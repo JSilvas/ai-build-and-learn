@@ -16,6 +16,16 @@ Pydantic AI
 <tbody>
 <tr><td>
       <div style="padding: 8px 0;">
+        <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>MCP with FastMCP</strong></div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">YYYY-MM-DD</div>
+        <div style="font-size: 13px; color: #666;">
+          <a href="topics/mcp">code</a> • <a href="https://luma.com/ai-builders-and-learners">register</a>
+        </div>
+      </div>
+    </td><td><div style="padding: 8px 0; line-height: 1.5;">Build a simple MCP server using FastMCP and connect to it with the OpenAI Agents SDK. Covers pure computation tools, external state tools, and context-aware tools.
+</div></td></tr>
+<tr><td>
+      <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Tavily</strong></div>
         <div style="color: #666; font-size: 13px; margin-bottom: 4px;">YYYY-MM-DD</div>
         <div style="font-size: 13px; color: #666;">
