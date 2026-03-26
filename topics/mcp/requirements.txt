@@ -1,0 +1,7 @@
+anthropic
+beautifulsoup4
+ddgs
+fastmcp
+httpx
+openai-agents
+python-dotenv
