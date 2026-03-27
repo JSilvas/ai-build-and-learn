@@ -5,3 +5,4 @@ fastmcp
 httpx
 openai-agents
 python-dotenv
+flyte[tui]>=2.0

@@ -117,6 +117,29 @@ python claude_client.py
 
 Both clients connect to the same running server, discover the available tools, and let the model decide which ones to call. This demonstrates MCP's portability - same server, different model providers.
 
+### Deploying with Flyte
+
+The server can be deployed to the cloud using [Flyte](https://flyte.org/) via `flyte_app.py`. This wraps the FastMCP server in a Starlette ASGI app and deploys it as a persistent service.
+
+```bash
+# Set your app name
+export APP_NAME=demo-mcp-server
+
+# Run locally with Flyte
+python flyte_app.py
+
+# Deploy to a Flyte cluster
+flyte deploy flyte_app.py app_env
+```
+
+Once deployed, update `MCP_SERVER_URL` in your `.env` to point at the remote URL:
+
+```
+MCP_SERVER_URL=https://your-app-url.hosted.unionai.cloud/mcp
+```
+
+Both clients read from `MCP_SERVER_URL`, so they work against local or remote servers without code changes.
+
 ## How it works
 
 FastMCP turns Python functions into MCP tools automatically:
@@ -183,6 +206,19 @@ MCP isn't always the right choice. It's the same monolith vs microservice tradeo
 
 If you only have one agent using one set of tools, MCP adds complexity for no benefit. If you have multiple consumers or want portability across model providers, the standardization is worth it.
 
+## Resources
+
+- [Introducing the Model Context Protocol](https://www.anthropic.com/news/model-context-protocol) - The original announcement from Anthropic
+- [Introduction to MCP (Anthropic Course)](https://anthropic.skilljar.com/introduction-to-model-context-protocol) - Free course on building MCP servers and clients from scratch
+- [MCP Course (Hugging Face)](https://huggingface.co/learn/mcp-course/en/unit0/introduction) - Community course on MCP
+
+## Community Spotlight
+
+Built something with MCP this week? Share it in [Slack](https://slack.flyte.org/) and we'll add it here!
+
+- [Niels Bantilan Building Your Own MCP Server](https://github.com/unionai/workshops/tree/main/tutorials/mcp) - Hands-on workshop walkthrough
+
+
 ## Next steps
 
 - Add a Claude Code MCP integration example
@@ -191,4 +227,6 @@ If you only have one agent using one set of tools, MCP adds complexity for no be
 - Host on HF spaces
 - Flyte app hosting
 - Chat interface example
-- Agent run
+- Agent run from interface / CLI
+- Specialize servers
+- LLM call from server

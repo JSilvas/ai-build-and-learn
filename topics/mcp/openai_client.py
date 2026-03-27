@@ -8,7 +8,11 @@ from agents.mcp import MCPServerSse
 
 load_dotenv()
 
-MCP_SERVER_URL = "http://localhost:8000/sse"
+import os
+
+# Local: http://localhost:8000/sse
+# Remote: https://rapid-grass-86f44.apps.demo.hosted.unionai.cloud/mcp
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000/sse")
 
 
 async def main():

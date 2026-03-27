@@ -42,28 +42,31 @@ def read_text_file(path: str) -> str:
 @mcp.tool
 async def get_weather(location: str) -> dict[str, str]:
     """Get current weather for a location using the wttr.in API."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"https://wttr.in/{location}?format=j1",
-            timeout=10.0,
-        )
-        response.raise_for_status()
-        data = response.json()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"https://wttr.in/{location}?format=j1",
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            data = response.json()
 
-    if not data or "current_condition" not in data:
-        return {"location": location, "error": "Weather data unavailable for this location"}
+        if not data or "current_condition" not in data:
+            return {"location": location, "error": "Weather data unavailable for this location"}
 
-    current = data["current_condition"][0]
-    return {
-        "location": location,
-        "temperature_c": current["temp_C"],
-        "temperature_f": current["temp_F"],
-        "condition": current["weatherDesc"][0]["value"],
-        "feels_like_c": current["FeelsLikeC"],
-        "feels_like_f": current["FeelsLikeF"],
-        "humidity": current["humidity"],
-        "wind_speed_kmph": current["windspeedKmph"],
-    }
+        current = data["current_condition"][0]
+        return {
+            "location": location,
+            "temperature_c": current["temp_C"],
+            "temperature_f": current["temp_F"],
+            "condition": current["weatherDesc"][0]["value"],
+            "feels_like_c": current["FeelsLikeC"],
+            "feels_like_f": current["FeelsLikeF"],
+            "humidity": current["humidity"],
+            "wind_speed_kmph": current["windspeedKmph"],
+        }
+    except Exception as e:
+        return {"location": location, "error": f"Weather API unavailable: {e}"}
 
 
 # --- Web search tools ---
