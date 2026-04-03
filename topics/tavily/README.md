@@ -39,3 +39,4 @@ TAVILY_API_KEY=your-key-here
 |---------|-------------|
 | [tavily-usage-examples](tavily-usage-examples/) | Core Tavily API usage — basic search, extract, and configuration options |
 | [langgraph_agent_research](langgraph_agent_research/) | Full research agent pipeline using Tavily + LangGraph + Flyte with parallel sub-topic research, synthesis, and quality gates |
+| [fastmcp_agent_tavily](fastmcp_agent_tavily/) | An agentic web research assistant powered by Tavily, FastMCP, and Anthropic's Claude |

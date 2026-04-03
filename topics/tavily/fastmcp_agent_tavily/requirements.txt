@@ -1,0 +1,4 @@
+fastmcp
+anthropic
+python-dotenv
+tavily-python
