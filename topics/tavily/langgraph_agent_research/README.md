@@ -90,14 +90,30 @@ flyte run workflow.py research_pipeline \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--query` | required | Research question |
-| `--num-topics` | 3 | Number of sub-topics to research in parallel |
-| `--max-searches` | 2 | Max web searches per sub-topic |
-| `--max-iterations` | 2 | Max quality gate iterations |
+| `--num_topics` | 3 | Number of sub-topics to research in parallel |
+| `--max_searches` | 2 | Max web searches per sub-topic |
+| `--max_iterations` | 2 | Max quality gate iterations |
+
+## Gradio App
+
+A Gradio UI (`app.py`) that kicks off the pipeline and links to the Flyte run:
+
+```bash
+# Local app + local task
+RUN_MODE=local python app.py
+
+# Local app + remote task (on a Flyte cluster)
+python app.py
+
+# Deploy to cluster
+flyte deploy app.py serving_env
+```
 
 ## Project Structure
 
 ```
-agent_research_pipeline/
+langgraph_agent_research/
+├── app.py              # Gradio UI — kicks off pipeline, links to Flyte run
 ├── config.py           # Flyte environment, secrets, resources
 ├── graph.py            # LangGraph graphs — pipeline + ReAct subgraph
 ├── workflow.py         # Flyte tasks — research_topic + research_pipeline orchestrator
