@@ -27,7 +27,6 @@ from dotenv import load_dotenv
 from tavily import TavilyClient
 
 from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import StepResult
 
 from env.models import ResearchAction, ResearchObservation, ResearchState
 from env.tools.search import run_search
@@ -85,7 +84,7 @@ class ResearchEnvironment(Environment):
         seed: Optional[int] = None,
         episode_id: Optional[str] = None,
         query: str = "",
-    ) -> StepResult:
+    ) -> ResearchObservation:
         """Start a new research episode for the given query."""
         self._query = query or "What is Model Context Protocol (MCP)?"
         self._step = 0
@@ -94,7 +93,7 @@ class ResearchEnvironment(Environment):
         self._history = []
         self._tool_usage = {"tavily_search": 0, "tavily_extract": 0, "tavily_crawl": 0}
 
-        observation = ResearchObservation(
+        return ResearchObservation(
             tool_name="reset",
             tool_args={},
             result={"message": f"Episode started. Research question: {self._query}"},
@@ -104,12 +103,10 @@ class ResearchEnvironment(Environment):
             message=f"Research question: {self._query}. Available tools: tavily_search, tavily_extract, tavily_crawl, finish.",
         )
 
-        return StepResult(observation=observation, reward=0.0, done=False)
-
-    def step(self, action: ResearchAction) -> StepResult:
+    def step(self, action: ResearchAction) -> ResearchObservation:
         """Execute one tool call and return the resulting observation."""
         if self._done:
-            observation = ResearchObservation(
+            return ResearchObservation(
                 tool_name="noop",
                 tool_args={},
                 result={},
@@ -118,14 +115,13 @@ class ResearchEnvironment(Environment):
                 reward=0.0,
                 message="Episode already finished.",
             )
-            return StepResult(observation=observation, reward=0.0, done=True)
 
         self._step += 1
 
         # Special finish action — agent signals it has enough information
         if action.tool_name == "finish":
             self._done = True
-            observation = ResearchObservation(
+            return ResearchObservation(
                 tool_name="finish",
                 tool_args={},
                 result={"message": "Agent chose to finish the episode."},
@@ -134,7 +130,6 @@ class ResearchEnvironment(Environment):
                 reward=0.0,
                 message="Episode complete.",
             )
-            return StepResult(observation=observation, reward=0.0, done=True)
 
         # Execute the requested Tavily tool
         result = self._dispatch_tool(action.tool_name, action.tool_args)
@@ -174,7 +169,7 @@ class ResearchEnvironment(Environment):
         })
 
         self._done = done
-        return StepResult(observation=observation, reward=reward, done=done)
+        return observation
 
     @property
     def state(self) -> ResearchState:

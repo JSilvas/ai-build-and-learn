@@ -8,9 +8,8 @@ environment responds with ResearchObservations.
 
 OpenEnv expects:
   - Action subclass for agent inputs
-  - Observation subclass for environment outputs
+  - Observation subclass for environment outputs (returned directly from reset/step)
   - State subclass for full environment state (used by env.state property)
-  - StepResult is provided by openenv-core — we don't redefine it
 """
 
 from typing import Any, Optional
