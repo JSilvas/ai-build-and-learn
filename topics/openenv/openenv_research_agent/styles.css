@@ -106,6 +106,10 @@
     color: #111;
 }
 
+.summary-box b {
+    color: #111;
+}
+
 /* ── Race summary card ───────────────────────────────────────────────────── */
 
 .race-card {
