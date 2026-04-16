@@ -357,7 +357,7 @@ def run(dry_run: bool = False) -> None:
             "experiment_number": experiment_number,
             "started_at": exp_start,
             "duration_seconds": duration,
-            "change_description": reasoning[:500],
+            "change_description": reasoning[:2000],
             "change_diff": change_diff,
             "val_bpb_before": result.val_bpb_before,
             "val_bpb_after": result.val_bpb_after,

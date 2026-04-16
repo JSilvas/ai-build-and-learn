@@ -298,7 +298,7 @@ def run_summary_card(experiments: list[dict]) -> str:
     improvement = baseline - final
 
     best = min(experiments, key=lambda e: e.get("delta", 0))
-    best_desc = best.get("change_description", "")[:100]
+    best_desc = best.get("change_description", "")
 
     trend = "improved" if improvement > 0.005 else "stayed flat" if abs(improvement) <= 0.005 else "got slightly worse"
     trend_color = _GREEN if improvement > 0.005 else _MUTED if abs(improvement) <= 0.005 else _RED
