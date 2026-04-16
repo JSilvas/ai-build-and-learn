@@ -329,7 +329,20 @@ def run() -> None:
         }
         if run_id is not None:
             try:
-                firestore_logger.log_experiment(run_id=run_id, project_id=gcp_project, **exp_record)
+                firestore_logger.log_experiment(
+                    run_id=run_id,
+                    project_id=gcp_project,
+                    experiment_number=exp_record["experiment_number"],
+                    started_at=exp_record["started_at"],
+                    duration_seconds=exp_record["duration_seconds"],
+                    change_description=exp_record["change_description"],
+                    change_diff=exp_record["change_diff"],
+                    val_bpb_before=exp_record["val_bpb_before"],
+                    val_bpb_after=exp_record["val_bpb_after"],
+                    kept=exp_record["kept"],
+                    train_loss=exp_record["train_loss"],
+                    step_count=exp_record["step_count"],
+                )
             except Exception as e:
                 print(f"WARNING: Firestore log_experiment failed: {e}. Continuing.")
         experiment_history.append(exp_record)

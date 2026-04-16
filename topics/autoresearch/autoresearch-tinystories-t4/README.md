@@ -85,6 +85,7 @@ The result is autonomous ML experimentation — the agent explores the hyperpara
 | `agent.py` | Main loop: reads, proposes, applies, trains, evaluates, logs |
 | `train.py` | GPT model + training loop. **Only file the agent modifies** |
 | `prepare.py` | One-time dataset download and tokenization. Never modified |
+| `checkpoint.py` | Crash recovery: save/load/clear `checkpoint.json` after each experiment |
 | `firestore_logger.py` | All Firestore reads/writes. No other I/O |
 | `metrics.py` | val_bpb parsing, delta calculation, keep/revert decision. Pure functions, no I/O |
 | `program.md` | Natural language strategy guide read by the agent each experiment |
@@ -226,6 +227,7 @@ autoresearch-tinystories-t4/
   ├── agent.py              — main overnight loop
   ├── train.py              — GPT training script (only file agent modifies)
   ├── prepare.py            — TinyStories download + tokenization (run once)
+  ├── checkpoint.py         — crash recovery (checkpoint.json read/write/clear)
   ├── firestore_logger.py   — all Firestore reads/writes
   ├── metrics.py            — val_bpb parsing and keep/revert logic
   ├── program.md            — agent strategy guide (natural language)
@@ -425,6 +427,32 @@ RUN_HOURS=12 python3 agent.py
 
 ---
 
+## Part 6b — Crash recovery
+
+If the instance crashes or is preempted mid-run, `checkpoint.json` in the project directory preserves the agent's state after each completed experiment. On restart, the agent automatically resumes from the last checkpoint:
+
+```bash
+# Just re-run — agent detects checkpoint.json and resumes automatically
+tmux new -s autoresearch
+python3 agent.py
+```
+
+Output on resume:
+```
+Resuming from checkpoint saved at 2025-04-16T02:14:33+00:00
+  experiment_number=12  val_bpb=3.421083
+```
+
+The agent skips the baseline re-run and continues from where it left off, reusing the same Firestore run ID so the dashboard shows an unbroken experiment log.
+
+**If you want to start fresh** (not resume), delete the checkpoint first:
+```bash
+rm checkpoint.json
+python3 agent.py
+```
+
+---
+
 ## Part 7 — Local Gradio dashboard
 
 ### Authenticate locally
@@ -513,3 +541,4 @@ gcloud compute instances stop autoresearch-t4 --zone=YOUR_ZONE
 | torch not found in venv | `pip install torch` (or use requirements.txt) |
 | Firestore `(default)` database not found | Set `FIRESTORE_DATABASE=your-database-name` env var |
 | SSH drops during overnight run | Use `tmux` — run detaches from terminal |
+| Want to start fresh after a crash | Delete `checkpoint.json` before re-running agent.py |
