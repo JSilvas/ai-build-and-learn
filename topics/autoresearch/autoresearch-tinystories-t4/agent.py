@@ -32,6 +32,11 @@ import anthropic
 import firestore_logger
 import metrics
 
+# ── Retry config ──────────────────────────────────────────────────────────────
+
+_MAX_API_RETRIES = 3
+_RETRY_BASE_DELAY = 5  # seconds, doubles each attempt
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 TRAIN_SCRIPT = Path(__file__).parent / "train.py"
@@ -54,12 +59,15 @@ Respond with two sections:
 2. NEW_TRAIN_PY: the complete updated train.py file with your change applied.
 No other text outside these two sections."""
 
-def _build_user_prompt(
-    program: str,
+def _build_dynamic_prompt(
     current_train: str,
     experiment_history: list[dict],
 ) -> str:
-    """Build the prompt sent to Claude for each experiment."""
+    """
+    Build the dynamic (per-experiment) portion of the user prompt.
+
+    program.md is sent as a separate cached content block — do not include it here.
+    """
     history_lines = []
     for exp in experiment_history[-10:]:  # last 10 experiments for context
         status = "KEPT" if exp.get("kept") else "REVERTED"
@@ -69,10 +77,7 @@ def _build_user_prompt(
         )
     history_text = "\n".join(history_lines) if history_lines else "  (no experiments yet)"
 
-    return f"""## Strategy Guide (program.md)
-{program}
-
-## Current train.py
+    return f"""## Current train.py
 ```python
 {current_train}
 ```
@@ -134,6 +139,49 @@ def _parse_llm_response(response: str) -> tuple[str, str]:
     return reasoning, new_train_py
 
 
+def _call_claude(client: anthropic.Anthropic, program: str, current_train: str, experiment_history: list[dict]) -> str:
+    """
+    Call Claude with prompt caching and retry on transient errors.
+
+    System prompt and program.md are marked as cached content blocks — they are
+    identical across all experiments in a run, so the cache stays warm.
+    Dynamic content (current train.py + history) is sent uncached.
+
+    Retries up to _MAX_API_RETRIES times with exponential backoff on API errors.
+    """
+    for attempt in range(_MAX_API_RETRIES):
+        try:
+            message = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=8192,
+                system=[
+                    {"type": "text", "text": _SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+                ],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"## Strategy Guide (program.md)\n{program}\n\n",
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                        {
+                            "type": "text",
+                            "text": _build_dynamic_prompt(current_train, experiment_history),
+                        },
+                    ],
+                }],
+            )
+            return message.content[0].text
+        except anthropic.APIError as e:
+            if attempt < _MAX_API_RETRIES - 1:
+                delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"Claude API error (attempt {attempt + 1}/{_MAX_API_RETRIES}): {e}. Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                raise
+
+
 def _run_training() -> tuple[str, int]:
     """
     Run train.py as a subprocess and return (stdout, returncode).
@@ -167,7 +215,11 @@ def run() -> None:
         "dataset": "TinyStories",
         "gpu": "T4",
     }
-    run_id = firestore_logger.create_run(config=initial_config, project_id=gcp_project)
+    try:
+        run_id = firestore_logger.create_run(config=initial_config, project_id=gcp_project)
+    except Exception as e:
+        print(f"WARNING: Firestore create_run failed: {e}. Continuing without Firestore logging.")
+        run_id = None
     print(f"Run started: {run_id}")
 
     deadline = time.time() + RUN_SECONDS
@@ -198,18 +250,9 @@ def run() -> None:
 
         # Ask Claude to propose a change
         try:
-            message = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=4096,
-                system=_SYSTEM_PROMPT,
-                messages=[{
-                    "role": "user",
-                    "content": _build_user_prompt(program, current_train, experiment_history),
-                }],
-            )
-            response_text = message.content[0].text
+            response_text = _call_claude(client, program, current_train, experiment_history)
         except Exception as e:
-            print(f"Claude API error: {e}. Skipping experiment.")
+            print(f"Claude API error after {_MAX_API_RETRIES} attempts: {e}. Skipping experiment.")
             continue
 
         # Parse Claude's response
@@ -271,11 +314,19 @@ def run() -> None:
             "train_loss": result.train_loss,
             "step_count": result.step_count,
         }
-        firestore_logger.log_experiment(run_id=run_id, project_id=gcp_project, **exp_record)
+        if run_id is not None:
+            try:
+                firestore_logger.log_experiment(run_id=run_id, project_id=gcp_project, **exp_record)
+            except Exception as e:
+                print(f"WARNING: Firestore log_experiment failed: {e}. Continuing.")
         experiment_history.append(exp_record)
 
     # Close the run
-    firestore_logger.close_run(run_id, experiment_number, project_id=gcp_project)
+    if run_id is not None:
+        try:
+            firestore_logger.close_run(run_id, experiment_number, project_id=gcp_project)
+        except Exception as e:
+            print(f"WARNING: Firestore close_run failed: {e}.")
     print(f"\nRun complete. {experiment_number} experiments. Final val_bpb={current_val_bpb:.6f}")
     print(f"Run ID: {run_id}")
 
