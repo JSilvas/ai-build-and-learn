@@ -1,0 +1,24 @@
+# AutoResearch — installs into the build-learn venv (uv pip install -r ...).
+#
+# Bundles karpathy's training stack (mirrored from upstream/pyproject.toml)
+# + our Flyte wrapper deps. Driver invokes `python train.py` so whichever
+# venv you're in is the one training runs against.
+
+# Torch needs the cu128 wheel index for Blackwell / DGX Spark.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+# --- Training stack (mirrors upstream/pyproject.toml) ---
+torch==2.9.1
+kernels>=0.11.7
+matplotlib>=3.10.8
+numpy>=2.2.6
+pandas>=2.3.3
+pyarrow>=21.0.0
+requests>=2.32.0
+rustbpe>=0.1.0
+tiktoken>=0.11.0
+
+# --- Flyte wrapper (driver/workflow only) ---
+flyte>=2.1.2
+python-dotenv
+markdown
