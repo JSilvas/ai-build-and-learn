@@ -338,14 +338,29 @@ pip install -r requirements.txt
 
 > **Note:** The Deep Learning VM has PyTorch pre-installed system-wide but the venv requires an explicit install. `requirements.txt` handles this.
 
-### Set environment variables (permanent)
+### Set environment variables
+Copy the example file and fill in your values:
 ```bash
-echo 'export GCP_PROJECT=your-project-id' >> ~/.bashrc
-echo 'export FIRESTORE_DATABASE=your-database-name' >> ~/.bashrc
-echo 'export ANTHROPIC_API_KEY=your-anthropic-key' >> ~/.bashrc
-echo 'source ~/ai-build-and-learn/topics/autoresearch/autoresearch-tinystories-t4/venv/bin/activate' >> ~/.bashrc
-source ~/.bashrc
+cp .env.example .env
+nano .env
 ```
+
+Edit the three required values:
+```
+ANTHROPIC_API_KEY=your-anthropic-api-key
+GCP_PROJECT=your-gcp-project-id
+FIRESTORE_DATABASE=your-firestore-database-name
+```
+
+Save with `Ctrl+O` → `Enter`, exit with `Ctrl+X`.
+
+`agent.py` loads `.env` automatically at startup via `python-dotenv`. The `.env` file is gitignored and never committed.
+
+> **Note:** Also add the venv activation to `~/.bashrc` so it activates on every SSH session:
+> ```bash
+> echo 'source ~/ai-build-and-learn/topics/autoresearch/autoresearch-tinystories-t4/venv/bin/activate' >> ~/.bashrc
+> source ~/.bashrc
+> ```
 
 ### Verify Firestore connection
 ```bash
