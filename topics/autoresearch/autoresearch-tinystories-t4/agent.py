@@ -29,6 +29,10 @@ from pathlib import Path
 
 import anthropic
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import checkpoint
 import firestore_logger
 import metrics
