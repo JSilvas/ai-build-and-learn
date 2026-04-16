@@ -280,6 +280,8 @@ def run_training() -> tuple[Optional[float], Optional[float], str, bool]:
 def baseline(branch: str) -> IterationResult:
     """First run: no agent edit, just measure baseline at HEAD."""
     t0 = time.time()
+    print(f"[iter 0] training baseline at HEAD ({TRAINING_TIMEOUT_SEC // 60}min cap; "
+          f"watch upstream/run.log for live step counts) ...", flush=True)
     val_bpb, memory_gb, log_tail, timed_out = run_training()
     elapsed = time.time() - t0
     commit = current_commit()
@@ -303,10 +305,16 @@ def iterate(iteration: int, branch: str, prev_best_bpb: float,
     start_commit = current_commit()
     t0 = time.time()
 
+    print(f"[iter {iteration}] start (best so far: val_bpb={prev_best_bpb:.6f})", flush=True)
+
+    t_agent = time.time()
     description = propose_change(
         branch=branch, agent=agent, model=model,
         instructions_path=instructions_path,
     )
+    print(f"[iter {iteration}] agent done in {time.time()-t_agent:.1f}s "
+          f"-> {description[:90]}", flush=True)
+
     new_commit = current_commit()
     if new_commit == start_commit:
         # Agent didn't commit anything — skip this iteration cleanly.
@@ -317,6 +325,9 @@ def iterate(iteration: int, branch: str, prev_best_bpb: float,
             val_bpb=None, memory_gb=None, status="discard",
             elapsed_sec=elapsed, log_tail="agent did not commit",
         )
+
+    print(f"[iter {iteration}] training (~5min; tail upstream/run.log for live progress) ...",
+          flush=True)
 
     val_bpb, memory_gb, log_tail, timed_out = run_training()
     elapsed = time.time() - t0

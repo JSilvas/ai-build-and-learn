@@ -12,7 +12,7 @@ This folder wraps the upstream repo four ways:
    `upstream/`, point it at `program.md`, walk away.
 2. **Mode B — Headless driver loop** — `python driver.py --tag demo` runs a
    fixed number of iterations from the terminal. Same agent, no UI babysitting.
-3. **Mode C — Flyte workflow with TUI reports** — `flyte run --local workflow.py`
+3. **Mode C — Flyte workflow with TUI reports** — `flyte run --local --tui workflow.py`
    wraps each iteration as a Flyte task so the Flyte TUI shows per-iteration
    change descriptions, val_bpb, status, and log tails as they happen.
 4. **Mode D — Local-LLM agent (Ollama)** — `python driver.py --agent local`
@@ -224,10 +224,12 @@ Useful when you want a finite run with no UI, e.g. a quick demo or a CI smoke.
 ## Mode C — Flyte workflow with TUI reports
 
 Same loop, but each iteration is a Flyte task with a live HTML report. Run
-locally so you don't need a cluster:
+locally so you don't need a cluster. The `--tui` flag is what actually pops
+the live status panel — without it, Flyte just runs the workflow and prints
+to stdout:
 
 ```bash
-flyte run --local workflow.py run_autoresearch --tag demo --iterations 3
+flyte run --local --tui workflow.py run_autoresearch --tag demo --iterations 3
 ```
 
 The Flyte TUI shows:
@@ -275,8 +277,8 @@ python driver.py --tag local-demo --iterations 3 --agent local
 python driver.py --tag gemma4-test --iterations 3 \
     --agent local --model gemma4:something
 
-# Flyte TUI version (Mode C-style) with local agent
-flyte run --local workflow.py run_autoresearch \
+# Flyte TUI version (Mode C-style) with local agent — note the --tui flag
+flyte run --local --tui workflow.py run_autoresearch \
     --tag local-flyte --iterations 3 --agent local
 ```
 

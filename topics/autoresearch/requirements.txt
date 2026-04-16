@@ -19,7 +19,7 @@ rustbpe>=0.1.0
 tiktoken>=0.11.0
 
 # --- Flyte wrapper (driver/workflow only) ---
-flyte>=2.1.2
+flyte[tui]>=2.1.2
 python-dotenv
 markdown
 
