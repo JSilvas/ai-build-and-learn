@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import firestore_logger
 from dashboard.ui_components import (
     app_header,
+    chart_heading,
     empty_chart,
     experiment_table,
     loading_card,
@@ -122,6 +123,10 @@ def build_ui() -> gr.Blocks:
             refresh_btn = gr.Button("Refresh", scale=1, size="sm")
 
         stats_html = gr.HTML(loading_card())
+        gr.HTML(chart_heading(
+            "val_bpb Progression",
+            tooltip="Validation bits per byte — how many bits the model needs to predict each byte of unseen text. Lower is better. Improvement threshold: 0.001",
+        ))
         chart = gr.Plot(value=empty_chart(), show_label=False)
         table_html = gr.HTML(loading_card("Loading experiment log..."))
         summary_html = gr.HTML()

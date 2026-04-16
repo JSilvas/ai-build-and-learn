@@ -12,26 +12,13 @@ import pandas  # must import before plotly to avoid circular import in Gradio th
 import plotly.graph_objects as go
 from typing import Optional
 
-# ── Color constants ───────────────────────────────────────────────────────────
+# ── Plotly color constants (CSS cannot reach SVG/canvas — must be Python values) ──
 
-_TEXT   = "#ccc"
-_TEXT2  = "#aaa"
-_MUTED  = "#888"
-_DIM    = "#555"
-_BRIGHT = "#e0e0e0"
-
-_BG     = "#1a1a1a"
-_BG2    = "#141414"
-_BG3    = "#1e1e1e"
-_BORDER = "#2a2a2a"
-
-_GOOD   = "#1a7a4a"
-_WARN   = "#b7770d"
-_BAD    = "#8b2020"
-_INFO   = "#2471a3"
-
-_GREEN  = "#2ecc71"
-_RED    = "#e74c3c"
+_TEXT2  = "#aaa"    # axis labels, legend text
+_DIM    = "#555"    # baseline annotation
+_BORDER = "#2a2a2a" # grid lines, connecting line
+_GREEN  = "#2ecc71" # kept experiment markers
+_RED    = "#e74c3c" # reverted experiment markers
 
 # Plotly dark layout shared across all charts
 _CHART_LAYOUT = dict(
@@ -116,6 +103,22 @@ def stat_row(experiments: list[dict], run: Optional[dict] = None) -> str:
     )
 
 
+# ── Section headings ──────────────────────────────────────────────────────────
+
+def chart_heading(label: str, tooltip: str = "") -> str:
+    """
+    Render a chart section heading with an optional tooltip icon to the left.
+
+    The ℹ icon uses .tooltip-icon CSS — hover shows the native browser tooltip.
+    Uses .chart-heading style (not .section-heading) to avoid uppercase transform.
+    """
+    icon = (
+        f'<span class="tooltip-icon" title="{tooltip}">ℹ</span> '
+        if tooltip else ""
+    )
+    return f'<div class="chart-heading">{icon}{label}</div>'
+
+
 # ── Val BPB chart ─────────────────────────────────────────────────────────────
 
 def val_bpb_chart(experiments: list[dict]) -> go.Figure:
@@ -130,7 +133,6 @@ def val_bpb_chart(experiments: list[dict]) -> go.Figure:
 
     if not experiments:
         fig.update_layout(
-            title="val_bpb Progression",
             xaxis=dict(title="Experiment", **_AXIS),
             yaxis=dict(title="val_bpb", **_AXIS),
             **_CHART_LAYOUT,
@@ -184,9 +186,6 @@ def val_bpb_chart(experiments: list[dict]) -> go.Figure:
     )
 
     fig.update_layout(
-        title=dict(
-            text='val_bpb Progression <span class="tooltip-icon" title="Validation bits per byte — how many bits the model needs to predict each byte of unseen text. Lower is better. Improvement threshold: 0.001">ℹ</span>',
-        ),
         xaxis=dict(title="Experiment #", **_AXIS),
         yaxis=dict(title="val_bpb (lower = better)", **_AXIS),
         **_CHART_LAYOUT,
@@ -230,7 +229,7 @@ def experiment_table(experiments: list[dict]) -> str:
     Most recent experiments appear first.
     """
     if not experiments:
-        return '<p style="color:#555;font-size:0.88em">No experiments logged yet.</p>'
+        return '<p class="exp-empty">No experiments logged yet.</p>'
 
     rows = []
     for exp in reversed(experiments):
@@ -256,22 +255,34 @@ def experiment_table(experiments: list[dict]) -> str:
             f'</details>'
         ) if diff else ""
 
-        change_cell = f'<div class="exp-desc">{desc}</div>{diff_block}'
+        _TRUNCATE = 120
+        if len(desc) > _TRUNCATE:
+            summary = desc[:_TRUNCATE].rsplit(" ", 1)[0] + "…"
+            change_cell = (
+                f'<details class="desc-details">'
+                f'<summary class="desc-summary">{summary}</summary>'
+                f'<div class="desc-full">{desc}</div>'
+                f'</details>'
+                + diff_block
+            )
+        else:
+            change_cell = f'<div class="exp-desc">{desc}</div>{diff_block}'
 
         rows.append(
             f"<tr>"
             f'<td class="exp-num">{exp.get("experiment_number", "")}</td>'
             f"<td>{badge}</td>"
-            f'<td style="color:{_MUTED}">{exp.get("val_bpb_before", 0):.4f} → {exp.get("val_bpb_after", 0):.4f}</td>'
+            f'<td class="exp-muted">{exp.get("val_bpb_before", 0):.4f} → {exp.get("val_bpb_after", 0):.4f}</td>'
             f'<td class="{delta_class}">{delta_str}</td>'
-            f'<td style="color:{_DIM}">{loss_str}</td>'
-            f'<td style="color:{_DIM}">{steps_str}</td>'
-            f'<td style="color:{_DIM}">{duration:.0f}s</td>'
+            f'<td class="exp-dim">{loss_str}</td>'
+            f'<td class="exp-dim">{steps_str}</td>'
+            f'<td class="exp-dim">{duration:.0f}s</td>'
             f'<td>{change_cell}</td>'
             f"</tr>"
         )
 
     return (
+        '<div class="exp-table-container">'
         '<table class="exp-table">'
         "<thead><tr>"
         "<th>#</th><th>Status</th><th>val_bpb</th><th>Delta</th>"
@@ -279,6 +290,7 @@ def experiment_table(experiments: list[dict]) -> str:
         "</tr></thead>"
         "<tbody>" + "".join(rows) + "</tbody>"
         "</table>"
+        "</div>"
     )
 
 
@@ -303,7 +315,7 @@ def run_summary_card(experiments: list[dict]) -> str:
     best_desc = best.get("change_description", "")
 
     trend = "improved" if improvement > 0.005 else "stayed flat" if abs(improvement) <= 0.005 else "got slightly worse"
-    trend_color = _GREEN if improvement > 0.005 else _MUTED if abs(improvement) <= 0.005 else _RED
+    trend_class = "summary-trend-good" if improvement > 0.005 else "summary-trend-flat" if abs(improvement) <= 0.005 else "summary-trend-bad"
 
     return (
         '<div class="summary-card">'
@@ -311,7 +323,7 @@ def run_summary_card(experiments: list[dict]) -> str:
         '<div class="summary-body">'
         f'<b>val_bpb {trend}</b> overnight — '
         f'started at <b>{baseline:.4f}</b>, ended at '
-        f'<b style="color:{trend_color}">{final:.4f}</b> '
+        f'<b class="{trend_class}">{final:.4f}</b> '
         f'({"↓" if improvement > 0 else "↑"} {abs(improvement):.4f}).'
         "<ul>"
         f"<li>Ran <b>{total}</b> experiments · <b>{len(kept)}</b> kept · <b>{total - len(kept)}</b> reverted</li>"
@@ -327,18 +339,17 @@ def run_summary_card(experiments: list[dict]) -> str:
 def loading_card(message: str = "Loading data from Firestore...") -> str:
     """Placeholder shown while Firestore data is being fetched."""
     return (
-        f'<div style="text-align:center;padding:48px 16px;color:{_DIM}">'
-        f'<div style="font-size:1.4em;margin-bottom:10px">&#9651;</div>'
-        f'<div style="font-size:0.92em">{message}</div>'
-        f'</div>'
+        '<div class="loading-card">'
+        '<div class="loading-icon">&#9651;</div>'
+        f'<div class="loading-message">{message}</div>'
+        '</div>'
     )
 
 
-def empty_chart(title: str = "val_bpb Progression") -> go.Figure:
+def empty_chart() -> go.Figure:
     """Return an empty dark-themed Plotly chart as a placeholder."""
     fig = go.Figure()
     fig.update_layout(
-        title=title,
         xaxis=dict(title="Experiment #", **_AXIS),
         yaxis=dict(title="val_bpb", **_AXIS),
         **_CHART_LAYOUT,

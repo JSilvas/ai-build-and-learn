@@ -41,7 +41,7 @@ body, .gradio-container {
 
 .app-tagline {
     font-size: 0.82em;
-    color: #555;
+    color: #888;
     letter-spacing: 0.04em;
 }
 
@@ -62,6 +62,14 @@ body, .gradio-container {
     padding-bottom: 8px;
     border-bottom: 1px solid #222;
     margin-bottom: 14px;
+    margin-top: 24px;
+}
+
+.chart-heading {
+    font-size: 1.2em;
+    font-weight: 600;
+    color: #e0e0e0;
+    margin-bottom: 4px;
     margin-top: 24px;
 }
 
@@ -89,7 +97,7 @@ body, .gradio-container {
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    color: #555;
+    color: #999;
     margin-bottom: 6px;
 }
 
@@ -102,7 +110,7 @@ body, .gradio-container {
 
 .stat-sub {
     font-size: 0.78em;
-    color: #555;
+    color: #888;
     margin-top: 3px;
 }
 
@@ -129,29 +137,40 @@ body, .gradio-container {
 
 /* ── Experiment log table ────────────────────────────────────────────────── */
 
+.exp-table-container {
+    max-height: 520px;
+    overflow-y: auto;
+    border: 1px solid #1a1a1a;
+    border-radius: 6px;
+}
+
 .exp-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.88em;
-    color: #ccc;
+    font-size: 0.95em;
+    color: #ddd;
 }
 
 .exp-table th {
-    padding: 8px 12px;
+    padding: 9px 12px;
     text-align: left;
     background: #1e1e1e;
-    color: #666;
-    font-size: 0.72em;
+    color: #888;
+    font-size: 0.78em;
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.07em;
     border-bottom: 1px solid #2a2a2a;
+    position: sticky;
+    top: 0;
+    z-index: 1;
 }
 
 .exp-table td {
-    padding: 8px 12px;
+    padding: 10px 12px;
     border-bottom: 1px solid #1a1a1a;
     vertical-align: top;
+    line-height: 1.5;
 }
 
 .exp-table tr:hover td {
@@ -159,14 +178,16 @@ body, .gradio-container {
 }
 
 .exp-num {
-    color: #555;
-    font-size: 0.85em;
+    color: #888;
+    font-size: 0.9em;
     font-weight: 600;
 }
 
 .exp-delta-good { color: #2ecc71; font-weight: 600; }
 .exp-delta-bad  { color: #e74c3c; font-weight: 600; }
-.exp-desc       { color: #aaa; line-height: 1.5; }
+.exp-desc       { color: #ccc; line-height: 1.6; }
+.exp-muted      { color: #bbb; }
+.exp-dim        { color: #bbb; }
 
 
 /* ── Summary card ────────────────────────────────────────────────────────── */
@@ -208,14 +229,14 @@ body, .gradio-container {
 
 .diff-summary {
     font-size: 0.78em;
-    color: #555;
+    color: #888;
     cursor: pointer;
     user-select: none;
     padding: 2px 0;
 }
 
 .diff-summary:hover {
-    color: #888;
+    color: #bbb;
 }
 
 .exp-diff {
@@ -240,15 +261,15 @@ body, .gradio-container {
 /* ── Tooltip ─────────────────────────────────────────────────────────────── */
 
 .tooltip-icon {
-    font-size: 11px;
-    color: #555;
+    font-size: 13px;
+    color: #888;
     cursor: help;
     vertical-align: super;
-    margin-left: 4px;
+    margin-right: 6px;
 }
 
 .tooltip-icon:hover {
-    color: #888;
+    color: #ccc;
 }
 
 
@@ -258,3 +279,69 @@ body, .gradio-container {
     color: #888 !important;
     font-size: 0.82em !important;
 }
+
+
+/* ── Description expand ──────────────────────────────────────────────────── */
+
+.desc-summary {
+    font-size: 0.92em;
+    color: #ccc;
+    cursor: pointer;
+    line-height: 1.5;
+    list-style: none;
+}
+
+.desc-summary::-webkit-details-marker {
+    display: none;
+}
+
+.desc-summary::after {
+    content: " · more";
+    font-size: 0.82em;
+    color: #888;
+}
+
+details[open] .desc-summary::after {
+    content: " · less";
+    color: #888;
+}
+
+.desc-full {
+    color: #ccc;
+    line-height: 1.6;
+    margin-top: 6px;
+    font-size: 0.92em;
+}
+
+
+/* ── Empty state ─────────────────────────────────────────────────────────── */
+
+.exp-empty {
+    color: #555;
+    font-size: 0.88em;
+}
+
+
+/* ── Loading placeholder ─────────────────────────────────────────────────── */
+
+.loading-card {
+    text-align: center;
+    padding: 48px 16px;
+    color: #555;
+}
+
+.loading-icon {
+    font-size: 1.4em;
+    margin-bottom: 10px;
+}
+
+.loading-message {
+    font-size: 0.92em;
+}
+
+
+/* ── Summary trend colors ────────────────────────────────────────────────── */
+
+.summary-trend-good { color: #2ecc71; }
+.summary-trend-flat { color: #888; }
+.summary-trend-bad  { color: #e74c3c; }
