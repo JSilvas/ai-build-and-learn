@@ -172,12 +172,14 @@ Standard PyTorch attention — no custom kernel, fully compatible with T4 and an
 
 ### Summary of changes
 
-- **Attention** — FA3 custom kernel → `F.scaled_dot_product_attention` (FA3 requires compute capability 9.0; T4 is 7.5)
-- **`DEVICE_BATCH_SIZE`** — 128 → 16 (T4 has 16GB VRAM vs H100 80GB)
-- **`TOTAL_BATCH_SIZE`** — 2²⁰ → 2¹⁷ (keeps gradient accumulation manageable in 5 min)
-- **`WINDOW_PATTERN`** — `"SSSL"` → `"LLLL"` (sliding window requires FA3 kernel)
-- **Dataset** — climbmix-400b → TinyStories (fast download, strong signal in 5-minute runs)
-- **Optimizer** — MuonAdamW → AdamW (MuonAdamW not available as a package)
+| Change | Original (H100) | This repo (T4) | Reason |
+|--------|----------------|----------------|--------|
+| Attention | FA3 custom kernel | `F.scaled_dot_product_attention` | FA3 requires compute cap 9.0 |
+| `DEVICE_BATCH_SIZE` | 128 | 16 | VRAM limit |
+| `TOTAL_BATCH_SIZE` | 2\*\*19 (524K) | 2\*\*17 (131K) | Gradient accum steps for 5-min budget |
+| `WINDOW_PATTERN` | "SSSL" | "LLLL" | Sliding window requires FA3 kernel |
+| Dataset | climbmix-400b | TinyStories | Download size and run budget |
+| Optimizer | MuonAdamW | AdamW | Availability and simplicity |
 
 ---
 
