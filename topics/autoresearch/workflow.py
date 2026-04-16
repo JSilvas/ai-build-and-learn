@@ -99,19 +99,26 @@ async def run_baseline(tag: str) -> str:
 
 @env.task(report=True)
 async def run_iteration(tag: str, iteration: int, prev_best_bpb: float,
-                         model: str = "sonnet") -> str:
+                         agent: str = "claude", model: str = "",
+                         instructions: str = "") -> str:
     branch = f"autoresearch/{tag}"
+    instructions_path = pathlib.Path(instructions) if instructions else None
+    model_arg = model or None
 
+    pretty_model = model or ("sonnet" if agent == "claude" else "qwen3-coder-next")
     await flyte.report.replace.aio(
         f"<h2>Iteration {iteration}</h2>"
         f"<p>Branch: <code>{branch}</code> &nbsp; "
         f"prev best val_bpb: <b>{prev_best_bpb:.6f}</b></p>"
-        f"<p>Asking Claude ({model}) to propose a change, then running training…</p>"
+        f"<p>Agent: <code>{agent}</code> ({pretty_model}). "
+        f"Asking for a change, then running training…</p>"
     )
     await flyte.report.flush.aio()
 
-    result = driver.iterate(iteration=iteration, branch=branch,
-                             prev_best_bpb=prev_best_bpb, model=model)
+    result = driver.iterate(
+        iteration=iteration, branch=branch, prev_best_bpb=prev_best_bpb,
+        agent=agent, model=model_arg, instructions_path=instructions_path,
+    )
     await flyte.report.replace.aio(_row_to_html(result))
     await flyte.report.flush.aio()
     return json.dumps(_to_dict(result))
@@ -123,11 +130,14 @@ async def run_iteration(tag: str, iteration: int, prev_best_bpb: float,
 
 @env.task(report=True)
 async def run_autoresearch(tag: str, iterations: int = 3,
-                            model: str = "sonnet") -> str:
+                            agent: str = "claude", model: str = "",
+                            instructions: str = "") -> str:
     """Run baseline + N agent-driven iterations, sequentially."""
+    pretty_model = model or ("sonnet" if agent == "claude" else "qwen3-coder-next")
     await flyte.report.replace.aio(
         f"<h2>AutoResearch — {tag}</h2>"
-        f"<p>Iterations: {iterations} (+ baseline) &nbsp;|&nbsp; model: {model}</p>"
+        f"<p>Iterations: {iterations} (+ baseline) &nbsp;|&nbsp; "
+        f"agent: <code>{agent}</code> ({pretty_model})</p>"
         f"<p>Starting…</p>"
     )
     await flyte.report.flush.aio()
@@ -144,12 +154,14 @@ async def run_autoresearch(tag: str, iterations: int = 3,
         return json.dumps({"results": history, "best_val_bpb": None})
 
     for i in range(1, iterations + 1):
-        r_json = await run_iteration(tag=tag, iteration=i, prev_best_bpb=best, model=model)
+        r_json = await run_iteration(
+            tag=tag, iteration=i, prev_best_bpb=best,
+            agent=agent, model=model, instructions=instructions,
+        )
         r = json.loads(r_json)
         history.append(r)
         if r["status"] == "keep" and r["val_bpb"] is not None:
             best = r["val_bpb"]
-        # Refresh the rolling summary after each iteration.
         await flyte.report.replace.aio(_summary_html(tag, history))
         await flyte.report.flush.aio()
 

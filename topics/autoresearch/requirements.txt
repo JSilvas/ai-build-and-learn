@@ -22,3 +22,9 @@ tiktoken>=0.11.0
 flyte>=2.1.2
 python-dotenv
 markdown
+
+# --- Mode D: local agent via Ollama ---
+# `requests` is already a transitive dep of training, listed here explicitly
+# because local_agent.py imports it directly. No `ollama` Python SDK — we use
+# the plain HTTP API to keep the dep surface small.
+# requests>=2.32.0  (already pinned above)

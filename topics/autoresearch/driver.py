@@ -29,9 +29,16 @@ from pathlib import Path
 from typing import Optional
 
 UPSTREAM = Path(__file__).parent / "upstream"
+TRAIN_PY = UPSTREAM / "train.py"
 RESULTS_TSV = UPSTREAM / "results.tsv"
 RUN_LOG = UPSTREAM / "run.log"
 RESULTS_HEADER = "commit\tval_bpb\tmemory_gb\tstatus\tdescription"
+
+# Default instructions file for the agent. Mode A/B/C use the verbose-but-Claude-friendly
+# karpathy.md (a copy of upstream/program.md). Mode D points at karpathy_verbose.md.
+INSTRUCTIONS_DIR = Path(__file__).parent / "instructions"
+DEFAULT_CLAUDE_INSTRUCTIONS = INSTRUCTIONS_DIR / "karpathy.md"
+DEFAULT_LOCAL_INSTRUCTIONS = INSTRUCTIONS_DIR / "karpathy_verbose.md"
 
 # How long to allow `uv run train.py` to live before we kill it.
 # Karpathy: 5 min training + a bit of compile/eval overhead. Cap hard at 10 min.
@@ -120,19 +127,22 @@ def read_history(max_rows: int = 30) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code invocation
+# Agent dispatch
 # ---------------------------------------------------------------------------
+# Two backends:
+#   - "claude" — spawns the Claude Code CLI as a general-tool-use agent.
+#                Reads/Edits files itself, runs git, etc.
+#   - "local"  — calls a local Ollama model and asks for a unified diff.
+#                See local_agent.py. Strictly less capable; useful for a
+#                local-LLM demo and bake-offs across small open models.
 
-AGENT_PROMPT_TEMPLATE = """You are running ONE iteration of an autonomous LLM pretraining research loop.
+CLAUDE_PROMPT_TEMPLATE = """You are running ONE iteration of an autonomous LLM pretraining research loop.
 
 Working directory: {repo}
 Current branch: {branch}
 
-Rules (from program.md):
-- You may ONLY edit train.py. Do NOT edit prepare.py. Do NOT add dependencies.
-- You will NOT run training — that happens externally after you exit.
-- Make exactly ONE focused experimental change you have not tried before.
-- Commit the change with `git add train.py && git commit -m "<short description>"`.
+Instructions (read carefully):
+{instructions}
 
 Previous experiment history (results.tsv, lower val_bpb is better):
 ```
@@ -146,10 +156,13 @@ CHANGE: <one-line description of what you changed>
 """
 
 
-def propose_change(branch: str, model: str = "sonnet") -> str:
-    """Spawn Claude Code in the upstream/ dir to make one edit + commit. Returns description."""
+def _propose_via_claude(branch: str, model: str, instructions_path: Path) -> str:
+    """Spawn Claude Code in upstream/ to make one edit + commit. Returns description."""
     history = read_history()
-    prompt = AGENT_PROMPT_TEMPLATE.format(repo=UPSTREAM, branch=branch, history=history)
+    instructions = instructions_path.read_text()
+    prompt = CLAUDE_PROMPT_TEMPLATE.format(
+        repo=UPSTREAM, branch=branch, instructions=instructions, history=history,
+    )
 
     cmd = [
         "claude", "-p", prompt,
@@ -158,24 +171,61 @@ def propose_change(branch: str, model: str = "sonnet") -> str:
         "--add-dir", str(UPSTREAM),
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep",
     ]
-    print(f"[agent] launching: {shlex.join(cmd[:6])} ...", flush=True)
+    print(f"[agent:claude] launching: {shlex.join(cmd[:6])} ...", flush=True)
     r = _run(cmd, cwd=UPSTREAM, timeout=AGENT_TIMEOUT_SEC)
     if r.returncode != 0:
         raise RuntimeError(f"claude -p failed (rc={r.returncode}):\n{r.stderr[-2000:]}")
 
-    # Extract "CHANGE: ..." line if the agent followed instructions.
     desc = ""
     for line in reversed(r.stdout.splitlines()):
         if line.startswith("CHANGE:"):
             desc = line[len("CHANGE:"):].strip()
             break
     if not desc:
-        # Fall back to the latest commit subject — the agent should have committed.
         try:
             desc = _git(["log", "-1", "--format=%s"])
         except Exception:
             desc = "(no description)"
     return desc
+
+
+def _propose_via_local(model: str, instructions_path: Path) -> str:
+    """Ask a local Ollama model for a diff, apply + commit. Returns description.
+
+    On failure (model unreachable, malformed output, diff doesn't apply) the
+    description is prefixed with [TAG] explaining the failure mode and NO commit
+    is produced — the caller's `new_commit == start_commit` check will catch it
+    and treat the iteration as a discard.
+    """
+    import local_agent  # deferred so Mode A/B/C don't require `requests` to be importable
+    history = read_history()
+    print(f"[agent:local] querying ollama model={model} ...", flush=True)
+    ok, description = local_agent.propose_change(
+        repo=UPSTREAM,
+        train_py_path=TRAIN_PY,
+        instructions_path=instructions_path,
+        history=history,
+        model=model,
+    )
+    return description
+
+
+def propose_change(branch: str, agent: str = "claude", model: Optional[str] = None,
+                   instructions_path: Optional[Path] = None) -> str:
+    """Dispatch to the configured agent backend. Returns the change description."""
+    if agent == "claude":
+        return _propose_via_claude(
+            branch=branch,
+            model=model or "sonnet",
+            instructions_path=instructions_path or DEFAULT_CLAUDE_INSTRUCTIONS,
+        )
+    if agent == "local":
+        from local_agent import DEFAULT_MODEL as LOCAL_DEFAULT
+        return _propose_via_local(
+            model=model or LOCAL_DEFAULT,
+            instructions_path=instructions_path or DEFAULT_LOCAL_INSTRUCTIONS,
+        )
+    raise ValueError(f"unknown agent: {agent!r} (expected 'claude' or 'local')")
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +297,16 @@ def baseline(branch: str) -> IterationResult:
 
 
 def iterate(iteration: int, branch: str, prev_best_bpb: float,
-            model: str = "sonnet") -> IterationResult:
+            agent: str = "claude", model: Optional[str] = None,
+            instructions_path: Optional[Path] = None) -> IterationResult:
     """One agent-driven experiment. Reverts on no improvement / crash."""
     start_commit = current_commit()
     t0 = time.time()
 
-    description = propose_change(branch=branch, model=model)
+    description = propose_change(
+        branch=branch, agent=agent, model=model,
+        instructions_path=instructions_path,
+    )
     new_commit = current_commit()
     if new_commit == start_commit:
         # Agent didn't commit anything — skip this iteration cleanly.
@@ -289,7 +343,9 @@ def iterate(iteration: int, branch: str, prev_best_bpb: float,
     return result
 
 
-def loop(tag: str, iterations: int, model: str = "sonnet") -> list[IterationResult]:
+def loop(tag: str, iterations: int, agent: str = "claude",
+         model: Optional[str] = None,
+         instructions_path: Optional[Path] = None) -> list[IterationResult]:
     """Standalone loop runner. workflow.py calls iterate() directly per Flyte task."""
     branch = ensure_branch(tag)
     ensure_results_tsv()
@@ -305,7 +361,8 @@ def loop(tag: str, iterations: int, model: str = "sonnet") -> list[IterationResu
 
     best = base.val_bpb
     for i in range(1, iterations + 1):
-        r = iterate(i, branch=branch, prev_best_bpb=best, model=model)
+        r = iterate(i, branch=branch, prev_best_bpb=best,
+                    agent=agent, model=model, instructions_path=instructions_path)
         results.append(r)
         bpb_str = f"{r.val_bpb:.6f}" if r.val_bpb is not None else "crash"
         print(f"[iter {i}] {r.status:8s} val_bpb={bpb_str}  {r.description[:80]}", flush=True)
@@ -317,11 +374,23 @@ def loop(tag: str, iterations: int, model: str = "sonnet") -> list[IterationResu
 def _cli() -> int:
     import argparse
     p = argparse.ArgumentParser(description="Run the autoresearch loop locally.")
-    p.add_argument("--tag", required=True, help="Run tag, e.g. 'demo'. Branch will be autoresearch/<tag>.")
+    p.add_argument("--tag", required=True,
+                   help="Run tag, e.g. 'demo'. Branch will be autoresearch/<tag>.")
     p.add_argument("--iterations", type=int, default=3)
-    p.add_argument("--model", default="sonnet", help="Claude model alias for the agent.")
+    p.add_argument("--agent", choices=["claude", "local"], default="claude",
+                   help="Which agent backend to use. 'claude' = Claude Code CLI; "
+                        "'local' = Ollama-served local model (Mode D).")
+    p.add_argument("--model", default=None,
+                   help="Model name. For --agent claude: alias like 'sonnet' or 'opus'. "
+                        "For --agent local: an Ollama tag like 'qwen3-coder-next' or "
+                        "'gemma4:something'. Defaults pick a sensible per-agent value.")
+    p.add_argument("--instructions", type=Path, default=None,
+                   help="Path to the markdown instructions file. Defaults: "
+                        "instructions/karpathy.md for claude, instructions/karpathy_verbose.md "
+                        "for local.")
     args = p.parse_args()
-    loop(tag=args.tag, iterations=args.iterations, model=args.model)
+    loop(tag=args.tag, iterations=args.iterations,
+         agent=args.agent, model=args.model, instructions_path=args.instructions)
     return 0
 
 

@@ -6,7 +6,7 @@ real GPT training setup; it edits `train.py`, trains for ~5 minutes, checks
 whether `val_bpb` improved, keeps or reverts, and repeats. Wake up the next
 morning to a log of experiments and (hopefully) a better model.
 
-This folder wraps the upstream repo three ways:
+This folder wraps the upstream repo four ways:
 
 1. **Mode A — Claude Code (faithful Karpathy)** — open Claude Code in
    `upstream/`, point it at `program.md`, walk away.
@@ -15,17 +15,25 @@ This folder wraps the upstream repo three ways:
 3. **Mode C — Flyte workflow with TUI reports** — `flyte run --local workflow.py`
    wraps each iteration as a Flyte task so the Flyte TUI shows per-iteration
    change descriptions, val_bpb, status, and log tails as they happen.
+4. **Mode D — Local-LLM agent (Ollama)** — `python driver.py --agent local`
+   swaps Claude for any local model served by Ollama (default `qwen3-coder-next`,
+   easy to swap to Gemma 4, DeepSeek-Coder, etc.). Honest about the gap — small
+   models will fail more, and *seeing how they fail* is the demo.
 
 ```
 topics/autoresearch/
-├── README.md           ← you are here
-├── requirements.txt    ← deps for the wrapper (driver/workflow), not training
-├── driver.py           ← one iteration = propose → train → keep/revert
-├── workflow.py         ← Flyte wrapper around driver, renders HTML reports
-└── upstream/           ← cloned karpathy/autoresearch (its own git repo)
+├── README.md                ← you are here
+├── requirements.txt         ← deps for the wrapper (driver/workflow), not training
+├── driver.py                ← one iteration = propose → train → keep/revert
+├── workflow.py              ← Flyte wrapper around driver, renders HTML reports
+├── local_agent.py           ← Mode D: Ollama HTTP client + diff sanitize + git apply
+├── instructions/
+│   ├── karpathy.md          ← default agent brief (copy of upstream/program.md)
+│   └── karpathy_verbose.md  ← verbose variant for small local models
+└── upstream/                ← cloned karpathy/autoresearch (its own git repo)
     ├── prepare.py
-    ├── train.py        ← the file the agent edits
-    ├── program.md      ← the agent's brief
+    ├── train.py             ← the file the agent edits
+    ├── program.md           ← the agent's brief
     └── pyproject.toml
 ```
 
@@ -91,19 +99,21 @@ works. Watching it debug a GPU you yourself don't fully understand is, frankly,
 a more compelling demo than watching it tune `n_embd`.
 
 …and then it actually did the research. Once the kernel situation
-stabilized, the loop landed six kept commits in a row, taking val_bpb
-from **1.819 → 1.395** (–23% relative):
+stabilized, the loop took val_bpb from **1.819 → 1.395** (–23% relative)
+across six kept commits, plus a clean discard that proved the
+reject-and-revert path works:
 
-| # | commit  | val_bpb  | VRAM   | description                                          |
-|---|---------|----------|--------|------------------------------------------------------|
-| 0 | 567db9f | 1.818913 | 44.0 G | baseline (FA3 → flex_attention for sm_121a compat)   |
-| 1 | e1181b8 | 1.821681 | 44.0 G | SDPA instead of flex, drop sliding window — *kept despite a +0.003 regression because the code was simpler and SDPA is faster downstream* |
-| 2 | 9dfa100 | 1.793186 | 87.2 G | DEVICE_BATCH_SIZE 128→256 (grad_accum 2→1)           |
-| 3 | 3b9d79d | **1.467645** | 27.9 G | DEPTH 8→4 (50M → 11.5M params; **110 steps vs 39**) |
-| 4 | 4d93489 | 1.424601 | 13.1 G | DEPTH 4→2 (3.5M params; 247 steps) — kept exploring "smaller = more steps wins" |
-| 5 | 29c26a9 | **1.395246** | 23.2 G | DEPTH 2→3 (10.7M params; 132 steps) — backed off, found the sweet spot |
+| # | commit  | val_bpb  | VRAM   | status   | description                                          |
+|---|---------|----------|--------|----------|------------------------------------------------------|
+| 0 | 567db9f | 1.818913 | 44.0 G | keep     | baseline (FA3 → flex_attention for sm_121a compat)   |
+| 1 | e1181b8 | 1.821681 | 44.0 G | keep     | SDPA instead of flex, drop sliding window — *kept despite a +0.003 regression because the code was simpler and SDPA is faster downstream* |
+| 2 | 9dfa100 | 1.793186 | 87.2 G | keep     | DEVICE_BATCH_SIZE 128→256 (grad_accum 2→1)           |
+| 3 | 3b9d79d | **1.467645** | 27.9 G | keep     | DEPTH 8→4 (50M → 11.5M params; **110 steps vs 39**) |
+| 4 | 4d93489 | 1.424601 | 13.1 G | keep     | DEPTH 4→2 (3.5M params; 247 steps) — kept exploring "smaller = more steps wins" |
+| 5 | 29c26a9 | **1.395246** | 23.2 G | keep     | DEPTH 2→3 (10.7M params; 132 steps) — backed off, found the sweet spot |
+| 6 | 5a815c4 | 1.503361 | 30.8 G | **discard** | ASPECT_RATIO 64→128 (17.9M params, only 96 steps) — wider model lost the step-budget tradeoff, reverted |
 
-Two things worth pointing out:
+Three things worth pointing out:
 
 1. **The biggest single jump** (–0.32 val_bpb at iter 3) came from
    *shrinking* the model. The agent figured out that on GB10's
@@ -120,8 +130,14 @@ Two things worth pointing out:
    executed across two commits — exactly what a careful human would do,
    except the agent didn't need a Jupyter notebook to run the sweep.
 
-The val_bpb / memory / one-line description triple in `results.tsv`
-does the narrative work — you can read the agent's reasoning in 6 rows
+3. **Iter 6 is the first discard** — proves the reject-and-revert path
+   isn't theoretical. Widening (`ASPECT_RATIO 64→128`) lost the same
+   step-budget tradeoff the agent had just been winning on the depth
+   axis. Run logged, branch reset, kept val_bpb unchanged. Without this
+   guardrail the loop drifts; with it, the metric is monotonic.
+
+The val_bpb / memory / status / description quad in `results.tsv` does
+the narrative work — you can read the agent's reasoning in 7 rows
 without ever opening a diff.
 
 ## Hardware
@@ -192,7 +208,15 @@ stop it. Best for an unattended overnight run.
 keep-or-revert, append to `results.tsv`.
 
 ```bash
+# Default: Claude Sonnet, the karpathy.md instructions
 python driver.py --tag demo --iterations 3
+
+# Pick a different Claude model
+python driver.py --tag opus-test --iterations 3 --model opus
+
+# Use a custom instructions file (e.g. one focused on optimizer tuning)
+python driver.py --tag opt-focus --iterations 3 \
+    --instructions instructions/my_optimizer_brief.md
 ```
 
 Useful when you want a finite run with no UI, e.g. a quick demo or a CI smoke.
@@ -218,6 +242,134 @@ Why Flyte for what is essentially a sequential loop? Two reasons that matter
 for a stream demo: (1) the TUI gives clean per-step visibility without writing
 your own UI; (2) the same workflow can be deployed to a remote Flyte cluster
 later without changing the iteration code.
+
+## Mode D — Local-LLM agent (Ollama)
+
+Swap Claude for any model served by Ollama. Useful for: keeping the loop
+fully offline, comparing how different small open models reason about ML
+research ("Qwen vs Gemma 4 vs DeepSeek bake-off"), or testing how much of
+the demo is the model vs the methodology.
+
+### One-time Ollama setup
+
+```bash
+# 1. Install Ollama (if not already): https://ollama.com/download
+# 2. Start the server (default port 11434)
+ollama serve &
+
+# 3. Pull the default model — qwen3-coder-next is the strongest open coder
+#    that fits on a single GPU and the one that worked well in our auto-rel
+#    pipeline. ~50GB download, one-time.
+ollama pull qwen3-coder-next
+```
+
+### Run with the local agent
+
+Same `driver.py` and `workflow.py`, just add `--agent local`:
+
+```bash
+# Headless (Mode B-style) with the default local model
+python driver.py --tag local-demo --iterations 3 --agent local
+
+# Headless with a specific model
+python driver.py --tag gemma4-test --iterations 3 \
+    --agent local --model gemma4:something
+
+# Flyte TUI version (Mode C-style) with local agent
+flyte run --local workflow.py run_autoresearch \
+    --tag local-flyte --iterations 3 --agent local
+```
+
+### What's different from Mode B/C
+
+- **Different prompt** — `instructions/karpathy_verbose.md` is loaded by
+  default for `--agent local`. Small models need explicit edit format,
+  concrete examples, and a "common mistakes" list. Override with
+  `--instructions <path>` for a different brief.
+- **Single-shot, no tool use** — the local model gets ONE shot per iteration
+  to output one or more `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE` blocks
+  (aider-style). We do literal substitution against `train.py`. If any block
+  has no unique match or the model's output is malformed, the iteration is
+  logged as `discard` with a `[TAG]` describing the failure, and the loop
+  moves on. No retry, no reflection (see "Why no reflection?" below).
+- **Why search/replace, not unified diff** — first attempt used `git apply`
+  on a unified diff. Result on `qwen3-coder-next`: **0/3 iterations applied**
+  ("corrupt patch", "patch failed at line 599"). The *reasoning* in the
+  descriptions was correct ("reduce DEPTH from 3 to 2"), but small models
+  can't reliably compute `@@ -line,count @@` headers against a 700-line file.
+  Switching to search/replace got 3/3 iterations to apply on the next test.
+  This is also why aider, Cursor, and similar tools use this format.
+- **No `bypassPermissions` worry** — the local agent doesn't have general
+  shell or filesystem access. It outputs text; we validate and substitute.
+- **Configurable via env vars** — `OLLAMA_URL` (default
+  `http://localhost:11434`), `AUTORESEARCH_LOCAL_MODEL` (default
+  `qwen3-coder-next`).
+
+### Honest expectations
+
+Small local models are noticeably worse than Sonnet at this task. Expect:
+
+- **Higher discard rate** — both from "experiment was a bad idea" and from
+  output-format failures (e.g. `[SEARCH NOT FOUND]` when the model retypes
+  context from memory instead of copying it).
+- **Limited cross-iteration coherence** — the model receives the full
+  results history each iteration, but small models tend not to use it well.
+  In our first qwen3-coder-next run on a depth=3 baseline, the model tried
+  depth 3→2 *twice* in 3 iterations even though the first attempt was
+  already in the discard log. Claude doesn't do this.
+- **Some genuinely interesting moves anyway** — especially when the local
+  optimum is non-obvious. In the same test, the model independently
+  rediscovered that depth=3 is a local optimum on GB10 (tested both 2 and
+  4, both worse) — same conclusion the Claude run reached, just via
+  brute-force exploration instead of binary search.
+- **Failure modes that *differ* from Claude's** — which is the demo.
+
+### Why no reflection / retry?
+
+Auto-rel (the cousin project this borrows from) uses up to 10 fix
+iterations per project because the project must work. Autoresearch is the
+opposite — failure is normal, expected, and informative. Karpathy's
+program.md literally says *"If the idea itself is fundamentally broken,
+just skip it, log 'crash', and move on."* Adding reflection would mask
+the local model's failure modes, which are the most interesting part of
+the comparison.
+
+### Reading failure tags in results.tsv
+
+When the local agent fails to produce a valid edit, the iteration is
+logged as `discard` and the description gets a leading `[TAG]` so you can
+diagnose what went wrong without opening the run log:
+
+| Tag | Meaning |
+|-----|---------|
+| `[OLLAMA UNREACHABLE]`  | Couldn't reach `OLLAMA_URL`. Check `ollama serve` is running. |
+| `[INVALID OUTPUT: no SEARCH/REPLACE blocks]` | Model returned text but no parseable blocks. Often the model emitted prose instead of following the format. |
+| `[SEARCH NOT FOUND ...]` | Model produced a SEARCH block whose text doesn't appear in `train.py` — usually because the model retyped from memory instead of copying exactly (whitespace, indentation drift). |
+| `[AMBIGUOUS MATCH ...]`  | SEARCH text appears multiple times in `train.py`. Model picked too-short context; needs a unique surrounding line. |
+| `[git add failed: …]` / `[git commit failed: …]` | Edit applied but git balked. Usually means the model touched something it shouldn't have. |
+
+Same `[TIMEOUT]` and `[crash]` tags from Mode B/C also apply when
+training itself misbehaves — those are agent-agnostic.
+
+## Customizing the agent's brief (instructions/)
+
+`instructions/` is the customization surface — drop in a new markdown
+file and point the driver at it with `--instructions path/to/yours.md`.
+Two ship by default:
+
+- `karpathy.md` — verbatim copy of `upstream/program.md`. Default for `--agent claude`.
+- `karpathy_verbose.md` — adds explicit diff-format rules, concrete edit
+  examples, and a "common mistakes" list. Default for `--agent local`.
+
+Things you might want a custom brief for:
+- Steering research direction ("focus on optimizer tweaks only")
+- Demoing program.md as the real programming surface (run two iterations
+  of the loop with two different briefs, compare arcs)
+- Adapting the loop to a non-pretraining target (e.g. shrink an existing
+  model to match throughput)
+
+The brief is the actual lever — same code, different markdown, different
+research behavior. That's the point karpathy is making with program.md.
 
 ## Where results land
 
