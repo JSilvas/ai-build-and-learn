@@ -10,7 +10,8 @@ Responsibilities:
   - Repeat until the time budget is exhausted
 
 Usage:
-    python agent.py
+    python agent.py               # production run
+    python agent.py --dry-run     # smoke test — no Firestore writes
 
 Environment variables:
     ANTHROPIC_API_KEY   — required, Claude API key
@@ -18,6 +19,7 @@ Environment variables:
     RUN_HOURS           — optional, overnight budget in hours (default: 8)
 """
 
+import argparse
 import difflib
 import os
 import shutil
@@ -226,8 +228,11 @@ def _run_training() -> tuple[str, int]:
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def run() -> None:
+def run(dry_run: bool = False) -> None:
     """Run the AutoResearch agent loop for RUN_HOURS hours."""
+    if dry_run:
+        print("DRY RUN — Firestore writes disabled. No data will be persisted.")
+
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
     program = _read_file(PROGRAM_MD)
@@ -241,12 +246,16 @@ def run() -> None:
         "dataset": "TinyStories",
         "gpu": "T4",
     }
-    try:
-        run_id = firestore_logger.create_run(config=initial_config, project_id=gcp_project)
-    except Exception as e:
-        print(f"WARNING: Firestore create_run failed: {e}. Continuing without Firestore logging.")
+    if dry_run:
         run_id = None
-    print(f"Run started: {run_id}")
+        print("Run started: (dry run — no Firestore)")
+    else:
+        try:
+            run_id = firestore_logger.create_run(config=initial_config, project_id=gcp_project)
+        except Exception as e:
+            print(f"WARNING: Firestore create_run failed: {e}. Continuing without Firestore logging.")
+            run_id = None
+        print(f"Run started: {run_id}")
 
     deadline = time.time() + RUN_SECONDS
 
@@ -353,7 +362,7 @@ def run() -> None:
             "train_loss": result.train_loss,
             "step_count": result.step_count,
         }
-        if run_id is not None:
+        if run_id is not None and not dry_run:
             try:
                 firestore_logger.log_experiment(
                     run_id=run_id,
@@ -375,7 +384,7 @@ def run() -> None:
         checkpoint.save(run_id, current_val_bpb, experiment_number, experiment_history)
 
     # Close the run
-    if run_id is not None:
+    if run_id is not None and not dry_run:
         try:
             firestore_logger.close_run(run_id, experiment_number, project_id=gcp_project)
         except Exception as e:
@@ -386,4 +395,7 @@ def run() -> None:
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true", help="Skip all Firestore writes (use for smoke tests)")
+    args = parser.parse_args()
+    run(dry_run=args.dry_run)
