@@ -77,17 +77,31 @@ Three consecutive kept experiments, each halving the batch size — the agent re
 - **Exp 40–58:** Steady convergence toward 1.4, mostly reverted late in the run
 
 ### Key finding
-The agent rediscovered the same insight as Run 1 — **TOTAL_BATCH_SIZE reduction** was the primary driver. Starting from a clean baseline, the agent reached the same conclusion independently by experiment 11.
+The agent rediscovered the same insight as Run 1 — **TOTAL_BATCH_SIZE reduction** was the primary driver. Starting from a clean baseline, the agent reached the same conclusion independently by experiments 11–12, mirroring the Run 1 pattern exactly.
+
+| Experiment | Change | Delta |
+|---|---|---|
+| Exp 11 | TOTAL_BATCH_SIZE 2^17 → 2^16 | -0.1270 |
+| Exp 12 | TOTAL_BATCH_SIZE 2^16 → 2^15 | -0.7398 (best) |
+
+Two consecutive kept experiments, each halving batch size — same sequence as Run 1 experiments 9–10.
 
 ### Best single change
-> **-0.7398** — Experiment 11: reducing TOTAL_BATCH_SIZE from 2^17 to 2^16 gave a strong improvement, suggesting more frequent gradient updates are beneficial within the 5-minute budget for this shallow, fast model.
+> **-0.7398** — Experiment 12: reducing TOTAL_BATCH_SIZE from 2^16 to 2^15 (~65K → ~32K tokens per gradient update), yielding 299 optimizer steps in 361s. Identical lever as Run 1's best experiment.
 
 ---
 
 ## Observations
 
 ### Both runs converged on the same insight
-Without any human guidance, both the `agent.py` loop and the `flyte_workflow.py` loop independently identified that **reducing TOTAL_BATCH_SIZE** is the dominant optimization for a 5-minute training budget on a T4. The agent discovered this by experiment 9–11 in both runs.
+Without any human guidance, both the `agent.py` loop and the `flyte_workflow.py` loop independently identified that **reducing TOTAL_BATCH_SIZE** is the dominant optimization for a 5-minute training budget on a T4. The agent discovered this by experiment 9–12 in both runs, following the same two-step halving pattern:
+
+| Halving step | Run 1 | Run 2 |
+|---|---|---|
+| 2^17 → 2^16 (~131K → ~65K tokens) | Exp 9, delta **-0.1144** | Exp 11, delta **-0.1270** |
+| 2^16 → 2^15 (~65K → ~32K tokens) | Exp 10, delta **-0.4966** | Exp 12, delta **-0.7398** |
+
+The second halving consistently produced the larger gain in both runs — the agent didn't stop after the first improvement, it recognized the pattern and kept pushing.
 
 ### Fewer experiments in Run 2
 Run 2 completed 58 experiments vs 80 in Run 1. Likely causes:
