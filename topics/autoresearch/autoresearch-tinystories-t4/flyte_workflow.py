@@ -157,14 +157,25 @@ def run(dry_run: bool = False) -> None:
 
     deadline = time.time() + RUN_SECONDS
 
-    # Baseline measurement as a Flyte task
-    # local_persistence=True enables TUI visibility via `flyte start tui`
     flyte.init(local_persistence=True)
-    baseline_run = flyte.run(measure_baseline)
-    current_val_bpb = baseline_run.outputs().o0
 
-    experiment_number  = 0
-    experiment_history = []
+    # Resume from checkpoint if one exists (e.g. after a crash or credit pause)
+    prior = checkpoint.load()
+    if prior is not None:
+        print(f"Resuming from checkpoint saved at {prior['saved_at']}")
+        print(f"  experiment_number={prior['experiment_number']}  val_bpb={prior['current_val_bpb']:.6f}")
+        current_val_bpb    = prior["current_val_bpb"]
+        experiment_number  = prior["experiment_number"]
+        experiment_history = prior["experiment_history"]
+        if not run_id and prior.get("run_id"):
+            run_id = prior["run_id"]
+    else:
+        # Baseline measurement as a Flyte task
+        # local_persistence=True enables TUI visibility via `flyte start tui`
+        baseline_run = flyte.run(measure_baseline)
+        current_val_bpb = baseline_run.outputs().o0
+        experiment_number  = 0
+        experiment_history = []
 
     while time.time() < deadline:
         experiment_number += 1
