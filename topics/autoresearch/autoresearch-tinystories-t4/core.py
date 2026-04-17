@@ -194,6 +194,119 @@ def run_training() -> tuple[str, int]:
     return result.stdout + "\n" + result.stderr, result.returncode
 
 
+def propose_change(
+    client: anthropic.Anthropic,
+    program: str,
+    experiment_history: list[dict],
+) -> tuple[str, str, str]:
+    """Read current train.py, call Claude, parse the proposed change.
+
+    Returns (reasoning, new_train_py, current_train).
+    Raises ValueError if the response cannot be parsed.
+    Raises anthropic.APIError after _MAX_API_RETRIES failed attempts.
+    """
+    current_train = read_file(TRAIN_SCRIPT)
+    response_text = call_claude(client, program, current_train, experiment_history)
+    reasoning, new_train_py = parse_llm_response(response_text)
+    return reasoning, new_train_py, current_train
+
+
+def apply_and_train(new_train_py: str, current_train: str) -> tuple[str, int, str]:
+    """Back up train.py, write the new version, and run training.
+
+    Returns (training_output, returncode, change_diff).
+    returncode -2 signals a training timeout; train.py is already reverted.
+    Any other non-zero returncode means training failed; train.py still needs revert.
+    """
+    shutil.copy(TRAIN_SCRIPT, TRAIN_BACKUP)
+    write_file(TRAIN_SCRIPT, new_train_py)
+    change_diff = compute_diff(current_train, new_train_py)
+    try:
+        training_output, returncode = run_training()
+        return training_output, returncode, change_diff
+    except subprocess.TimeoutExpired:
+        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
+        return "", -2, change_diff
+
+
+def evaluate_and_log(
+    current_val_bpb: float,
+    training_output: str,
+    returncode: int,
+    change_diff: str,
+    reasoning: str,
+    run_id: str | None,
+    experiment_number: int,
+    exp_start: str,
+    exp_start_time: float,
+    gcp_project: str | None,
+    dry_run: bool = False,
+) -> "ExperimentOutcome":
+    """Keep/revert decision, build the experiment record, and log to Firestore.
+
+    returncode -2 means training timed out and train.py is already reverted.
+    Any other non-zero returncode means training failed; this function reverts.
+    """
+    duration = round(time.time() - exp_start_time, 1)
+
+    if returncode != 0:
+        if returncode != -2:
+            shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
+        print(f"Training failed (code={returncode}) — skipping.")
+        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
+
+    new_val_bpb = metrics.parse_val_bpb(training_output)
+    if new_val_bpb is None:
+        print("Could not parse val_bpb — reverting.")
+        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
+        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
+
+    result = metrics.build_experiment_result(current_val_bpb, new_val_bpb, training_output)
+
+    if result.kept:
+        print(f"KEPT   val_bpb {current_val_bpb:.6f} → {new_val_bpb:.6f} (delta={result.delta:+.6f})")
+        updated_val_bpb = new_val_bpb
+    else:
+        print(f"REVERT val_bpb {current_val_bpb:.6f} → {new_val_bpb:.6f} (delta={result.delta:+.6f})")
+        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
+        updated_val_bpb = current_val_bpb
+
+    exp_record = {
+        "experiment_number":  experiment_number,
+        "started_at":         exp_start,
+        "duration_seconds":   duration,
+        "change_description": reasoning[:2000],
+        "change_diff":        change_diff,
+        "val_bpb_before":     result.val_bpb_before,
+        "val_bpb_after":      result.val_bpb_after,
+        "delta":              result.delta,
+        "kept":               result.kept,
+        "train_loss":         result.train_loss,
+        "step_count":         result.step_count,
+    }
+
+    if run_id is not None and not dry_run:
+        try:
+            firestore_logger.log_experiment(
+                run_id=run_id,
+                project_id=gcp_project,
+                experiment_number=exp_record["experiment_number"],
+                started_at=exp_record["started_at"],
+                duration_seconds=exp_record["duration_seconds"],
+                change_description=exp_record["change_description"],
+                change_diff=exp_record["change_diff"],
+                val_bpb_before=exp_record["val_bpb_before"],
+                val_bpb_after=exp_record["val_bpb_after"],
+                kept=exp_record["kept"],
+                train_loss=exp_record["train_loss"],
+                step_count=exp_record["step_count"],
+            )
+        except Exception as e:
+            print(f"WARNING: Firestore log_experiment failed: {e}. Continuing.")
+
+    return ExperimentOutcome(skipped=False, new_val_bpb=updated_val_bpb, exp_record=exp_record)
+
+
 # ── Single experiment ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -227,95 +340,29 @@ def run_single_experiment(
     print(f"Experiment {experiment_number} | val_bpb={current_val_bpb:.6f}")
     print(f"{'='*60}")
 
-    shutil.copy(TRAIN_SCRIPT, TRAIN_BACKUP)
-    current_train = read_file(TRAIN_SCRIPT)
-
-    # Propose a change
+    # Propose
     try:
-        response_text = call_claude(client, program, current_train, experiment_history)
+        reasoning, new_train_py, current_train = propose_change(client, program, experiment_history)
     except Exception as e:
-        print(f"Claude API error after {_MAX_API_RETRIES} attempts: {e}. Skipping.")
-        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
-
-    # Parse response
-    try:
-        reasoning, new_train_py = parse_llm_response(response_text)
-    except ValueError as e:
-        print(f"Parse error: {e}. Skipping.")
+        print(f"Proposal failed: {e}. Skipping.")
         return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
 
     print(f"Change proposed: {reasoning[:200]}")
 
-    # Apply change
-    write_file(TRAIN_SCRIPT, new_train_py)
-    change_diff = compute_diff(current_train, new_train_py)
+    # Apply + train
+    training_output, returncode, change_diff = apply_and_train(new_train_py, current_train)
 
-    # Train
-    print("Training...")
-    try:
-        training_output, returncode = run_training()
-    except subprocess.TimeoutExpired:
-        print("Training timed out — reverting.")
-        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
-        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
-
-    if returncode != 0:
-        print(f"Training failed (exit {returncode}) — reverting.")
-        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
-        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
-
-    # Parse results
-    new_val_bpb = metrics.parse_val_bpb(training_output)
-    if new_val_bpb is None:
-        print("Could not parse val_bpb — reverting.")
-        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
-        return ExperimentOutcome(skipped=True, new_val_bpb=current_val_bpb)
-
-    result   = metrics.build_experiment_result(current_val_bpb, new_val_bpb, training_output)
-    duration = round(time.time() - exp_start_time, 1)
-
-    # Keep or revert
-    if result.kept:
-        print(f"KEPT   val_bpb {current_val_bpb:.6f} → {new_val_bpb:.6f} (delta={result.delta:+.6f})")
-        updated_val_bpb = new_val_bpb
-    else:
-        print(f"REVERT val_bpb {current_val_bpb:.6f} → {new_val_bpb:.6f} (delta={result.delta:+.6f})")
-        shutil.copy(TRAIN_BACKUP, TRAIN_SCRIPT)
-        updated_val_bpb = current_val_bpb
-
-    # Build record
-    exp_record = {
-        "experiment_number": experiment_number,
-        "started_at":        exp_start,
-        "duration_seconds":  duration,
-        "change_description": reasoning[:2000],
-        "change_diff":       change_diff,
-        "val_bpb_before":    result.val_bpb_before,
-        "val_bpb_after":     result.val_bpb_after,
-        "delta":             result.delta,
-        "kept":              result.kept,
-        "train_loss":        result.train_loss,
-        "step_count":        result.step_count,
-    }
-
-    # Log to Firestore
-    if run_id is not None and not dry_run:
-        try:
-            firestore_logger.log_experiment(
-                run_id=run_id,
-                project_id=gcp_project,
-                experiment_number=exp_record["experiment_number"],
-                started_at=exp_record["started_at"],
-                duration_seconds=exp_record["duration_seconds"],
-                change_description=exp_record["change_description"],
-                change_diff=exp_record["change_diff"],
-                val_bpb_before=exp_record["val_bpb_before"],
-                val_bpb_after=exp_record["val_bpb_after"],
-                kept=exp_record["kept"],
-                train_loss=exp_record["train_loss"],
-                step_count=exp_record["step_count"],
-            )
-        except Exception as e:
-            print(f"WARNING: Firestore log_experiment failed: {e}. Continuing.")
-
-    return ExperimentOutcome(skipped=False, new_val_bpb=updated_val_bpb, exp_record=exp_record)
+    # Evaluate + log
+    return evaluate_and_log(
+        current_val_bpb=current_val_bpb,
+        training_output=training_output,
+        returncode=returncode,
+        change_diff=change_diff,
+        reasoning=reasoning,
+        run_id=run_id,
+        experiment_number=experiment_number,
+        exp_start=exp_start,
+        exp_start_time=exp_start_time,
+        gcp_project=gcp_project,
+        dry_run=dry_run,
+    )

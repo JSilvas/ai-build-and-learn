@@ -17,6 +17,7 @@ Environment variables (same as agent.py):
 import argparse
 import os
 import time
+from datetime import datetime, timezone
 
 import anthropic
 import flyte
@@ -26,13 +27,13 @@ load_dotenv()
 
 import checkpoint
 import firestore_logger
-import metrics
 from core import (
     CLAUDE_MODEL,
     PROGRAM_MD,
     read_file,
-    run_single_experiment,
-    run_training,
+    apply_and_train,
+    evaluate_and_log,
+    propose_change,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -59,33 +60,63 @@ async def measure_baseline() -> float:
 
 
 @env.task
-async def run_experiment_task(
+async def propose_change_task(
     experiment_number: int,
     current_val_bpb: float,
     experiment_history: list[dict],
+) -> dict:
+    """Call Claude and parse the proposed train.py change."""
+    client  = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    program = read_file(PROGRAM_MD)
+
+    print(f"\n{'='*60}")
+    print(f"Experiment {experiment_number} | val_bpb={current_val_bpb:.6f}")
+    print(f"{'='*60}")
+
+    reasoning, new_train_py, current_train = propose_change(client, program, experiment_history)
+    print(f"Change proposed: {reasoning[:200]}")
+
+    return {
+        "reasoning":      reasoning,
+        "new_train_py":   new_train_py,
+        "current_train":  current_train,
+        "exp_start":      datetime.now(timezone.utc).isoformat(),
+        "exp_start_time": time.time(),
+    }
+
+
+@env.task
+async def run_training_task(proposal: dict) -> dict:
+    """Apply the proposed change to train.py and run training."""
+    training_output, returncode, change_diff = apply_and_train(
+        proposal["new_train_py"], proposal["current_train"]
+    )
+    return {**proposal, "training_output": training_output, "returncode": returncode, "change_diff": change_diff}
+
+
+@env.task
+async def evaluate_task(
+    training_data: dict,
+    current_val_bpb: float,
+    experiment_number: int,
     run_id: str,
     dry_run: bool,
 ) -> dict:
-    """
-    Run one experiment cycle as a Flyte task.
-
-    Returns a dict with keys: skipped, new_val_bpb, exp_record.
-    """
-    client      = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    program     = read_file(PROGRAM_MD)
+    """Keep/revert decision and Firestore logging."""
     gcp_project = os.getenv("GCP_PROJECT")
-
-    outcome = run_single_experiment(
-        client=client,
-        program=program,
+    outcome = evaluate_and_log(
+        current_val_bpb=current_val_bpb,
+        training_output=training_data["training_output"],
+        returncode=training_data["returncode"],
+        change_diff=training_data["change_diff"],
+        reasoning=training_data["reasoning"],
         run_id=run_id if run_id else None,
         experiment_number=experiment_number,
-        current_val_bpb=current_val_bpb,
-        experiment_history=experiment_history,
+        exp_start=training_data["exp_start"],
+        exp_start_time=training_data["exp_start_time"],
         gcp_project=gcp_project,
         dry_run=dry_run,
     )
-
     return {
         "skipped":     outcome.skipped,
         "new_val_bpb": outcome.new_val_bpb,
@@ -136,15 +167,38 @@ def run(dry_run: bool = False) -> None:
     while time.time() < deadline:
         experiment_number += 1
 
-        exp_run = flyte.run(
-            run_experiment_task,
-            experiment_number=experiment_number,
-            current_val_bpb=current_val_bpb,
-            experiment_history=experiment_history,
-            run_id=run_id,
-            dry_run=dry_run,
-        )
-        result = exp_run.outputs().o0  # returns the dict
+        try:
+            propose_run = flyte.run(
+                propose_change_task,
+                experiment_number=experiment_number,
+                current_val_bpb=current_val_bpb,
+                experiment_history=experiment_history,
+            )
+            proposal = propose_run.outputs().o0
+        except Exception as e:
+            print(f"Experiment {experiment_number}: proposal failed — {e}. Skipping.")
+            continue
+
+        try:
+            train_run     = flyte.run(run_training_task, proposal=proposal)
+            training_data = train_run.outputs().o0
+        except Exception as e:
+            print(f"Experiment {experiment_number}: training task failed — {e}. Skipping.")
+            continue
+
+        try:
+            eval_run = flyte.run(
+                evaluate_task,
+                training_data=training_data,
+                current_val_bpb=current_val_bpb,
+                experiment_number=experiment_number,
+                run_id=run_id,
+                dry_run=dry_run,
+            )
+            result = eval_run.outputs().o0
+        except Exception as e:
+            print(f"Experiment {experiment_number}: evaluate task failed — {e}. Skipping.")
+            continue
 
         if result["skipped"]:
             continue
