@@ -1,0 +1,347 @@
+/*
+ * AutoResearch Dashboard — Gradio UI Styles
+ *
+ * Dark theme consistent with OpenEnv Research Agent demo.
+ *
+ * Sections:
+ *   App shell        — dark layout, header, content area
+ *   Stat cards       — key metric summary blocks
+ *   Experiment table — per-experiment log rows
+ *   Status badges    — kept / reverted indicators
+ *   Run selector     — dropdown styling
+ *   Chart area       — Plotly container
+ */
+
+
+/* ── App shell ───────────────────────────────────────────────────────────── */
+
+body, .gradio-container {
+    background: #0f0f0f !important;
+}
+
+.gradio-container {
+    padding-top: 0 !important;
+}
+
+.app-header {
+    display: flex;
+    align-items: baseline;
+    gap: 16px;
+    padding: 16px 24px;
+    background: #141414;
+    border-bottom: 1px solid #222;
+}
+
+.app-title {
+    font-size: 1.25em;
+    font-weight: 700;
+    color: #ffffff;
+    letter-spacing: -0.01em;
+}
+
+.app-tagline {
+    font-size: 0.82em;
+    color: #888;
+    letter-spacing: 0.04em;
+}
+
+#content-area {
+    background: #0f0f0f !important;
+    padding: 20px 24px !important;
+    flex: 1 !important;
+    min-width: 0 !important;
+    flex-direction: column !important;
+}
+
+.section-heading {
+    font-size: 0.75em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    color: #555;
+    padding-bottom: 8px;
+    border-bottom: 1px solid #222;
+    margin-bottom: 14px;
+    margin-top: 24px;
+}
+
+.chart-heading {
+    font-size: 1.2em;
+    font-weight: 600;
+    color: #e0e0e0;
+    margin-bottom: 4px;
+    margin-top: 24px;
+}
+
+
+/* ── Stat cards ──────────────────────────────────────────────────────────── */
+
+.stat-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+}
+
+.stat-card {
+    background: #141414;
+    border: 1px solid #222;
+    border-radius: 8px;
+    padding: 14px 18px;
+    min-width: 130px;
+    flex: 1;
+}
+
+.stat-label {
+    font-size: 0.70em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #999;
+    margin-bottom: 6px;
+}
+
+.stat-value {
+    font-size: 1.6em;
+    font-weight: 700;
+    color: #e0e0e0;
+    letter-spacing: -0.02em;
+}
+
+.stat-sub {
+    font-size: 0.78em;
+    color: #888;
+    margin-top: 3px;
+}
+
+.stat-good  { border-top: 3px solid #1a7a4a; }
+.stat-warn  { border-top: 3px solid #b7770d; }
+.stat-info  { border-top: 3px solid #2471a3; }
+.stat-neut  { border-top: 3px solid #333; }
+
+
+/* ── Status badges ───────────────────────────────────────────────────────── */
+
+.badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.78em;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+}
+
+.badge-kept     { background: #1a7a4a; color: #fff; }
+.badge-reverted { background: #8b2020; color: #fff; }
+
+
+/* ── Experiment log table ────────────────────────────────────────────────── */
+
+.exp-table-container {
+    max-height: 520px;
+    overflow-y: auto;
+    border: 1px solid #1a1a1a;
+    border-radius: 6px;
+}
+
+.exp-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95em;
+    color: #ddd;
+}
+
+.exp-table th {
+    padding: 9px 12px;
+    text-align: left;
+    background: #1e1e1e;
+    color: #888;
+    font-size: 0.78em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    border-bottom: 1px solid #2a2a2a;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+.exp-table td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #1a1a1a;
+    vertical-align: top;
+    line-height: 1.5;
+}
+
+.exp-table tr:hover td {
+    background: #141414;
+}
+
+.exp-num {
+    color: #888;
+    font-size: 0.9em;
+    font-weight: 600;
+}
+
+.exp-delta-good { color: #2ecc71; font-weight: 600; }
+.exp-delta-bad  { color: #e74c3c; font-weight: 600; }
+.exp-desc       { color: #ccc; line-height: 1.6; }
+.exp-muted      { color: #bbb; }
+.exp-dim        { color: #bbb; }
+
+
+/* ── Summary card ────────────────────────────────────────────────────────── */
+
+.summary-card {
+    border: 1px solid #2a2a2a;
+    border-radius: 6px;
+    overflow: hidden;
+    margin-top: 16px;
+}
+
+.summary-header {
+    background: #1e1e1e;
+    color: #e0e0e0;
+    padding: 10px 16px;
+    font-weight: 700;
+    font-size: 0.95em;
+    border-bottom: 1px solid #2a2a2a;
+}
+
+.summary-body {
+    background: #141414;
+    padding: 14px 16px;
+    color: #bbb;
+    line-height: 1.75;
+    font-size: 0.92em;
+}
+
+.summary-body b  { color: #e0e0e0; }
+.summary-body ul { margin: 6px 0 0; padding-left: 20px; }
+.summary-body li { margin-bottom: 6px; line-height: 1.6; }
+
+
+/* ── Diff viewer ─────────────────────────────────────────────────────────── */
+
+.diff-details {
+    margin-top: 8px;
+}
+
+.diff-summary {
+    font-size: 0.78em;
+    color: #888;
+    cursor: pointer;
+    user-select: none;
+    padding: 2px 0;
+}
+
+.diff-summary:hover {
+    color: #bbb;
+}
+
+.exp-diff {
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    background: #0d0d0d;
+    border: 1px solid #222;
+    border-radius: 4px;
+    font-size: 0.78em;
+    line-height: 1.5;
+    overflow-x: auto;
+    white-space: pre;
+    font-family: monospace;
+    color: #aaa;
+}
+
+.diff-add    { color: #2ecc71; }
+.diff-remove { color: #e74c3c; }
+.diff-header { color: #444; }
+
+
+/* ── Tooltip ─────────────────────────────────────────────────────────────── */
+
+.tooltip-icon {
+    font-size: 13px;
+    color: #888;
+    cursor: help;
+    vertical-align: super;
+    margin-right: 6px;
+}
+
+.tooltip-icon:hover {
+    color: #ccc;
+}
+
+
+/* ── Run selector ────────────────────────────────────────────────────────── */
+
+#run-selector label span {
+    color: #888 !important;
+    font-size: 0.82em !important;
+}
+
+
+/* ── Description expand ──────────────────────────────────────────────────── */
+
+.desc-summary {
+    font-size: 0.92em;
+    color: #ccc;
+    cursor: pointer;
+    line-height: 1.5;
+    list-style: none;
+}
+
+.desc-summary::-webkit-details-marker {
+    display: none;
+}
+
+.desc-summary::after {
+    content: " · more";
+    font-size: 0.82em;
+    color: #888;
+}
+
+details[open] .desc-summary::after {
+    content: " · less";
+    color: #888;
+}
+
+.desc-full {
+    color: #ccc;
+    line-height: 1.6;
+    margin-top: 6px;
+    font-size: 0.92em;
+}
+
+
+/* ── Empty state ─────────────────────────────────────────────────────────── */
+
+.exp-empty {
+    color: #555;
+    font-size: 0.88em;
+}
+
+
+/* ── Loading placeholder ─────────────────────────────────────────────────── */
+
+.loading-card {
+    text-align: center;
+    padding: 48px 16px;
+    color: #555;
+}
+
+.loading-icon {
+    font-size: 1.4em;
+    margin-bottom: 10px;
+}
+
+.loading-message {
+    font-size: 0.92em;
+}
+
+
+/* ── Summary trend colors ────────────────────────────────────────────────── */
+
+.summary-trend-good { color: #2ecc71; }
+.summary-trend-flat { color: #888; }
+.summary-trend-bad  { color: #e74c3c; }
