@@ -24,3 +24,6 @@ google-cloud-firestore>=2.16.0
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 gradio>=4.36.0
 plotly>=5.22.0
+
+# ── Flyte orchestration (optional — T4 only) ──────────────────────────────────
+flyte>=2.1.0
