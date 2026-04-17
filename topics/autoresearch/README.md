@@ -44,7 +44,7 @@ There is no novel agent framework, no clever ML, no new optimization
 technique. The agent is Claude (or Codex, or a local model) in a loop,
 hitting a metric.
 
-So why does anyone care? Three reasons, in decreasing order of substance:
+Why is it interesting?
 
 1. **The constraints are the insight, not the code.** Single editable file +
    read-only eval + fixed 5-minute budget = experiments are *comparable* and
@@ -65,16 +65,33 @@ So why does anyone care? Three reasons, in decreasing order of substance:
    paper-reading subloops. The repo is a wedge for "you program research
    orgs by writing prompts." Whether that pays off is a different question.
 
-The takeaway most people miss: this isn't really about LLM pretraining.
-It's a 700-line lesson in how to bound an agent so it can do useful
+The takeaway:
+How to bound an agent so it can do useful
 closed-loop work. The shape generalizes well past `train.py`.
+
+## The metric: val_bpb
+
+**Validation bits per byte** measures how well the model compresses unseen
+text. Lower is better. If the model predicts the next token well, it needs
+fewer bits to encode it. If it's surprised by every token, it needs many.
+
+Why it's a good fit for autoresearch:
+- **Compression = understanding.** A model that "gets" grammar, facts, and
+  patterns compresses text efficiently. One that's guessing can't. BPB
+  captures "how much did this model learn" in a single number.
+- **Vocab-size independent.** If the agent changes `vocab_size` from 8192
+  to 4096, regular cross-entropy loss isn't comparable anymore. BPB
+  normalizes by actual bytes, so architectural changes are fairly compared.
+- **Theoretically grounded.** Shannon's information theory says the best
+  possible compressor is the true probability distribution of the data.
+  Lower BPB = closer to the true distribution = better language model.
 
 ## Dataset
 
 The model trains on **karpathy's ClimbMix** (`karpathy/climbmix-400b-shuffle`),
 a curated 400B-token mix of high-quality web text, code, and educational
 content. Not TinyStories. The model won't produce coherent text at this scale;
-the exercise is purely about minimizing the `val_bpb` metric.
+the exercise is purely about minimizing val_bpb.
 
 ## Hardware
 

@@ -127,38 +127,100 @@ discovered the depth trick. But its optimizer hill-climbing was clean:
 pushed MATRIX_LR through four steps, correctly rejected the overshoot at
 0.1, pivoted to a different knob (EMBEDDING_LR), repeated the pattern.
 
-### Experiment 4: overnight run
+### Experiment 4: Gemma 4 overnight with diversity prompt
 
 We ran Gemma 4 overnight with `overnight.md`, a prompt that explicitly
-nudges the model to explore diverse axes (architecture, optimizer, batch
-size, attention patterns) instead of fixating on one.
+nudges the model to explore diverse axes instead of fixating on one. The
+question: with the diversity prompt, does Gemma find the depth trick?
 
-```bash
-tmux new -s overnight
-flyte run --local --tui workflow.py run_autoresearch \
-    --tag gemma-overnight --iterations 100 \
-    --agent local --model gemma4:31b \
-    --instructions instructions/overnight.md
-```
+**Yes.** 78 iterations, val_bpb from **1.821 to 1.239**, 16 keeps.
+Best result across all experiments. The diversity prompt worked.
 
-The question: with the diversity prompt, does Gemma find the depth trick
-on its own? Check `saved_runs/` for results.
+Kept improvements (in order):
+
+| # | val_bpb | VRAM | description |
+|---|---------|------|-------------|
+| 0 | 1.821 | 44.0 G | baseline (depth=8, karpathy defaults) |
+| 1 | 1.667 | 26.5 G | **reduce depth from 8 to 6** |
+| 2 | 1.412 | 26.4 G | halve TOTAL_BATCH_SIZE (more optimizer steps) |
+| 3 | 1.405 | 26.4 G | window pattern SSSL to L (full context all layers) |
+| 5 | 1.386 | 26.4 G | WARMDOWN_RATIO 0.5 to 0.3 |
+| 6 | 1.371 | 18.9 G | reduce ASPECT_RATIO 64 to 40 (narrower model) |
+| 8 | **1.272** | 9.5 G | halve batch size again |
+| 11 | **1.269** | 7.1 G | **reduce depth from 6 to 4** |
+| 12 | 1.265 | 7.1 G | add warmup ratio 0.05 |
+| 13 | **1.247** | 3.6 G | halve batch size a third time |
+| 14 | 1.246 | 3.6 G | MATRIX_LR 0.04 to 0.05 |
+| 17 | 1.244 | 3.6 G | UNEMBEDDING_LR 0.004 to 0.01 |
+| 24 | 1.243 | 3.6 G | FINAL_LR_FRAC 0.0 to 0.1 |
+| 36 | 1.241 | 3.6 G | window pattern L to SLLL |
+| 50 | 1.241 | 3.6 G | EMBEDDING_LR 0.6 to 0.8 |
+| 63 | 1.240 | 3.6 G | window pattern SLLL to LLSL |
+| 73 | 1.240 | 3.6 G | warmdown ratio 0.3 to 0.4 |
+| 77 | **1.239** | 3.6 G | warmdown ratio 0.4 to 0.5 |
+
+What makes this run remarkable:
+
+1. **Gemma found the depth trick on its own.** Depth 8 to 6 was its
+   *first* kept change (iter 1), then 6 to 4 at iter 11. It also tried
+   depth 4 to 3 (iter 20, val_bpb 1.323, discarded) and correctly
+   identified depth=4 as the sweet spot for this configuration. The
+   diversity prompt worked.
+
+2. **Explored 7+ different axes.** Model size (depth, aspect ratio),
+   batch size (three successive halvings), learning rates (matrix,
+   embedding, unembedding, scalar), schedule (warmup, warmdown,
+   final LR fraction), window patterns (L, SSSL, SLLL, LLSL, SLSL,
+   LLLS, and more), architecture (head dim, activation function,
+   query-key normalization). The anti-fixation rule ("if your last 3
+   experiments were on the same axis, switch") visibly worked.
+
+3. **Diminishing returns after iter ~25.** The model squeezed 0.58
+   val_bpb out of the first 14 keeps (1.821 to 1.243), then only
+   0.004 out of the last 4 (1.243 to 1.239). It was thoroughly
+   exploring the remaining landscape (window pattern permutations,
+   small LR tweaks) but finding almost nothing. This is what
+   convergence looks like.
+
+4. **Beat everything else.** Final val_bpb 1.239 vs Claude's 1.395
+   and Gemma-clean-slate's 1.547. The diversity prompt + 78 iterations
+   found a configuration (depth=4, narrow, tiny batches, 3.6 GB VRAM)
+   that none of the shorter runs discovered.
+
+### Results summary
+
+| Experiment | Agent | Iterations | Best val_bpb | Strategy |
+|-----------|-------|------------|-------------|----------|
+| 1. Claude Code | Claude Sonnet | 7 | 1.395 | depth axis (8 to 3) |
+| 2. Gemma + history | Gemma 4 31B | ~15 | 1.296 | optimizer (built on Claude's depth wins) |
+| 3. Gemma clean | Gemma 4 31B | 10 | 1.547 | optimizer only (never touched depth) |
+| 4. Gemma overnight | Gemma 4 31B | 78 | **1.239** | everything (depth + optimizer + window + batch) |
 
 ### What we learned
 
 1. **Same harness, different model, different strategy.** Claude did
-   structural surgery (depth axis). Gemma did optimizer tuning (LR axis).
-   Neither tried the other's approach. The model's "research personality"
-   is a real variable.
+   structural surgery (depth axis). Gemma defaulted to optimizer tuning
+   (LR axis). Same problem, same harness, genuinely different research
+   personalities.
 
-2. **The combined strategy wins.** Gemma building on Claude's depth wins
-   (1.296) beat either model alone (Claude: 1.395, Gemma solo: 1.547).
-   Multi-model research pipelines aren't just a cute idea.
+2. **The prompt steers the research.** Without the diversity prompt
+   (experiment 3), Gemma never touched depth in 10 iterations. With it
+   (experiment 4), depth was its *first* change. `program.md` is the
+   real programming surface. Same code, different markdown, different
+   research behavior.
 
-3. **The prompt steers the research.** The `overnight.md` prompt nudges
-   toward diversity. If it works, it proves karpathy's thesis: program.md
-   is the real programming surface. Same code, different markdown,
-   different research behavior.
+3. **More iterations + diverse exploration wins.** Experiment 4's 78
+   iterations found a 1.239 that no short run discovered. The best
+   result came from combining moves across multiple axes: depth
+   reduction (from Claude's playbook) + batch size tuning + LR
+   optimization + window pattern exploration. Breadth of search
+   matters as much as depth.
+
+4. **The combined strategy wins.** Gemma building on Claude's depth
+   wins (experiment 2, val_bpb 1.296) beat either model alone. But
+   Gemma with the diversity prompt (experiment 4, val_bpb 1.239) beat
+   everything. The right prompt on one model can outperform two models
+   with the wrong prompt.
 
 ---
 
