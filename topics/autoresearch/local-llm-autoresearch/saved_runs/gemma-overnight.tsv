@@ -1,0 +1,71 @@
+commit	val_bpb	memory_gb	status	description
+b1bd2ed	1.821129	44.0	baseline	baseline (no edits)
+232198b	1.666954	26.5	keep	reduce depth from 8 to 6 to increase training steps within the time budget
+eb039cf	1.411958	26.4	keep	reduce TOTAL_BATCH_SIZE from 2**19 to 2**18 to increase the number of optimizer updates
+457d85d	1.404714	26.4	keep	change window pattern from "SSSL" to "L" to use full context in all layers
+457d85d	1.410019	26.4	discard	increase MATRIX_LR from 0.04 to 0.06 to accelerate convergence
+ab558bf	1.386496	26.4	keep	reduce WARMDOWN_RATIO from 0.5 to 0.3 to train at peak LR for longer
+46be7bf	1.371277	18.9	keep	reduce ASPECT_RATIO from 64 to 40 to decrease model width and increase training throughput
+46be7bf	1.375046	18.9	discard	reduce weight decay from 0.2 to 0.1 to reduce regularization strength
+f309d95	1.272327	9.5	keep	reduce total batch size and device batch size to increase the number of optimizer updates
+f309d95	1.292655	9.6	discard	reduce HEAD_DIM from 128 to 64 to increase the number of attention heads for the same model width
+f309d95	1.289185	9.5	discard	change MLP activation from squared ReLU to SiLU (Swish) for better gradient flow
+0bc3c90	1.269497	7.1	keep	reduce depth from 6 to 4 to increase training steps
+ab53f4e	1.265202	7.1	keep	introduce a small warmup ratio of 0.05 to improve stability
+41c23f5	1.246888	3.6	keep	reduce TOTAL_BATCH_SIZE and DEVICE_BATCH_SIZE to increase the number of optimizer updates
+2eac1c6	1.245926	3.6	keep	increase MATRIX_LR from 0.04 to 0.05 to accelerate convergence
+2eac1c6	1.316883	2.3	discard	reduce ASPECT_RATIO from 40 to 32 to further decrease model width and increase training throughput
+2eac1c6	1.246499	1.9	discard	reduce TOTAL_BATCH_SIZE and DEVICE_BATCH_SIZE further to increase the number of optimizer updates
+2eac1c6	1.246752	3.6	discard	increase EMBEDDING_LR from 0.6 to 0.8
+8e37598	1.243601	3.6	keep	increase unembedding learning rate from 0.004 to 0.01
+8e37598	1.247290	3.6	discard	reduce WARMDOWN_RATIO from 0.3 to 0.2 to keep the learning rate at its peak for a longer duration
+8e37598	1.322823	2.0	discard	reduce depth from 4 to 3 to increase training steps within the time budget
+8e37598	1.244661	3.6	discard	increase beta1 in ADAM_BETAS from 0.8 to 0.9 for better momentum stability
+8e37598	1.250226	3.6	discard	increase unembedding learning rate from 0.01 to 0.02 to follow up on previous improvement
+8e37598	1.244883	1.9	discard	reduce total batch size and device batch size to increase the number of optimizer updates
+91c8552	1.242621	3.6	keep	increase FINAL_LR_FRAC from 0.0 to 0.1 to prevent LR from decaying to zero
+91c8552	1.243911	3.6	discard	increase weight decay from 0.2 to 0.3 to strengthen regularization
+91c8552	1.246606	3.6	discard	increase MATRIX_LR from 0.05 to 0.06 to accelerate convergence with the current smaller model configuration
+91c8552	1.245822	3.6	discard	reduce EMBEDDING_LR from 0.6 to 0.3 to improve stability for the smaller model
+91c8552	1.244723	3.6	discard	increase FINAL_LR_FRAC from 0.1 to 0.2 to maintain a higher learning rate at the end of training
+91c8552	1.245857	4.2	discard	increase depth from 4 to 5 to increase model capacity while keeping width constant
+91c8552	1.265543	3.3	discard	remove query-key normalization to allow for more expressive attention weights
+91c8552	1.243390	3.6	discard	increase SCALAR_LR from 0.5 to 1.0 to accelerate convergence of residual scaling parameters
+91c8552	1.243444	3.6	discard	increase warmup ratio from 0.05 to 0.1 to improve stability and convergence
+91c8552	1.246049	3.6	discard	reduce warmup ratio from 0.05 to 0.02 to start peak learning rate earlier
+91c8552	1.252232	3.6	discard	increase number of attention heads from 2 to 4 by reducing HEAD_DIM to 64 and increasing ASPECT_RATIO to 64 to keep n_embd constant
+91c8552	1.242659	3.6	discard	change WINDOW_PATTERN from "L" to "SSSL" to reduce attention FLOPs and increase throughput
+33cd64d	1.241516	3.6	keep	change WINDOW_PATTERN from "L" to "SLLL" to potentially increase throughput and improve performance
+33cd64d	1.241532	4.9	discard	increase ASPECT_RATIO from 40 to 70 to increase model width (n_embd) from 256 to 384
+33cd64d	1.242188	3.6	discard	change WINDOW_PATTERN from "SLLL" to "SLSL" to alternate between short and long context windows
+33cd64d	1.242499	3.6	discard	change WINDOW_PATTERN from "SLLL" to "SSLL" to further reduce attention FLOPs and increase throughput
+33cd64d	1.241668	3.6	discard	reduce weight decay from 0.2 to 0.1 to reduce regularization strength
+33cd64d	1.241958	3.6	discard	reduce EMBEDDING_LR from 0.6 to 0.4 to find a more stable learning rate for embeddings
+33cd64d	1.252708	3.6	discard	replace ReLU^2 activation in MLP with GeLU
+33cd64d	1.245498	1.9	discard	reduce TOTAL_BATCH_SIZE and DEVICE_BATCH_SIZE to increase the number of optimizer updates
+33cd64d	1.243064	3.6	discard	change WINDOW_PATTERN from "SLLL" to "LLLL" to use full context in all layers, as the compute overhead for one additional full-attention layer is minimal.
+33cd64d	1.243309	3.6	discard	change WINDOW_PATTERN from "SLLL" to "LSLL" to shift the short-context layer
+33cd64d	1.314149	2.3	discard	reduce ASPECT_RATIO from 40 to 20 to decrease model width and increase throughput
+33cd64d	1.247616	3.6	discard	reduce MATRIX_LR from 0.05 to 0.02 to potentially stabilize training and improve convergence
+33cd64d	1.315539	3.6	discard	increase TOTAL_BATCH_SIZE from 2**16 to 2**17 to improve gradient quality
+8c8390c	1.240978	3.6	keep	increase EMBEDDING_LR from 0.6 to 0.8 to accelerate convergence of token embeddings
+8c8390c	1.245513	3.6	discard	reduce WARMDOWN_RATIO from 0.3 to 0.2 to spend more time at peak learning rate
+8c8390c	1.242944	3.0	discard	try a wider, shallower model (depth 3, aspect ratio 60) to maintain model dimension (256) while increasing throughput
+8c8390c	1.246166	3.6	discard	change ADAM_BETAS from (0.8, 0.95) to (0.9, 0.98) to improve stability of the AdamW optimizer components
+8c8390c	1.282510	3.6	discard	increase UNEMBEDDING_LR from 0.01 to 0.1 to accelerate convergence of the language modeling head
+8c8390c	1.241682	3.6	discard	reduce short window size from 1/2 to 1/4 of long window to increase throughput
+8c8390c	1.244744	4.2	discard	increase depth to 5 and reduce aspect ratio to 30 to keep model dimension constant at 256
+8c8390c	1.241485	3.6	discard	change WINDOW_PATTERN from "SLLL" to "SSSL" to further increase throughput and allow more training steps within the time budget
+8c8390c	1.248174	3.6	discard	increase MATRIX_LR from 0.05 to 0.07 to potentially accelerate convergence of matrix parameters
+8c8390c	1.243526	3.6	discard	increase EMBEDDING_LR from 0.8 to 1.0 to further accelerate convergence of token embeddings
+8c8390c	1.241745	3.6	discard	reduce FINAL_LR_FRAC from 0.1 to 0.01 to allow for better final convergence
+8c8390c	1.257031	4.8	discard	increase model depth from 4 to 6 while maintaining n_embd = 256
+2fe0806	1.240883	3.6	keep	change WINDOW_PATTERN from "SLLL" to "LLSL" to move the short-context layer to a later position in the transformer
+2fe0806	1.263029	3.6	discard	increase UNEMBEDDING_LR from 0.01 to 0.05 to accelerate convergence of the language modeling head
+2fe0806	1.244075	3.6	discard	increase SCALAR_LR from 0.5 to 1.0 to accelerate the adaptation of residual scaling parameters
+2fe0806	1.242101	3.6	discard	change WINDOW_PATTERN from "LLSL" to "LLLS" to move the short-context layer to the very end of the transformer
+2fe0806	1.274777	3.0	discard	reduce HEAD_DIM from 128 to 64 to increase the number of attention heads
+2fe0806	1.243767	3.6	discard	increase WARMUP_RATIO from 0.05 to 0.1 to allow for a more gradual learning rate increase
+2fe0806	1.241325	3.6	discard	change WINDOW_PATTERN from "LLSL" to "LSLS" to alternate short and long context windows
+f2edca0	1.240020	3.6	keep	increase warmdown ratio from 0.3 to 0.4 to allow for a more gradual learning rate decay
+7032c33	1.238728	3.6	keep	increase warmdown ratio from 0.4 to 0.5 to further slow the learning rate decay
