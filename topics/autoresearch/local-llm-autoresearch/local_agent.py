@@ -45,7 +45,7 @@ import requests
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 DEFAULT_MODEL = os.getenv("AUTORESEARCH_LOCAL_MODEL", "qwen3-coder-next")
 
-DEFAULT_TIMEOUT_SEC = 5 * 60
+DEFAULT_TIMEOUT_SEC = int(os.getenv("AUTORESEARCH_AGENT_TIMEOUT", "600"))
 
 SYSTEM_PROMPT = (
     "You are a research assistant that proposes ONE experimental edit to a "

@@ -1,0 +1,29 @@
+commit	val_bpb	memory_gb	status	description
+567db9f	1.818913	44.0	keep	baseline (FA3→flex_attention for sm_121a compat)
+e1181b8	1.821681	44.0	keep	SDPA instead of flex, drop sliding window (simplification, +0.003)
+9dfa100	1.793186	87.2	keep	DEVICE_BATCH_SIZE 128→256 (grad_accum 2→1)
+3b9d79d	1.467645	27.9	keep	DEPTH 8→4 (50M→11.5M params; 110 steps vs 39)
+4d93489	1.424601	13.1	keep	DEPTH 4→2 (3.5M params; 247 steps)
+29c26a9	1.395246	23.2	keep	DEPTH 2→3 (10.7M params; 132 steps)
+5a815c4	1.503361	30.8	discard	ASPECT_RATIO 64→128 (17.9M params, only 96 steps)
+294d33b	1.385104	23.2	baseline	baseline (no edits)
+294d33b	1.376410	23.2	baseline	baseline (no edits)
+294d33b	1.409336	13.1	discard	reduce n_layer from 3 to 2 to further increase training steps within time budget
+294d33b	1.454272	27.9	discard	increase DEPTH from 3 to 4 to recover capacity lost in baseline while keeping time budget
+294d33b	1.409689	13.1	discard	reduce DEPTH from 3 to 2 to increase training steps and potentially improve val_bpb
+294d33b	1.376465	23.2	baseline	baseline (no edits)
+a79018b	1.362026	23.2	keep	reduce WARMDOWN_RATIO from 0.5 to 0.3 to extend peak learning rate duration
+a79018b	1.362219	23.2	baseline	baseline (no edits)
+a79018b	1.380438	23.2	discard	increase MATRIX_LR from 0.08 to 0.1 to accelerate convergence in the limited time budget
+a79018b	1.363721	23.2	baseline	baseline (no edits)
+64f587e	1.380169	23.2	baseline	baseline (no edits)
+a309133	1.367809	23.2	keep	reduce WARMDOWN_RATIO from 0.3 to 0.2 to further extend the peak learning rate duration
+a309133	1.372026	23.2	discard	increase FINAL_LR_FRAC from 0.0 to 0.1 to maintain a higher learning rate at the end of training
+a309133	1.382468	23.2	discard	reduce weight decay from 0.2 to 0.1 to allow the small model to fit the data better
+5435549	1.362113	23.2	keep	reduce EMBEDDING_LR from 0.6 to 0.4 to stabilize training
+5435549	1.399723	23.2	discard	add a small warmup period to stabilize training
+5435549	1.363118	23.2	discard	reduce WARMDOWN_RATIO from 0.2 to 0.1 to further extend the peak learning rate duration
+5435549	1.369672	23.2	discard	reduce EMBEDDING_LR from 0.4 to 0.3 to further stabilize training and improve validation loss
+5435549	1.367658	23.2	discard	reduce MATRIX_LR from 0.08 to 0.07 to slightly slow down convergence and potentially improve stability
+5435549	1.365775	23.2	discard	increase UNEMBEDDING_LR from 0.004 to 0.01 to improve convergence of the language modeling head
+3f4f464	1.295875	11.6	keep	reduce TOTAL_BATCH_SIZE and DEVICE_BATCH_SIZE to increase the number of optimizer updates

@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-UPSTREAM = Path(__file__).parent / "upstream"
+UPSTREAM = Path(__file__).parent.parent / "upstream"
 TRAIN_PY = UPSTREAM / "train.py"
 RESULTS_TSV = UPSTREAM / "results.tsv"
 RUN_LOG = UPSTREAM / "run.log"

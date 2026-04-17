@@ -1,0 +1,12 @@
+commit	val_bpb	memory_gb	status	description
+3c465d6	1.821310	44.0	baseline	baseline (no edits)
+3c465d6	0.000000	0.0	crash	[TIMEOUT] increase model depth from 8 to 10 to improve capacity
+3c465d6	1.852617	44.0	discard	reduce matrix_lr from 0.04 to 0.02
+fdaac19	1.634100	43.8	keep	reduce TOTAL_BATCH_SIZE from 2**19 to 2**18 to increase the number of optimizer updates
+155817b	1.594323	43.8	keep	reduce WARMDOWN_RATIO from 0.5 to 0.2 to maintain higher learning rate for longer
+a66eb4b	1.592829	43.8	keep	increase MATRIX_LR from 0.04 to 0.05 to explore the direction suggested by the failed reduction to 0.02
+a66f681	1.583912	43.8	keep	increase MATRIX_LR from 0.05 to 0.06 to further explore the positive direction
+4ac5473	1.560846	43.8	keep	increase MATRIX_LR from 0.06 to 0.08 to further explore the positive direction
+4ac5473	1.572150	43.8	discard	increase MATRIX_LR from 0.08 to 0.1 to further explore the positive direction
+dfe64f9	1.547348	43.8	keep	increase EMBEDDING_LR from 0.6 to 0.8 to improve embedding convergence
+dfe64f9	1.547552	43.8	discard	increase EMBEDDING_LR from 0.8 to 1.0

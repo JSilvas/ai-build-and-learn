@@ -265,6 +265,40 @@ ollama serve &
 ollama pull qwen3-coder-next
 ```
 
+### Keep the model loaded (important!)
+
+By default, Ollama **evicts the model from GPU** after 5 minutes of
+inactivity. Since autoresearch alternates between agent calls (model on
+GPU) and training runs (PyTorch on GPU), the model gets evicted every
+iteration — and reloading a 31B model from disk takes ~4.5 minutes. This
+turns every iteration into a 10+ minute affair and causes timeouts.
+
+Fix: tell Ollama to keep the model loaded indefinitely. No restart needed:
+
+```bash
+# Tell Ollama to never unload gemma4 (works on the already-running server)
+curl -s http://localhost:11434/api/generate -d '{"model":"gemma4:31b","keep_alive":-1}'
+
+# Warm the model (first load takes ~4 min, subsequent calls are instant)
+ollama run gemma4:31b "say hello"
+```
+
+The DGX Spark has 128 GB unified VRAM — more than enough for both the
+local model (~17 GB for gemma4:31b) and training (~23 GB) to coexist.
+After warming, each agent call drops from ~5 minutes to ~10 seconds.
+
+If Ollama is installed as a system service (common), you can't `pkill`
+it without sudo. Use `sudo systemctl stop ollama` first if you need to
+restart it, or just use the `keep_alive` curl above on the running
+instance.
+
+To apply keep-alive globally (all models, all sessions), restart with:
+
+```bash
+sudo systemctl stop ollama
+OLLAMA_KEEP_ALIVE=-1 ollama serve &
+```
+
 ### Run with the local agent
 
 Same `driver.py` and `workflow.py`, just add `--agent local`:

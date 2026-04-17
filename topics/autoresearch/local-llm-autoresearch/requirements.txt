@@ -23,6 +23,9 @@ flyte[tui]>=2.1.2
 python-dotenv
 markdown
 
+# --- Charts (plot_progress.py) ---
+plotly
+
 # --- Mode D: local agent via Ollama ---
 # `requests` is already a transitive dep of training, listed here explicitly
 # because local_agent.py imports it directly. No `ollama` Python SDK — we use

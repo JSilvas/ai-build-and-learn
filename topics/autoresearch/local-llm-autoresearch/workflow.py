@@ -20,15 +20,58 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
+from dataclasses import dataclass
 
 import flyte
 import flyte.report
+from flyte import Link
 
 import driver
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Custom links — show up in the task-detail panel of the Flyte TUI/web UI
+# ---------------------------------------------------------------------------
+
+REPORT_SERVER_PORT = int(os.getenv("AUTORESEARCH_REPORT_PORT", "8080"))
+
+
+@dataclass
+class ReportLink(Link):
+    """Clickable link that opens the task's HTML report in a browser.
+
+    Requires a tiny HTTP server running on the report dir:
+        python -m http.server 8080 --directory /tmp/flyte/metadata &
+
+    VSCode tunnels auto-forward the port, so localhost:8080 reaches the
+    DGX even when you're remoting in.
+    """
+    name: str = "Report"
+    icon_uri: str = ""
+    port: int = REPORT_SERVER_PORT
+
+    def get_link(self, run_name, action_name, **kwargs):
+        return f"http://localhost:{self.port}/{run_name}/{action_name}/report.html"
+
+
+@dataclass
+class UpstreamLink(Link):
+    """Static link to karpathy's upstream repo."""
+    name: str = "Upstream"
+    icon_uri: str = ""
+    url: str = "https://github.com/karpathy/autoresearch"
+
+    def get_link(self, **kwargs):
+        return self.url
+
+
+report_link = ReportLink()
+upstream_link = UpstreamLink()
 
 env = flyte.TaskEnvironment(
     name="autoresearch-env",
@@ -75,7 +118,7 @@ def _row_to_html(r: driver.IterationResult) -> str:
 # Task: baseline run (no agent, just measure HEAD)
 # ---------------------------------------------------------------------------
 
-@env.task(report=True)
+@env.task(report=True, links=(report_link, upstream_link))
 async def run_baseline(tag: str) -> str:
     branch = driver.ensure_branch(tag)
     driver.ensure_results_tsv()
@@ -97,7 +140,7 @@ async def run_baseline(tag: str) -> str:
 # Task: one experiment iteration
 # ---------------------------------------------------------------------------
 
-@env.task(report=True)
+@env.task(report=True, links=(report_link, upstream_link))
 async def run_iteration(tag: str, iteration: int, prev_best_bpb: float,
                          agent: str = "claude", model: str = "",
                          instructions: str = "") -> str:
@@ -128,7 +171,7 @@ async def run_iteration(tag: str, iteration: int, prev_best_bpb: float,
 # Workflow: orchestrate sequential iterations
 # ---------------------------------------------------------------------------
 
-@env.task(report=True)
+@env.task(report=True, links=(report_link, upstream_link))
 async def run_autoresearch(tag: str, iterations: int = 3,
                             agent: str = "claude", model: str = "",
                             instructions: str = "") -> str:
@@ -186,6 +229,21 @@ def _to_dict(r: driver.IterationResult) -> dict:
     }
 
 
+def _history_to_plot_rows(history: list[dict]) -> list[dict]:
+    """Convert the workflow's in-memory history dicts to the format plot_progress expects."""
+    return [
+        {
+            "experiment": i,
+            "commit": r.get("commit", ""),
+            "val_bpb": r.get("val_bpb"),
+            "memory_gb": r.get("memory_gb"),
+            "status": r.get("status", ""),
+            "description": r.get("description", ""),
+        }
+        for i, r in enumerate(history)
+    ]
+
+
 def _summary_html(tag: str, history: list[dict], suffix: str = "") -> str:
     rows = ""
     for r in history:
@@ -197,9 +255,21 @@ def _summary_html(tag: str, history: list[dict], suffix: str = "") -> str:
             f"<td>{bpb}</td><td>{mem}</td>"
             f"<td>{r['description'][:80]}</td></tr>"
         )
+
+    chart_html = ""
+    try:
+        from plot_progress import build_chart
+        plot_rows = _history_to_plot_rows(history)
+        title = f"AutoResearch — {tag}: {len(history)} experiments"
+        fig = build_chart(plot_rows, title=title)
+        chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
+    except Exception as e:
+        chart_html = f"<p><i>Chart unavailable: {e}</i></p>"
+
     return f"""
 <h2>AutoResearch — {tag}</h2>
 <p>{suffix}</p>
+{chart_html}
 <table border="1" cellpadding="6" style="border-collapse:collapse;">
   <tr style="background:#f6f8fa;">
     <th>#</th><th>Status</th><th>Commit</th>
