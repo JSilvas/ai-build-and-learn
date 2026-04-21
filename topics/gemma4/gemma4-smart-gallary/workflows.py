@@ -69,11 +69,11 @@ async def collect_matches_task(results: list[dict]) -> list[str]:
 
 # ── Workflow runners ──────────────────────────────────────────────────────────
 
-def run_describe_workflow(folder_path: str) -> list[dict]:
+def run_describe_workflow(folder_path: str):
     """
     Process all images in folder_path with Gemma 4 and cache descriptions.
     Each image is a discrete flyte.run() call — visible individually in TUI.
-    Returns list of {path, description} dicts for UI rendering.
+    Yields one {path, description} dict per image as it completes.
     """
     flyte.init(local_persistence=True)
 
@@ -81,17 +81,16 @@ def run_describe_workflow(folder_path: str) -> list[dict]:
     image_paths = scan_run.outputs().o0
 
     if not image_paths:
-        return []
+        return
 
     results = []
     for path in image_paths:
         run    = flyte.run(describe_image_task, image_path=path)
         result = run.outputs().o0
         results.append(result)
+        yield result
 
     flyte.run(save_descriptions_task, results=results)
-
-    return results
 
 
 def run_search_workflow(folder_path: str, query: str) -> dict:

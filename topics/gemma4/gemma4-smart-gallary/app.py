@@ -8,7 +8,9 @@ Usage:
     Terminal 2: python app.py
 """
 
+import tkinter as tk
 from pathlib import Path
+from tkinter import filedialog
 
 import gradio as gr
 
@@ -22,33 +24,49 @@ _CSS = (Path(__file__).parent / "styles.css").read_text()
 
 # ── Event handlers ────────────────────────────────────────────────────────────
 
-def on_generate(folder_path: str) -> tuple[str, str]:
+def on_browse() -> str:
+    """Open native OS folder picker and return selected path."""
+    root = tk.Tk()
+    root.withdraw()
+    root.wm_attributes("-topmost", True)
+    folder = filedialog.askdirectory(title="Select Image Folder")
+    root.destroy()
+    return folder or ""
+
+
+def on_generate(folder_path: str):
     if not folder_path or not Path(folder_path).is_dir():
-        return ui.status_message("Please enter a valid folder path.", "error"), ""
+        yield ui.status_message("Please select a valid folder.", "error"), ""
+        return
 
-    yield ui.loading_card(f"Scanning folder..."), ""
+    yield ui.loading_card("Scanning folder..."), ""
 
+    cards = []
     try:
-        results = workflows.run_describe_workflow(folder_path)
+        for result in workflows.run_describe_workflow(folder_path):
+            cards.append(ui.image_card(result["path"], result["description"]))
+            grid = ui.results_grid(cards, label="images described")
+            yield ui.status_message(f"Processing... {len(cards)} done", ""), grid
     except Exception as e:
         yield ui.status_message(f"Error: {e}", "error"), ""
         return
 
-    if not results:
+    if not cards:
         yield ui.status_message("No supported images found in folder.", "warn"), ""
         return
 
-    cards = [ui.image_card(r["path"], r["description"]) for r in results]
-    grid  = ui.results_grid(cards, label="images described")
-    yield ui.status_message(f"Done — {len(results)} images processed.", "success"), grid
+    grid = ui.results_grid(cards, label="images described")
+    yield ui.status_message(f"Done — {len(cards)} images processed.", "success"), grid
 
 
-def on_search(folder_path: str, query: str) -> tuple[str, str]:
+def on_search(folder_path: str, query: str):
     if not folder_path or not Path(folder_path).is_dir():
-        return ui.status_message("Please enter a valid folder path.", "error"), ""
+        yield ui.status_message("Please select a valid folder.", "error"), ""
+        return
 
     if not query.strip():
-        return ui.status_message("Please enter a search query.", "warn"), ""
+        yield ui.status_message("Please enter a search query.", "warn"), ""
+        return
 
     yield ui.loading_card(f'Searching for "{query}"...'), ""
 
@@ -75,25 +93,48 @@ with gr.Blocks(css=_CSS, title="Gemma 4 Smart Gallery") as demo:
     gr.HTML(ui.app_header())
 
     with gr.Row():
-        folder_input = gr.Textbox(
-            label="Image Folder Path",
-            placeholder="/path/to/your/images",
-            scale=4,
-        )
 
-    with gr.Row():
-        generate_btn = gr.Button("Generate Descriptions", variant="primary")
+        # ── Left sidebar ──────────────────────────────────────────────────────
+        with gr.Column(scale=1, min_width=300):
+            gr.HTML('<div class="sidebar">')
+            gr.HTML('<div class="sidebar-section"><div class="sidebar-label">Image Folder</div></div>')
 
-    with gr.Row():
-        search_input = gr.Textbox(
-            label="Search",
-            placeholder='e.g. ocean, dog, sunset',
-            scale=3,
-        )
-        search_btn = gr.Button("Search", variant="secondary", scale=1)
+            folder_input = gr.Textbox(
+                label="Folder Path",
+                placeholder="Click Browse to select a folder",
+                lines=2,
+                max_lines=2,
+                interactive=True,
+            )
 
-    status_out = gr.HTML(ui.empty_state())
-    results_out = gr.HTML()
+            browse_btn = gr.Button("Browse...", variant="secondary", size="sm")
+
+            generate_btn = gr.Button("Generate Descriptions", variant="primary", size="lg")
+
+            gr.HTML('<hr class="sidebar-divider">')
+
+            search_input = gr.Textbox(
+                label="Search",
+                placeholder="e.g. ocean, dog, sunset",
+                lines=1,
+            )
+
+            search_btn = gr.Button("Search", variant="secondary", size="lg")
+
+            gr.HTML('</div>')
+
+        # ── Main results area ─────────────────────────────────────────────────
+        with gr.Column(scale=3):
+            status_out  = gr.HTML(ui.empty_state())
+            results_out = gr.HTML()
+
+    # ── Event wiring ──────────────────────────────────────────────────────────
+
+    browse_btn.click(
+        fn=on_browse,
+        inputs=[],
+        outputs=[folder_input],
+    )
 
     generate_btn.click(
         fn=on_generate,
