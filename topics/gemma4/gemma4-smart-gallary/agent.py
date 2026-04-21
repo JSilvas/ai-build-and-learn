@@ -28,9 +28,14 @@ def cmd_describe(folder: str) -> None:
 
 def cmd_search(folder: str, query: str) -> None:
     print(f'Searching for "{query}" in: {folder}')
-    result  = workflows.run_search_workflow(folder, query)
-    total   = result["total"]
-    matches = result["matches"]
+    matches = []
+    total   = 0
+    for update in workflows.run_search_workflow(folder, query):
+        total = update["total"]
+        if not update["done"]:
+            print(f"  Checked {update['checked']}/{total}...")
+        else:
+            matches = update["matches"]
 
     print(f"\nSearched {total} image(s) — {len(matches)} matched \"{query}\".")
 

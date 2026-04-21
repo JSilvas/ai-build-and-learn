@@ -8,8 +8,10 @@
   --color-text:         #e0e0e0;
   --color-text-muted:   #aaaaaa;
   --color-text-dim:     #555555;
-  --color-accent:       #4f9cf9;
-  --color-accent-hover: #3a8ae8;
+  --color-accent:        #4f9cf9;
+  --color-accent-hover:  #3a8ae8;
+  --color-primary:       #f97316;
+  --color-primary-hover: #ea6c0a;
   --color-success:      #2ecc71;
   --color-warn:         #f39c12;
   --color-error:        #e74c3c;
@@ -96,6 +98,9 @@ body {
 }
 
 .sidebar-label {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
   font-size: var(--font-size-sm);
   font-weight: var(--font-weight-medium);
   color: var(--color-text-muted);
@@ -107,6 +112,59 @@ body {
   border: none;
   border-top: 1px solid var(--color-border);
   margin: var(--space-sm) 0;
+}
+
+/* ── Tooltip icon ───────────────────────────────────────────────────────────── */
+.tooltip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1em;
+  height: 1em;
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
+  color: var(--color-text-muted);
+  border: 1.5px solid var(--color-text-muted);
+  border-radius: var(--radius-full);
+  cursor: help;
+  font-style: normal;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.tooltip-icon:hover {
+  color: var(--color-text);
+  border-color: var(--color-text);
+}
+
+/* ── Action button (icon outside, label as orange pill) ──────────────────────── */
+.action-btn-row {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  cursor: pointer;
+  user-select: none;
+}
+
+.action-btn-label {
+  background: var(--color-primary);
+  border-radius: var(--radius-md);
+  padding: var(--space-sm) var(--space-md);
+  color: #fff;
+  font-weight: var(--font-weight-bold);
+  font-size: var(--font-size-base);
+}
+
+.action-btn-row:hover .action-btn-label { background: var(--color-primary-hover); }
+
+.hidden-trigger {
+  position: absolute !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+  height: 0 !important;
+  overflow: hidden !important;
+  padding: 0 !important;
+  margin: 0 !important;
 }
 
 /* ── Results header ─────────────────────────────────────────────────────────── */

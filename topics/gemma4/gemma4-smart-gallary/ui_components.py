@@ -78,3 +78,27 @@ def loading_card(message: str = "Processing...") -> str:
 
 def empty_state() -> str:
     return '<div class="empty-state">Select a folder and click Generate Descriptions or Search.</div>'
+
+
+def tooltip_icon(tooltip: str) -> str:
+    return f'<span class="tooltip-icon" title="{html.escape(tooltip)}">i</span>'
+
+
+def action_button(label: str, tooltip: str, btn_id: str) -> str:
+    tip = html.escape(tooltip)
+    lbl = html.escape(label)
+    js  = f"var e=document.getElementById('{btn_id}');if(e){{(e.tagName==='BUTTON'?e:e.querySelector('button')).click();}}"
+    return (
+        f'<div class="action-btn-row" onclick="{js}">'
+        f'<span class="tooltip-icon" title="{tip}">i</span>'
+        f'<span class="action-btn-label">{lbl}</span>'
+        f'</div>'
+    )
+
+
+def sidebar_label(text: str, tooltip: str = "") -> str:
+    icon = (
+        f'<span class="tooltip-icon" title="{html.escape(tooltip)}">i</span>'
+        if tooltip else ""
+    )
+    return f'<div class="sidebar-label">{html.escape(text)}{icon}</div>'

@@ -93,11 +93,12 @@ def run_describe_workflow(folder_path: str):
     flyte.run(save_descriptions_task, results=results)
 
 
-def run_search_workflow(folder_path: str, query: str) -> dict:
+def run_search_workflow(folder_path: str, query: str):
     """
     Check every image in folder_path against query using Gemma 4 vision.
     Each image is a discrete flyte.run() call — visible individually in TUI.
-    Returns dict with total scanned and matching paths.
+    Yields progress dicts {checked, total, done} per image, then a final dict
+    with matches included.
     """
     flyte.init(local_persistence=True)
 
@@ -105,15 +106,17 @@ def run_search_workflow(folder_path: str, query: str) -> dict:
     image_paths = scan_run.outputs().o0
 
     if not image_paths:
-        return {"total": 0, "matches": []}
+        yield {"checked": 0, "total": 0, "matches": [], "done": True}
+        return
 
+    total   = len(image_paths)
     results = []
-    for path in image_paths:
+    for i, path in enumerate(image_paths):
         run    = flyte.run(check_match_task, image_path=path, query=query)
         result = run.outputs().o0
         results.append(result)
+        yield {"checked": i + 1, "total": total, "done": False}
 
     collect_run = flyte.run(collect_matches_task, results=results)
     matches     = collect_run.outputs().o0
-
-    return {"total": len(image_paths), "matches": matches}
+    yield {"checked": total, "total": total, "matches": matches, "done": True}

@@ -71,9 +71,18 @@ def on_search(folder_path: str, query: str):
     yield ui.loading_card(f'Searching for "{query}"...'), ""
 
     try:
-        result        = workflows.run_search_workflow(folder_path, query.strip())
-        matched_paths = result["matches"]
-        total         = result["total"]
+        matched_paths = []
+        total         = 0
+        for update in workflows.run_search_workflow(folder_path, query.strip()):
+            total = update["total"]
+            if not update["done"]:
+                checked   = update["checked"]
+                remaining = total - checked
+                yield ui.status_message(
+                    f'Searching... {checked}/{total} checked, {remaining} remaining', ""
+                ), ""
+            else:
+                matched_paths = update["matches"]
     except Exception as e:
         yield ui.status_message(f"Error: {e}", "error"), ""
         return
@@ -89,7 +98,7 @@ def on_search(folder_path: str, query: str):
 
 # ── UI layout ─────────────────────────────────────────────────────────────────
 
-with gr.Blocks(css=_CSS, title="Gemma 4 Smart Gallery") as demo:
+with gr.Blocks(title="Gemma 4 Smart Gallery") as demo:
     gr.HTML(ui.app_header())
 
     with gr.Row():
@@ -97,8 +106,9 @@ with gr.Blocks(css=_CSS, title="Gemma 4 Smart Gallery") as demo:
         # ── Left sidebar ──────────────────────────────────────────────────────
         with gr.Column(scale=1, min_width=300):
             gr.HTML('<div class="sidebar">')
-            gr.HTML('<div class="sidebar-section"><div class="sidebar-label">Image Folder</div></div>')
 
+            # Photo Library section
+            gr.HTML(ui.sidebar_label("Photo Library"))
             folder_input = gr.Textbox(
                 label="Folder Path",
                 placeholder="Click Browse to select a folder",
@@ -106,20 +116,37 @@ with gr.Blocks(css=_CSS, title="Gemma 4 Smart Gallery") as demo:
                 max_lines=2,
                 interactive=True,
             )
-
             browse_btn = gr.Button("Browse...", variant="secondary", size="sm")
-
-            generate_btn = gr.Button("Generate Descriptions", variant="primary", size="lg")
 
             gr.HTML('<hr class="sidebar-divider">')
 
+            # Vision Powered Options section
+            gr.HTML(ui.sidebar_label("Vision Powered Options"))
+
+            gr.HTML(ui.action_button(
+                "Generate Descriptions",
+                "Gemma 4 analyzes each image and writes a natural language description. Results are cached for future use.",
+                "generate-btn",
+            ))
+            generate_btn = gr.Button(
+                "Generate Descriptions", variant="primary", elem_id="generate-btn",
+                elem_classes=["hidden-trigger"],
+            )
+
             search_input = gr.Textbox(
-                label="Search",
+                label="Search Query",
                 placeholder="e.g. ocean, dog, sunset",
                 lines=1,
             )
-
-            search_btn = gr.Button("Search", variant="secondary", size="lg")
+            gr.HTML(ui.action_button(
+                "Search",
+                "Gemma 4 visually inspects each image in real time to find matches.",
+                "search-btn",
+            ))
+            search_btn = gr.Button(
+                "Search", variant="primary", elem_id="search-btn",
+                elem_classes=["hidden-trigger"],
+            )
 
             gr.HTML('</div>')
 
@@ -155,4 +182,4 @@ with gr.Blocks(css=_CSS, title="Gemma 4 Smart Gallery") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(css=_CSS)
