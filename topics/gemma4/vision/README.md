@@ -35,6 +35,14 @@ python app.py
 # -> http://localhost:7861
 ```
 
+### Public URL (remote / forwarded-port setups)
+
+Set `GRADIO_SHARE=1` for a public HTTPS tunnel via Gradio's servers (link good for 72 hours). Useful when SSH port-forwarding chokes on image uploads from a remote dev box.
+
+```bash
+GRADIO_SHARE=1 python app.py
+```
+
 Pick a smaller size:
 
 ```bash

@@ -38,6 +38,14 @@ python app.py
 # -> http://localhost:7864
 ```
 
+### Public URL (remote / forwarded-port setups)
+
+Set `GRADIO_SHARE=1` for a public HTTPS tunnel via Gradio's servers (link good for 72 hours). Useful when SSH port-forwarding is flaky from a remote dev box.
+
+```bash
+GRADIO_SHARE=1 python app.py
+```
+
 ## Things to try
 
 - "What is 847 * 293 + 1024?" — forces calculator

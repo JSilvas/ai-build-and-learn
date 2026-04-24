@@ -34,6 +34,14 @@ python app.py
 
 First run downloads the Whisper model (~140MB for `base.en`).
 
+### Public URL (remote / forwarded-port setups)
+
+Set `GRADIO_SHARE=1` for a public HTTPS tunnel via Gradio's servers (link good for 72 hours). Useful when SSH port-forwarding is flaky from a remote dev box — and necessary for the mic to work in most remote setups, since browsers block `getUserMedia` on non-HTTPS origins.
+
+```bash
+GRADIO_SHARE=1 python app.py
+```
+
 ## Swappables
 
 ```bash

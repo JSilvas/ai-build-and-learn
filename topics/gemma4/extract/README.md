@@ -30,3 +30,11 @@ ollama pull gemma4:31b
 python app.py
 # -> http://localhost:7862
 ```
+
+### Public URL (remote / forwarded-port setups)
+
+Set `GRADIO_SHARE=1` for a public HTTPS tunnel via Gradio's servers (link good for 72 hours). Useful when SSH port-forwarding is flaky from a remote dev box.
+
+```bash
+GRADIO_SHARE=1 python app.py
+```

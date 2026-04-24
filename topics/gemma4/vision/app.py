@@ -32,15 +32,8 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 DEFAULT_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:31b")
 
-# Known Gemma 4 tags on Ollama. Edit this list if more variants ship.
-# Only sizes NOT already installed will show in the pull dropdown.
-KNOWN_GEMMA4_SIZES = [
-    "gemma4:270m",
-    "gemma4:1b",
-    "gemma4:4b",
-    "gemma4:12b",
-    "gemma4:31b",
-]
+# Rough chars-per-token heuristic for the thinking-budget cutoff.
+CHARS_PER_TOKEN = 3.5
 
 PRESET_PROMPTS = [
     "Describe this image in detail.",
@@ -86,80 +79,76 @@ def list_vision_models() -> list[str]:
         return [DEFAULT_MODEL]
 
 
-def not_installed() -> list[str]:
-    """Known Gemma 4 sizes that aren't yet pulled."""
-    installed = set(list_vision_models())
-    return [s for s in KNOWN_GEMMA4_SIZES if s not in installed]
-
-
-def pull_model(name: str):
-    """Stream `ollama pull` progress. Yields (status_md, updated_model_dropdown,
-    updated_pull_dropdown) tuples so the UI refreshes when the download finishes."""
-    if not name:
-        yield "Pick a size first.", gr.update(), gr.update()
-        return
-
-    print(f"[pull] {name}", flush=True)
-    last_layer = ""
-    try:
-        for progress in ollama.pull(name, stream=True):
-            status = getattr(progress, "status", "") or ""
-            total = getattr(progress, "total", 0) or 0
-            completed = getattr(progress, "completed", 0) or 0
-            digest = getattr(progress, "digest", "") or ""
-            if total and completed and digest:
-                pct = completed / total * 100
-                last_layer = (
-                    f"Pulling `{name}` — {status}\n"
-                    f"`{digest[:16]}...`  **{pct:.1f}%**  "
-                    f"({completed / 1e9:.2f} / {total / 1e9:.2f} GB)"
-                )
-            else:
-                last_layer = f"Pulling `{name}` — {status}"
-            yield last_layer, gr.update(), gr.update()
-    except Exception as e:
-        yield f"Pull failed: {e}", gr.update(), gr.update()
-        return
-
-    # Refresh both dropdowns now that the new model exists.
-    installed = list_vision_models()
-    yield (
-        f"Done. `{name}` is ready.",
-        gr.update(choices=installed, value=name),
-        gr.update(choices=not_installed(), value=None),
-    )
-
-
-def ask(image_path: str | None, question: str, model: str, temperature: float):
-    """Stream the answer. image_path comes from gr.Image(type='filepath')."""
+def ask(image_path: str | None, question: str, model: str, temperature: float,
+        think_budget: int):
+    """Stream (thinking, answer). If thinking exceeds budget (tokens, 0=unlimited)
+    before the answer starts, we close the stream and re-prompt for a direct answer."""
     if not image_path:
-        yield "Upload an image first."
+        yield "", "Upload an image first."
         return
     if not question.strip():
-        yield "Ask a question about the image."
+        yield "", "Ask a question about the image."
         return
 
-    print(f"[ask] model={model} q={question[:60]!r}", flush=True)
-    yield "Thinking..."
+    print(f"[ask] model={model} q={question[:60]!r} budget={think_budget}", flush=True)
+    yield "", "Thinking..."
 
     prepared = _prepare_image(image_path)
+    user_msg = {"role": "user", "content": question, "images": [prepared]}
+    budget_chars = int(think_budget * CHARS_PER_TOKEN) if think_budget else 0
+
     stream = ollama.chat(
         model=model,
-        messages=[{
-            "role": "user",
-            "content": question,
-            "images": [prepared],
-        }],
+        messages=[user_msg],
         stream=True,
+        think=True,
         options={"temperature": float(temperature), "num_ctx": 8192},
     )
 
-    partial = ""
-    for chunk in stream:
-        partial += chunk["message"]["content"]
-        if partial:  # skip empty-content chunks so "Thinking..." stays until real tokens arrive
-            yield partial
-    print(f"[ask] done ({len(partial)} chars)", flush=True)
+    thinking, answer = "", ""
+    capped = False
+    try:
+        for chunk in stream:
+            m = chunk["message"]
+            if m.get("thinking"):
+                thinking += m["thinking"]
+            if m.get("content"):
+                if answer == "":
+                    # First real content chunk — replace the "Thinking..." placeholder.
+                    answer = m["content"]
+                else:
+                    answer += m["content"]
+            yield thinking, answer or "Thinking..."
+
+            if (budget_chars and not answer
+                    and len(thinking) >= budget_chars):
+                capped = True
+                break
+    finally:
+        stream.close()
+
+    if capped:
+        thinking += f"\n\n_[capped at ~{think_budget} tokens]_"
+        yield thinking, "Generating answer..."
+
+        followup = [
+            user_msg,
+            {"role": "assistant", "content": thinking},
+            {"role": "user", "content": "Stop thinking. Give your final answer now, concisely."},
+        ]
+        answer_stream = ollama.chat(
+            model=model,
+            messages=followup,
+            stream=True,
+            think=False,
+            options={"temperature": float(temperature), "num_ctx": 8192},
+        )
+        answer = ""
+        for chunk in answer_stream:
+            answer += chunk["message"].get("content", "")
+            yield thinking, answer or "Generating answer..."
+
+    print(f"[ask] done (think={len(thinking)} ans={len(answer)})", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -305,14 +294,11 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             model = gr.Dropdown(models, value=default, label="Model", scale=2)
             temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="Temperature")
-
-        with gr.Accordion("Pull another Gemma 4 size", open=False):
-            with gr.Row():
-                pull_choice = gr.Dropdown(
-                    not_installed(), label="Size to pull", scale=2,
-                )
-                pull_btn = gr.Button("Pull", variant="secondary")
-            pull_status = gr.Markdown("_Pick a size above, click Pull. Progress streams here._")
+            think_budget = gr.Slider(
+                0, 4000, value=0, step=100,
+                label="Thinking budget (tokens, 0 = unlimited)",
+                info="Caps thinking on the Ask tab. Detect ignores this.",
+            )
 
         with gr.Tabs():
             # --- Ask tab -------------------------------------------------
@@ -327,11 +313,18 @@ def build_ui() -> gr.Blocks:
                         preset = gr.Radio(PRESET_PROMPTS, label="Preset prompts", value=None)
                         submit = gr.Button("Ask", variant="primary")
                     with gr.Column():
-                        answer = gr.Textbox(label="Answer", lines=20)
+                        with gr.Accordion("🧠 Thinking", open=False):
+                            thinking = gr.Textbox(
+                                label=None, show_label=False, lines=10,
+                                placeholder="Thinking tokens stream here...",
+                            )
+                        answer = gr.Textbox(label="Answer", lines=15)
 
+                ask_inputs = [image, question, model, temperature, think_budget]
+                ask_outputs = [thinking, answer]
                 preset.change(lambda p: p or "", inputs=preset, outputs=question)
-                submit.click(ask, inputs=[image, question, model, temperature], outputs=answer)
-                question.submit(ask, inputs=[image, question, model, temperature], outputs=answer)
+                submit.click(ask, inputs=ask_inputs, outputs=ask_outputs)
+                question.submit(ask, inputs=ask_inputs, outputs=ask_outputs)
 
             # --- Detect tab ----------------------------------------------
             with gr.Tab("Detect (bounding boxes)"):
@@ -356,12 +349,6 @@ def build_ui() -> gr.Blocks:
                     inputs=[det_image, target, model, temperature],
                     outputs=[annotated, detections_json, raw_output],
                 )
-
-        pull_btn.click(
-            pull_model,
-            inputs=pull_choice,
-            outputs=[pull_status, model, pull_choice],
-        )
 
     return demo
 
