@@ -29,10 +29,13 @@ DEFAULT_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:31b")
 WHISPER_SIZE = os.environ.get("WHISPER_SIZE", "base.en")
 TTS_VOICE = os.environ.get("TTS_VOICE", "en-US-AriaNeural")
 
-SYSTEM_PROMPT = (
-    "You are a helpful voice assistant. Keep answers conversational and concise "
-    "— typically 1-3 sentences. No markdown, no lists, no code blocks. Just "
-    "speak naturally like a person."
+# Rough chars-per-token heuristic for the thinking-budget cutoff.
+CHARS_PER_TOKEN = 3.5
+
+DEFAULT_ROLE = (
+    "Role: Helpful voice assistant.\n"
+    "Constraints: Conversational, concise (1-3 sentences), no markdown, "
+    "no lists, no code blocks, natural speech."
 )
 
 # Load whisper once. int8 on CPU is fast enough for demo-length utterances;
@@ -75,36 +78,84 @@ def synthesize(text: str, voice: str) -> str:
     return str(out)
 
 
-def converse(audio_path: str | None, history: list, model: str, voice: str):
-    """One round-trip: transcribe user audio, run LLM, synthesize reply."""
+def converse(audio_path: str | None, history: list, model: str, voice: str,
+             role: str, think_budget: int):
+    """One round-trip: transcribe, stream LLM (with optional thinking budget),
+    then synthesize. Yields (history, audio, transcript, thinking) tuples."""
     if not audio_path:
-        return history, None, "No audio received."
+        yield history, None, "No audio received.", ""
+        return
 
     user_text = transcribe(audio_path)
     if not user_text:
-        return history, None, "Didn't catch that — try again."
+        yield history, None, "Didn't catch that — try again.", ""
+        return
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    transcript = f"**You**: {user_text}\n\n**Gemma**: _thinking..._"
+    yield history, None, transcript, ""
+
+    system_text = role.strip() or DEFAULT_ROLE
+    messages = [{"role": "system", "content": system_text}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
+    budget_chars = int(think_budget * CHARS_PER_TOKEN) if think_budget else 0
 
-    resp = ollama.chat(
+    stream = ollama.chat(
         model=model, messages=messages,
+        stream=True, think=True,
         options={"temperature": 0.6},
     )
-    reply = resp["message"]["content"].strip()
 
+    thinking, reply = "", ""
+    capped = False
+    try:
+        for chunk in stream:
+            m = chunk["message"]
+            if m.get("thinking"):
+                thinking += m["thinking"]
+            if m.get("content"):
+                reply += m["content"]
+            transcript = f"**You**: {user_text}\n\n**Gemma**: {reply or '_thinking..._'}"
+            yield history, None, transcript, thinking
+
+            if budget_chars and not reply and len(thinking) >= budget_chars:
+                capped = True
+                break
+    finally:
+        stream.close()
+
+    if capped:
+        thinking += f"\n\n_[capped at ~{think_budget} tokens]_"
+        transcript = f"**You**: {user_text}\n\n**Gemma**: _generating reply..._"
+        yield history, None, transcript, thinking
+
+        followup = messages + [
+            {"role": "assistant", "content": thinking},
+            {"role": "user", "content": "Stop thinking. Give your short spoken reply now."},
+        ]
+        answer_stream = ollama.chat(
+            model=model, messages=followup,
+            stream=True, think=False,
+            options={"temperature": 0.6},
+        )
+        reply = ""
+        for chunk in answer_stream:
+            reply += chunk["message"].get("content", "")
+            transcript = f"**You**: {user_text}\n\n**Gemma**: {reply or '_generating reply..._'}"
+            yield history, None, transcript, thinking
+
+    reply = reply.strip() or "(no reply)"
     audio_out = synthesize(reply, voice)
     new_history = history + [
         {"role": "user", "content": user_text},
         {"role": "assistant", "content": reply},
     ]
     transcript = f"**You**: {user_text}\n\n**Gemma**: {reply}"
-    return new_history, audio_out, transcript
+    yield new_history, audio_out, transcript, thinking
 
 
 def clear_history():
-    return [], None, ""
+    return [], None, "", ""
 
 
 def build_ui() -> gr.Blocks:
@@ -124,7 +175,16 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             model = gr.Dropdown(models, value=default, label="LLM")
             voice = gr.Dropdown(voices, value=TTS_VOICE, label="TTS voice")
+            think_budget = gr.Slider(
+                0, 2000, value=200, step=50,
+                label="Thinking budget (tokens, 0 = unlimited)",
+                info="Voice wants snappy replies — a tight cap keeps latency low.",
+            )
             clear = gr.Button("Clear conversation")
+
+        role = gr.Textbox(
+            value=DEFAULT_ROLE, label="Role / system prompt", lines=3,
+        )
 
         history_state = gr.State([])
 
@@ -135,13 +195,18 @@ def build_ui() -> gr.Blocks:
             with gr.Column():
                 reply_audio = gr.Audio(label="Reply", autoplay=True)
                 transcript = gr.Markdown()
+                with gr.Accordion("🧠 Thinking", open=False):
+                    thinking = gr.Textbox(
+                        label=None, show_label=False, lines=8,
+                        placeholder="Thinking tokens stream here...",
+                    )
 
         send.click(
             converse,
-            inputs=[mic, history_state, model, voice],
-            outputs=[history_state, reply_audio, transcript],
+            inputs=[mic, history_state, model, voice, role, think_budget],
+            outputs=[history_state, reply_audio, transcript, thinking],
         )
-        clear.click(clear_history, outputs=[history_state, reply_audio, transcript])
+        clear.click(clear_history, outputs=[history_state, reply_audio, transcript, thinking])
 
     return demo
 
