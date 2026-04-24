@@ -61,13 +61,16 @@ def load_file(path: str | None) -> tuple[str, str]:
     return text, status
 
 
-def ask(doc_text: str, question: str, model: str, temperature: float):
-    """Stream an answer. Full doc is pasted into the user message."""
+def ask(doc_text: str, question: str, model: str, temperature: float,
+        think_budget: int):
+    """Stream (thinking, answer). Full doc goes into the user message. If
+    thinking exceeds budget before the answer starts, cancel and re-prompt
+    with think=False."""
     if not doc_text.strip():
-        yield "Load a document first."
+        yield "", "Load a document first."
         return
     if not question.strip():
-        yield "Ask a question about the document."
+        yield "", "Ask a question about the document."
         return
 
     system = (
@@ -75,30 +78,62 @@ def ask(doc_text: str, question: str, model: str, temperature: float):
         "possible. If the answer isn't in the document, say so — do not invent."
     )
     user = f"<document>\n{doc_text}\n</document>\n\nQuestion: {question}"
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
     # Ollama defaults num_ctx=4096 which would silently truncate a long doc.
     # Size the window to fit doc + headroom for question/answer. Clamp to 256k
     # to stay under the model's 262k maximum with a small safety margin.
     approx_tokens = int(len(doc_text) / CHARS_PER_TOKEN)
     num_ctx = min(262_000, max(8_192, approx_tokens + 4_096))
+    budget_chars = int(think_budget * CHARS_PER_TOKEN) if think_budget else 0
 
     stream = ollama.chat(
         model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
+        messages=messages,
         stream=True,
-        options={
-            "temperature": float(temperature),
-            "num_ctx": num_ctx,
-        },
+        think=True,
+        options={"temperature": float(temperature), "num_ctx": num_ctx},
     )
-    partial = ""
-    for chunk in stream:
-        partial += chunk["message"]["content"]
-        if partial:
-            yield partial
+
+    thinking, answer = "", ""
+    capped = False
+    try:
+        for chunk in stream:
+            m = chunk["message"]
+            if m.get("thinking"):
+                thinking += m["thinking"]
+            if m.get("content"):
+                answer += m["content"]
+            yield thinking, answer or "_streaming..._"
+
+            if budget_chars and not answer and len(thinking) >= budget_chars:
+                capped = True
+                break
+    finally:
+        stream.close()
+
+    if capped:
+        thinking += f"\n\n_[capped at ~{think_budget} tokens]_"
+        yield thinking, "_generating answer..._"
+
+        followup = messages + [
+            {"role": "assistant", "content": thinking},
+            {"role": "user", "content": "Stop thinking. Give your final answer now, concisely."},
+        ]
+        answer_stream = ollama.chat(
+            model=model,
+            messages=followup,
+            stream=True,
+            think=False,
+            options={"temperature": float(temperature), "num_ctx": num_ctx},
+        )
+        answer = ""
+        for chunk in answer_stream:
+            answer += chunk["message"].get("content", "")
+            yield thinking, answer or "_generating answer..._"
 
 
 def build_ui() -> gr.Blocks:
@@ -114,6 +149,11 @@ def build_ui() -> gr.Blocks:
         with gr.Row():
             model = gr.Dropdown(models, value=default, label="Model")
             temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="Temperature")
+            think_budget = gr.Slider(
+                0, 4000, value=0, step=100,
+                label="Thinking budget (tokens, 0 = unlimited)",
+                info="Caps thinking. When hit, we force a direct answer.",
+            )
 
         with gr.Row():
             with gr.Column():
@@ -132,15 +172,18 @@ def build_ui() -> gr.Blocks:
                 )
                 submit = gr.Button("Ask", variant="primary")
             with gr.Column():
-                answer = gr.Textbox(label="Answer", lines=28)
+                with gr.Accordion("🧠 Thinking", open=False):
+                    thinking = gr.Textbox(
+                        label=None, show_label=False, lines=10,
+                        placeholder="Thinking tokens stream here...",
+                    )
+                answer = gr.Textbox(label="Answer", lines=20)
 
         upload.change(load_file, inputs=upload, outputs=[doc_text, status])
-        submit.click(
-            ask, inputs=[doc_text, question, model, temperature], outputs=answer,
-        )
-        question.submit(
-            ask, inputs=[doc_text, question, model, temperature], outputs=answer,
-        )
+        ask_inputs = [doc_text, question, model, temperature, think_budget]
+        ask_outputs = [thinking, answer]
+        submit.click(ask, inputs=ask_inputs, outputs=ask_outputs)
+        question.submit(ask, inputs=ask_inputs, outputs=ask_outputs)
 
     return demo
 
