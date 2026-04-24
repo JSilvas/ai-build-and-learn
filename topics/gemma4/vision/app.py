@@ -32,6 +32,16 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 DEFAULT_MODEL = os.environ.get("GEMMA_MODEL", "gemma4:31b")
 
+# Known Gemma 4 tags on Ollama. Edit this list if more variants ship.
+# Only sizes NOT already installed will show in the pull dropdown.
+KNOWN_GEMMA4_SIZES = [
+    "gemma4:270m",
+    "gemma4:1b",
+    "gemma4:4b",
+    "gemma4:12b",
+    "gemma4:31b",
+]
+
 PRESET_PROMPTS = [
     "Describe this image in detail.",
     "List every object you can see, roughly where it is in the frame.",
@@ -74,6 +84,50 @@ def list_vision_models() -> list[str]:
         return gemma or [DEFAULT_MODEL]
     except Exception:
         return [DEFAULT_MODEL]
+
+
+def not_installed() -> list[str]:
+    """Known Gemma 4 sizes that aren't yet pulled."""
+    installed = set(list_vision_models())
+    return [s for s in KNOWN_GEMMA4_SIZES if s not in installed]
+
+
+def pull_model(name: str):
+    """Stream `ollama pull` progress. Yields (status_md, updated_model_dropdown,
+    updated_pull_dropdown) tuples so the UI refreshes when the download finishes."""
+    if not name:
+        yield "Pick a size first.", gr.update(), gr.update()
+        return
+
+    print(f"[pull] {name}", flush=True)
+    last_layer = ""
+    try:
+        for progress in ollama.pull(name, stream=True):
+            status = getattr(progress, "status", "") or ""
+            total = getattr(progress, "total", 0) or 0
+            completed = getattr(progress, "completed", 0) or 0
+            digest = getattr(progress, "digest", "") or ""
+            if total and completed and digest:
+                pct = completed / total * 100
+                last_layer = (
+                    f"Pulling `{name}` — {status}\n"
+                    f"`{digest[:16]}...`  **{pct:.1f}%**  "
+                    f"({completed / 1e9:.2f} / {total / 1e9:.2f} GB)"
+                )
+            else:
+                last_layer = f"Pulling `{name}` — {status}"
+            yield last_layer, gr.update(), gr.update()
+    except Exception as e:
+        yield f"Pull failed: {e}", gr.update(), gr.update()
+        return
+
+    # Refresh both dropdowns now that the new model exists.
+    installed = list_vision_models()
+    yield (
+        f"Done. `{name}` is ready.",
+        gr.update(choices=installed, value=name),
+        gr.update(choices=not_installed(), value=None),
+    )
 
 
 def ask(image_path: str | None, question: str, model: str, temperature: float):
@@ -252,6 +306,14 @@ def build_ui() -> gr.Blocks:
             model = gr.Dropdown(models, value=default, label="Model", scale=2)
             temperature = gr.Slider(0.0, 1.5, value=0.2, step=0.05, label="Temperature")
 
+        with gr.Accordion("Pull another Gemma 4 size", open=False):
+            with gr.Row():
+                pull_choice = gr.Dropdown(
+                    not_installed(), label="Size to pull", scale=2,
+                )
+                pull_btn = gr.Button("Pull", variant="secondary")
+            pull_status = gr.Markdown("_Pick a size above, click Pull. Progress streams here._")
+
         with gr.Tabs():
             # --- Ask tab -------------------------------------------------
             with gr.Tab("Ask"):
@@ -294,6 +356,12 @@ def build_ui() -> gr.Blocks:
                     inputs=[det_image, target, model, temperature],
                     outputs=[annotated, detections_json, raw_output],
                 )
+
+        pull_btn.click(
+            pull_model,
+            inputs=pull_choice,
+            outputs=[pull_status, model, pull_choice],
+        )
 
     return demo
 

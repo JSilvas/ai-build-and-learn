@@ -33,12 +33,19 @@ def list_models() -> list[str]:
 
 
 def chat(message, history, system_prompt, model, temperature, top_p):
-    """Stream a response. `history` is Gradio 'messages' format: list of {role, content}."""
+    """Stream a response. Yields (cleared_textbox, updated_history) on each chunk."""
+    if not message or not message.strip():
+        yield "", history
+        return
+
+    history = history + [{"role": "user", "content": message},
+                         {"role": "assistant", "content": ""}]
+    yield "", history
+
     msgs = []
     if system_prompt.strip():
         msgs.append({"role": "system", "content": system_prompt})
-    msgs.extend(history)
-    msgs.append({"role": "user", "content": message})
+    msgs.extend(history[:-1])  # everything except the empty assistant placeholder
 
     stream = ollama.chat(
         model=model,
@@ -47,11 +54,9 @@ def chat(message, history, system_prompt, model, temperature, top_p):
         options={"temperature": float(temperature), "top_p": float(top_p)},
     )
 
-    partial = ""
     for chunk in stream:
-        partial += chunk["message"]["content"]
-        if partial:
-            yield partial
+        history[-1]["content"] += chunk["message"]["content"]
+        yield "", history
 
 
 def build_ui() -> gr.Blocks:
@@ -67,11 +72,19 @@ def build_ui() -> gr.Blocks:
         system_prompt = gr.Textbox(
             value=DEFAULT_SYSTEM, label="System prompt", lines=2,
         )
-        gr.ChatInterface(
-            fn=chat,
-            additional_inputs=[system_prompt, model, temperature, top_p],
-            type="messages",
-        )
+
+        chatbot = gr.Chatbot(type="messages", label="Conversation", height=500)
+        msg = gr.Textbox(label="Your message", placeholder="Type and press Enter")
+        with gr.Row():
+            send = gr.Button("Send", variant="primary")
+            clear = gr.Button("Clear")
+
+        inputs = [msg, chatbot, system_prompt, model, temperature, top_p]
+        outputs = [msg, chatbot]
+        msg.submit(chat, inputs=inputs, outputs=outputs)
+        send.click(chat, inputs=inputs, outputs=outputs)
+        clear.click(lambda: [], outputs=chatbot)
+
     return demo
 
 
