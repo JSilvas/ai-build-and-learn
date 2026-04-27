@@ -28,6 +28,105 @@ The key advantage over pure LLM: the answer is anchored to your documents. The m
 
 ---
 
+## Why Chunking is Necessary
+
+A PDF is a wall of text — anywhere from a few hundred to tens of thousands of characters. You cannot pass an entire document into an LLM prompt for two reasons:
+
+**1. Context window limits**
+LLMs have a maximum input size (measured in tokens). A single 10-page PDF can exceed that limit on its own. Sixteen PDFs definitely would. Even models with large context windows (100k+ tokens) become unreliable when the input is too long — they lose focus on the relevant parts buried in the middle.
+
+**2. Retrieval precision**
+Even if you could fit everything in, you wouldn't want to. If a user asks "what is the return window for sale items?", sending all 16 documents to Claude creates noise — the model has to mentally filter through 15 documents of irrelevant text to find the one sentence that answers the question. Smaller, focused chunks mean the retrieved context is dense with relevant signal.
+
+**How chunking works here:**
+
+```
+Full PDF text (e.g. 8,000 chars)
+      ↓  RecursiveCharacterTextSplitter(chunk_size=300, overlap=30)
+[chunk_0: chars 0–300]
+[chunk_1: chars 270–570]   ← 30-char overlap preserves boundary context
+[chunk_2: chars 540–840]
+...
+[chunk_n: last segment]
+```
+
+`RecursiveCharacterTextSplitter` tries to split on paragraph breaks, then sentence breaks, then word breaks — in that order. This keeps each chunk semantically coherent rather than cutting mid-sentence.
+
+The 30-character overlap means that if an important sentence straddles a boundary, it appears in both adjacent chunks. Neither chunk loses the context needed to make it retrievable.
+
+---
+
+## Why Embeddings are Needed
+
+Once text is chunked, you need a way to answer the question: *"which of these 800 chunks is most relevant to this user's question?"*
+
+You cannot use keyword search reliably. A user asking *"how long do I have to send something back?"* will not match a chunk containing *"items must be returned within 30 days"* — the words are completely different, but the meaning is the same.
+
+**Embeddings solve this by converting meaning into math.**
+
+An embedding model reads a piece of text and outputs a vector — a list of numbers (384 numbers in our case) that encodes the semantic meaning of that text. Texts with similar meanings produce vectors that are mathematically close together in 384-dimensional space.
+
+```
+"how long do I have to send something back?"
+      ↓  gte-small embedding model
+[0.021, -0.143, 0.887, ..., 0.034]   ← 384 numbers representing the meaning
+
+"items must be returned within 30 days"
+      ↓  gte-small embedding model
+[0.019, -0.138, 0.901, ..., 0.041]   ← very close to the question's vector
+```
+
+**Cosine similarity** measures the angle between two vectors. Vectors pointing in nearly the same direction have a similarity near 1.0 — they mean roughly the same thing. Unrelated texts produce vectors pointing in different directions, similarity near 0.0.
+
+**The retriever pipeline:**
+
+```
+INGEST (run once)
+  For each chunk:
+    text → embedding model → 384D vector → store in pgvector
+
+QUERY (run per question)
+  User question → embedding model → 384D query vector
+  Search pgvector: find the k chunks whose vectors are closest to the query vector
+  Return those chunks as context to Claude
+```
+
+This is why the same embedding model must be used for both ingest and query. The vectors only "speak the same language" if they were produced by the same model. Switching models after ingesting requires re-embedding and re-indexing all chunks from scratch.
+
+---
+
+## Why a Vector Store is Needed
+
+You have hundreds or thousands of chunk vectors. At query time you need to find the top-k most similar to the query vector — fast. A vector store is a database purpose-built for this problem.
+
+**Why not just use a regular database?**
+
+A SQL `LIKE` or full-text search cannot find semantic matches — it only matches exact words or substrings. You could store vectors in a standard Postgres `float[]` column, but finding the closest vectors would require computing the distance to *every row* in the table (a full table scan) on every query. With 800 chunks that's tolerable; with 1 million chunks it becomes unusably slow.
+
+**What a vector store adds:**
+
+| Feature | Benefit |
+|---------|---------|
+| Vector index (HNSW) | Approximate nearest-neighbor in O(log n) — no full scan |
+| Distance operators | Native `<=>` cosine, `<->` L2, `<#>` inner product |
+| Metadata filtering | Filter by `collection_name`, `source_doc`, etc. before or after vector search |
+| Persistence | Vectors survive restarts, shareable across machines |
+
+**How HNSW works (simplified):**
+
+HNSW (Hierarchical Navigable Small World) builds a multi-layer graph where each node is a vector. At query time it navigates the graph layer by layer, pruning branches that are moving away from the query vector. This gives approximate (not exact) nearest neighbors, but the approximation is extremely accurate (>99% recall) at a fraction of the cost of an exact scan.
+
+```
+Exact scan (no index):  compare query to all 800 vectors  →  O(n)
+HNSW index:             navigate graph, skip most vectors  →  O(log n)
+```
+
+For this project — 16 PDFs, ~800 chunks — the difference is negligible. But the index is already in place, so if the knowledge base grows to 10,000+ chunks the query latency stays flat.
+
+**pgvector specifically** brings all of this inside standard Postgres. The same `document_chunks` table supports both vector similarity search and standard SQL filters on `collection_name` — no second service, no separate API, no data sync between systems.
+
+---
+
 ## Research: Vector Store Options
 
 Evaluated five options against three criteria: managed hosting, pgvector compatibility, and free tier.
