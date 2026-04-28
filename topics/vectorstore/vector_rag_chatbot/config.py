@@ -36,16 +36,7 @@ else:
 
 env = flyte.TaskEnvironment(
     name="vector-rag-chatbot",
-    image=flyte.Image.from_debian_base(python_version=(3, 11), registry="docker.io/johndellenbaugh").with_pip_packages(
-        "flyte>=2.1.2",
-        "psycopg[binary]>=3.1.0",
-        "pgvector>=0.3.0",
-        "sentence-transformers>=3.0.0",
-        "anthropic>=0.40.0",
-        "PyMuPDF>=1.24.0",
-        "langchain-text-splitters>=0.3.0",
-        "python-dotenv>=1.0.0",
-    ),
+    image=flyte.Image(name="docker.io/johndellenbaugh/rag-task:latest"),
     resources=flyte.Resources(cpu=2, memory="4Gi"),
     secrets=[
         flyte.Secret(key="ANTHROPIC_API_KEY", as_env_var="ANTHROPIC_API_KEY"),
