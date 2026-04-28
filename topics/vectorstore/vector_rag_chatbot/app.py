@@ -80,7 +80,7 @@ serving_env = flyte.app.AppEnvironment(
         flyte.Secret(key="ANTHROPIC_API_KEY", as_env_var="ANTHROPIC_API_KEY"),
         flyte.Secret(key="PG_URL",             as_env_var="PG_URL"),
     ],
-    env_vars={"FLYTE_BACKEND": "cluster", "APP_VERSION": "2"},
+    env_vars={"FLYTE_BACKEND": "cluster", "APP_VERSION": "3"},
     port=7860,
     resources=flyte.Resources(cpu=2, memory="4Gi"),
 )
@@ -201,24 +201,19 @@ def run_ingest(uploaded_files, collection_name, chunk_size, chunk_overlap):
 
 def chat(query, history, collection_name, top_k):
     query = query.strip()
-    if not query:
-        yield history or [], query
-        return
-
     history = list(history or [])
-    history.append({"role": "user", "content": query})
 
-    # Yield immediately so the question stays visible and user message appears
-    # in the chatbot before the Flyte run starts
-    yield history, query
+    if not query:
+        return history, query
+
+    history.append({"role": "user", "content": query})
 
     if not collection_name.strip():
         history.append({
             "role": "assistant",
             "content": "⚠️ Please set a collection name before chatting.",
         })
-        yield history, query
-        return
+        return history, query
 
     try:
         from workflows import query_pipeline
@@ -233,7 +228,6 @@ def chat(query, history, collection_name, top_k):
         answer  = result["answer"]
         sources = result.get("sources", [])
 
-        # Try to get full context chunks for rich accordion; fall back to names only
         try:
             context_chunks = json.loads(run.outputs().o1)
             accordion = build_sources_accordion(context_chunks)
@@ -251,7 +245,7 @@ def chat(query, history, collection_name, top_k):
             "content": f"❌ Error: {exc}",
         })
 
-    yield history, ""
+    return history, query
 
 
 # ── UI layout ─────────────────────────────────────────────────────────────────
@@ -339,7 +333,6 @@ def build_ui() -> gr.Blocks:
                     fn=chat,
                     inputs=[query_input, chatbot, chat_collection, top_k],
                     outputs=[chatbot, query_input],
-                    show_progress="minimal",
                 )
 
                 clear_btn.click(
