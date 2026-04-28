@@ -26,6 +26,8 @@ if BACKEND == "union":
         project="dellenbaugh",
         domain="development",
     )
+elif BACKEND == "cluster":
+    flyte.init_in_cluster()
 else:
     flyte.init(local_persistence=True)
 

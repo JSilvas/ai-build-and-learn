@@ -11,16 +11,38 @@ Run:
 
 import base64
 import json
-import time
+import sys
 from pathlib import Path
 
 import flyte
+import flyte.app
 import gradio as gr
 
 from workflows import ingest_pipeline, query_pipeline
 
 DATA_DIR  = Path(__file__).parent / "data"
 CSS_FILE  = Path(__file__).parent / "styles.css"
+
+# ── Union App deployment environment ──────────────────────────────────────────
+
+serving_env = flyte.app.AppEnvironment(
+    name="everstorm-rag-chatbot",
+    image=flyte.Image.from_debian_base(
+        python_version=(3, 11),
+        registry="docker.io/johndellenbaugh",
+    ).with_pip_packages(
+        "gradio>=6.0.0",
+        "flyte>=2.1.2",
+        "python-dotenv>=1.0.0",
+    ),
+    secrets=[
+        flyte.Secret(key="ANTHROPIC_API_KEY", as_env_var="ANTHROPIC_API_KEY"),
+        flyte.Secret(key="PG_URL",             as_env_var="PG_URL"),
+    ],
+    env_vars={"FLYTE_BACKEND": "cluster"},
+    port=7860,
+    resources=flyte.Resources(cpu=2, memory="4Gi"),
+)
 
 # ── HTML builders ─────────────────────────────────────────────────────────────
 
@@ -123,6 +145,7 @@ def run_ingest(selected_files, collection_name, chunk_size, chunk_overlap):
         link = build_run_link(run)
         yield emit("⏳ Running on Union — waiting for results..."), link
 
+        run.wait()
         stats = json.loads(run.outputs().o0)
 
         yield emit(
@@ -161,14 +184,8 @@ def chat(query, history, collection_name, top_k):
             collection_name=collection_name.strip(),
             k=int(top_k),
         )
-        outputs = run.outputs()
-        deadline = time.time() + 180
-        while (outputs is None or outputs.o0 is None) and time.time() < deadline:
-            time.sleep(3)
-            outputs = run.outputs()
-        if outputs is None or outputs.o0 is None:
-            raise TimeoutError("Query pipeline timed out waiting for output")
-        result = json.loads(outputs.o0)
+        run.wait()
+        result = json.loads(run.outputs().o0)
         answer  = result["answer"]
         sources = result.get("sources", [])
 
@@ -299,9 +316,21 @@ def build_ui() -> gr.Blocks:
     return app
 
 
+# ── Union cluster entry point ─────────────────────────────────────────────────
+
+@serving_env.server
+def _cluster_server():
+    css = CSS_FILE.read_text()
+    build_ui().launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    css = (Path(__file__).parent / "styles.css").read_text()
-    ui = build_ui()
-    ui.launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)
+    if "--deploy" in sys.argv:
+        flyte.init_from_config(root_dir=Path(__file__).parent)
+        app = flyte.serve(serving_env)
+        print(f"App URL: {app.url}")
+    else:
+        css = CSS_FILE.read_text()
+        build_ui().launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)
