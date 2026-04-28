@@ -42,10 +42,10 @@ Even if you could fit everything in, you wouldn't want to. If a user asks "what 
 
 ```
 Full PDF text (e.g. 8,000 chars)
-      ↓  RecursiveCharacterTextSplitter(chunk_size=300, overlap=30)
-[chunk_0: chars 0–300]
-[chunk_1: chars 270–570]   ← 30-char overlap preserves boundary context
-[chunk_2: chars 540–840]
+      ↓  RecursiveCharacterTextSplitter(chunk_size=600, overlap=60)
+[chunk_0: chars 0–600]
+[chunk_1: chars 540–1140]   ← 60-char overlap preserves boundary context
+[chunk_2: chars 1080–1680]
 ...
 [chunk_n: last segment]
 ```
@@ -176,11 +176,12 @@ Customer support PDFs are short, structured documents (numbered sections, bullet
 | Fixed character splits | Fast but cuts mid-sentence, degrades retrieval |
 | `RecursiveCharacterTextSplitter` | **Selected** — respects paragraph/sentence boundaries |
 
-**Parameters chosen: chunk_size=300, overlap=30**
+**Parameters chosen: chunk_size=600, overlap=60**
 
-- 300 chars ≈ 2–4 sentences — enough context for Claude to answer from, small enough for precise retrieval
-- 30-char overlap preserves boundary context without redundancy
-- Configurable from the Gradio UI — users can experiment live
+- 600 chars keeps a section header together with its content — critical for structured support docs where the header carries the semantic meaning (e.g. "Password Requirements" + its criteria in the same chunk)
+- 60-char overlap preserves boundary context without redundancy
+- Initial testing with chunk_size=300 caused retrieval failures: the B2B Corporate Orders doc outranked Account_and_Security for password questions because "account" appeared frequently in B2B chunks while the password section header was split from its content
+- Configurable from the Gradio UI — users can experiment live and re-ingest
 
 ---
 
@@ -220,7 +221,7 @@ All heavy compute (PDF extraction, embedding, vector indexing, retrieval, genera
 
 **Why Flyte here:**
 - Every task is visible as a node in the Union UI — good for the demo audience
-- `cache="auto"` on load/chunk and retrieve tasks means re-ingesting the same PDF or asking the same question returns instantly from cache
+- `cache="auto"` on `load_and_chunk_task` means re-ingesting an unchanged PDF is a free cache hit — no re-chunking needed
 - Parallel fan-out for PDF ingest via `asyncio.gather` — all PDFs embed concurrently, one task per PDF visible in Union
 
 ### Two-Pipeline Design
@@ -239,7 +240,7 @@ ingest_pipeline
 **Query pipeline** — runs on every question:
 ```
 query_pipeline
-  ├── retrieve_task(query)         → top-k from pgvector  (cached per query)
+  ├── retrieve_task(query)         → top-k from pgvector
   └── generate_task(query, chunks) → Claude RAG answer
 ```
 
@@ -315,13 +316,11 @@ The Gradio UI can be deployed as a persistent web app on the Union cluster — n
 Union exposes `flyte.app.AppEnvironment` — a lightweight container that runs a long-lived server process on the cluster and gives it a public URL.
 
 ```
-python app.py --deploy
+flyte deploy app.py serving_env
       ↓
-flyte.serve(serving_env)
+Union bundles app.py + config.py + workflows.py → deploys pod → returns persistent URL
       ↓
-Union builds app image → deploys pod → returns persistent URL
-      ↓
-app.url  →  https://everstorm-rag-chatbot.<project>.unionai.cloud
+https://wandering-resonance-f163a.apps.tryv2.hosted.unionai.cloud
 ```
 
 ### Two separate images
@@ -339,13 +338,12 @@ The app image is intentionally minimal — it doesn't need ML dependencies becau
 ```python
 serving_env = flyte.app.AppEnvironment(
     name="everstorm-rag-chatbot",
-    image=flyte.Image.from_debian_base(python_version=(3, 11), registry="docker.io/johndellenbaugh")
-        .with_pip_packages("gradio>=6.0.0", "flyte>=2.1.2", "python-dotenv>=1.0.0"),
+    image="docker.io/johndellenbaugh/rag-app:latest",  # plain string URI — factory methods don't work here
     secrets=[
         flyte.Secret(key="ANTHROPIC_API_KEY", as_env_var="ANTHROPIC_API_KEY"),
         flyte.Secret(key="PG_URL", as_env_var="PG_URL"),
     ],
-    env_vars={"FLYTE_BACKEND": "cluster"},
+    env_vars={"FLYTE_BACKEND": "cluster", "APP_VERSION": "4"},  # bump APP_VERSION to force redeploy
     port=7860,
     resources=flyte.Resources(cpu=2, memory="4Gi"),
 )
@@ -367,8 +365,7 @@ elif BACKEND == "cluster":
 
 **Deploy command:**
 ```bash
-python app.py --deploy
-# App URL: https://everstorm-rag-chatbot.<project>.unionai.cloud
+flyte --endpoint tryv2.hosted.unionai.cloud --org tryv2 --config flyte.yaml deploy app.py --project dellenbaugh --domain development serving_env
 ```
 
 ### Ingest tab: PDF upload widget
@@ -529,7 +526,7 @@ def _cluster_server():
     ui.queue()
     ui.launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)
 ```
-**(Under investigation — resume point for next session)**
+**Resolved** — sync `def` with `ui.queue()` before `ui.launch()` matches the Union docs pattern and runs cleanly.
 
 ---
 
@@ -587,10 +584,12 @@ Opens at `http://localhost:7860`. Docker Desktop must be running when `FLYTE_BAC
 ### Deploy to Union cluster
 
 ```bash
-python app.py --deploy
+flyte --endpoint tryv2.hosted.unionai.cloud --org tryv2 --config flyte.yaml deploy app.py --project dellenbaugh --domain development serving_env
 ```
 
-Builds the app image, deploys a persistent pod to Union, and prints the public URL. After deploying, the app runs on Union indefinitely — no local machine needed.
+Bundles `app.py`, `config.py`, and `workflows.py` and uploads them to Union. The app image (`rag-app:latest`) provides the Python environment. After deploy, Union returns a public URL for the hosted app. No image rebuild needed unless a Dockerfile changes.
+
+**Force redeployment** (when Union reports "No changes in App spec"): bump `APP_VERSION` in the `env_vars` dict in `serving_env` and redeploy.
 
 ### Demo Flow
 

@@ -238,4 +238,4 @@ The SHA-tagged images provide a rollback path. To roll back, update the image st
 
 **Code and image are decoupled.** Union injects the Python bundle at runtime — the Docker image only provides the environment. Code changes deploy in seconds without rebuilding images.
 
-**Task-level caching.** `load_and_chunk_task` and `retrieve_task` are cached by inputs. Re-ingesting an unchanged PDF is free. Repeated identical queries return instantly.
+**Task-level caching.** `load_and_chunk_task` is cached by inputs — re-ingesting an unchanged PDF is a free cache hit. `retrieve_task` is not cached because the underlying pgvector data can change between ingests; caching it would return stale results after a re-ingest.

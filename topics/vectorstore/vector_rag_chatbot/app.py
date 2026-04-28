@@ -80,7 +80,7 @@ serving_env = flyte.app.AppEnvironment(
         flyte.Secret(key="ANTHROPIC_API_KEY", as_env_var="ANTHROPIC_API_KEY"),
         flyte.Secret(key="PG_URL",             as_env_var="PG_URL"),
     ],
-    env_vars={"FLYTE_BACKEND": "cluster", "APP_VERSION": "3"},
+    env_vars={"FLYTE_BACKEND": "cluster", "APP_VERSION": "4"},
     port=7860,
     resources=flyte.Resources(cpu=2, memory="4Gi"),
 )
@@ -204,7 +204,7 @@ def chat(query, history, collection_name, top_k):
     history = list(history or [])
 
     if not query:
-        return history, query
+        return history
 
     history.append({"role": "user", "content": query})
 
@@ -213,7 +213,7 @@ def chat(query, history, collection_name, top_k):
             "role": "assistant",
             "content": "⚠️ Please set a collection name before chatting.",
         })
-        return history, query
+        return history
 
     try:
         from workflows import query_pipeline
@@ -245,7 +245,7 @@ def chat(query, history, collection_name, top_k):
             "content": f"❌ Error: {exc}",
         })
 
-    return history, query
+    return history
 
 
 # ── UI layout ─────────────────────────────────────────────────────────────────
@@ -271,11 +271,11 @@ def build_ui() -> gr.Blocks:
                             value="everstorm_docs",
                         )
                         chunk_size = gr.Slider(
-                            minimum=100, maximum=800, value=300, step=50,
+                            minimum=100, maximum=1200, value=600, step=50,
                             label="Chunk Size (chars)",
                         )
                         chunk_overlap = gr.Slider(
-                            minimum=0, maximum=150, value=30, step=10,
+                            minimum=0, maximum=200, value=60, step=10,
                             label="Chunk Overlap (chars)",
                         )
 
@@ -332,7 +332,10 @@ def build_ui() -> gr.Blocks:
                 query_input.submit(
                     fn=chat,
                     inputs=[query_input, chatbot, chat_collection, top_k],
-                    outputs=[chatbot, query_input],
+                    outputs=[chatbot],
+                ).then(
+                    fn=lambda: "",
+                    outputs=[query_input],
                 )
 
                 clear_btn.click(

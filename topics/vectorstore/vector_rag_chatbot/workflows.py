@@ -64,8 +64,8 @@ def _pg_connect():
 async def load_and_chunk_task(
     pdf_b64: str,
     filename: str,
-    chunk_size: int = 300,
-    chunk_overlap: int = 30,
+    chunk_size: int = 600,
+    chunk_overlap: int = 60,
 ) -> str:
     """
     Decode a base64 PDF → extract text with PyMuPDF → split into chunks.
@@ -305,7 +305,7 @@ async def ingest_pipeline(
 # QUERY PIPELINE — Task 1 of 2: retrieve_task
 # ─────────────────────────────────────────────────────────────────────────────
 
-@env.task(report=True, cache="auto")
+@env.task(report=True)
 async def retrieve_task(
     query: str,
     collection_name: str = COLLECTION,
