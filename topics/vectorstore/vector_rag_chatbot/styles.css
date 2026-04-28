@@ -18,7 +18,7 @@
 
 .source-accordion {
     margin-top: 10px;
-    border: 1px solid #dde1e7;
+    border: 1px solid rgba(255,255,255,0.15);
     border-radius: 8px;
     overflow: hidden;
     font-size: 0.88em;
@@ -26,22 +26,22 @@
 
 .source-accordion summary {
     padding: 6px 12px;
-    background: #f4f6f9;
+    background: rgba(255,255,255,0.08);
     cursor: pointer;
     font-weight: 600;
-    color: #444;
+    color: var(--body-text-color, #e0e0e0);
     list-style: none;
 }
 
 .source-accordion summary:hover {
-    background: #e8ecf2;
+    background: rgba(255,255,255,0.14);
 }
 
 /* ── Source item ──────────────────────────────────────────────────────────── */
 
 .source-item {
     padding: 8px 12px;
-    border-top: 1px solid #eee;
+    border-top: 1px solid rgba(255,255,255,0.08);
 }
 
 .source-header {
@@ -53,12 +53,12 @@
 
 .source-doc {
     font-weight: 600;
-    color: #333;
+    color: var(--body-text-color, #e0e0e0);
     font-size: 0.85em;
 }
 
 .source-text {
-    color: #555;
+    color: var(--body-text-color-subdued, #aaa);
     font-size: 0.82em;
     line-height: 1.4;
     margin: 0;

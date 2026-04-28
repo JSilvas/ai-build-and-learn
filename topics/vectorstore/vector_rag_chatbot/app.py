@@ -11,6 +11,7 @@ Run:
 
 import base64
 import json
+import time
 from pathlib import Path
 
 import flyte
@@ -160,7 +161,14 @@ def chat(query, history, collection_name, top_k):
             collection_name=collection_name.strip(),
             k=int(top_k),
         )
-        result = json.loads(run.outputs().o0)
+        outputs = run.outputs()
+        deadline = time.time() + 180
+        while (outputs is None or outputs.o0 is None) and time.time() < deadline:
+            time.sleep(3)
+            outputs = run.outputs()
+        if outputs is None or outputs.o0 is None:
+            raise TimeoutError("Query pipeline timed out waiting for output")
+        result = json.loads(outputs.o0)
         answer  = result["answer"]
         sources = result.get("sources", [])
 
@@ -188,13 +196,11 @@ def chat(query, history, collection_name, top_k):
 # ── UI layout ─────────────────────────────────────────────────────────────────
 
 def build_ui() -> gr.Blocks:
-    css = CSS_FILE.read_text()
-
-    with gr.Blocks(css=css, title="Everstorm RAG Chatbot") as app:
+    with gr.Blocks(title="Everstorm RAG Chatbot") as app:
 
         gr.Markdown("# Everstorm Outfitters — RAG Chatbot")
         gr.Markdown(
-            "Customer support Q&A powered by Qdrant vector search + Claude, "
+            "Customer support Q&A powered by pgvector semantic search + Claude, "
             "compute running on Union."
         )
 
@@ -261,9 +267,6 @@ def build_ui() -> gr.Blocks:
                 chatbot = gr.Chatbot(
                     label="Everstorm Support",
                     height=480,
-                    type="messages",
-                    render_markdown=True,
-                    show_copy_button=True,
                 )
 
                 with gr.Row():
@@ -299,5 +302,6 @@ def build_ui() -> gr.Blocks:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    css = (Path(__file__).parent / "styles.css").read_text()
     ui = build_ui()
-    ui.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    ui.launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)

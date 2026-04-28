@@ -25,8 +25,10 @@ import base64
 import json
 import logging
 import os
+import socket
 import tempfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import flyte
 import flyte.report
@@ -35,6 +37,23 @@ from config import COLLECTION, EMBED_DIM, EMBED_MODEL, env
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+
+def _pg_connect():
+    """Connect to Postgres forcing IPv4 to avoid IPv6-only cluster issues."""
+    import psycopg
+
+    url = os.environ["PG_URL"]
+    p = urlparse(url)
+    ipv4 = socket.getaddrinfo(p.hostname, None, socket.AF_INET)[0][4][0]
+    return psycopg.connect(
+        host=p.hostname,
+        hostaddr=ipv4,
+        port=p.port or 5432,
+        dbname=p.path.lstrip("/"),
+        user=p.username,
+        password=p.password,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,7 +137,6 @@ async def embed_and_index_task(
 
     Returns JSON: {collection_name, total_chunks, vectors_upserted, embed_model}
     """
-    import psycopg
     from pgvector.psycopg import register_vector
     from sentence_transformers import SentenceTransformer
 
@@ -134,7 +152,7 @@ async def embed_and_index_task(
     model = SentenceTransformer(EMBED_MODEL)
     embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
 
-    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    conn = _pg_connect()
     register_vector(conn)
 
     with conn:
@@ -300,14 +318,13 @@ async def retrieve_task(
 
     Returns JSON: list of {source_doc, chunk_text, score}
     """
-    import psycopg
     from pgvector.psycopg import register_vector
     from sentence_transformers import SentenceTransformer
 
     model = SentenceTransformer(EMBED_MODEL)
     query_vector = model.encode(query).tolist()
 
-    conn = psycopg.connect(os.environ["DATABASE_URL"])
+    conn = _pg_connect()
     register_vector(conn)
 
     with conn:
