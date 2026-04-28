@@ -22,6 +22,53 @@ import config  # loads .env and calls flyte.init() for the right backend
 
 CSS_FILE  = Path(__file__).parent / "styles.css"
 
+# CSS inlined so the deployed app bundle (Python files only) doesn't need styles.css on disk.
+_CSS = """
+.run-link a {
+    display: inline-block;
+    padding: 6px 14px;
+    background: #5865f2;
+    color: #fff;
+    border-radius: 6px;
+    font-weight: 600;
+    text-decoration: none;
+}
+.run-link a:hover { background: #4752c4; }
+.source-accordion {
+    margin-top: 10px;
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 8px;
+    overflow: hidden;
+    font-size: 0.88em;
+}
+.source-accordion summary {
+    padding: 6px 12px;
+    background: rgba(255,255,255,0.08);
+    cursor: pointer;
+    font-weight: 600;
+    color: var(--body-text-color, #e0e0e0);
+    list-style: none;
+}
+.source-accordion summary:hover { background: rgba(255,255,255,0.14); }
+.source-item {
+    padding: 8px 12px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+}
+.source-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.source-doc { font-weight: 600; color: var(--body-text-color, #e0e0e0); font-size: 0.85em; }
+.source-text { color: var(--body-text-color-subdued, #aaa); font-size: 0.82em; line-height: 1.4; margin: 0; }
+.score-high { background: #d4edda; color: #155724; padding: 2px 7px; border-radius: 10px; font-size: 0.8em; font-weight: 700; }
+.score-mid  { background: #fff3cd; color: #856404; padding: 2px 7px; border-radius: 10px; font-size: 0.8em; font-weight: 700; }
+.score-low  { background: #f8d7da; color: #721c24; padding: 2px 7px; border-radius: 10px; font-size: 0.8em; font-weight: 700; }
+.log-box textarea { font-family: monospace !important; font-size: 0.85em !important; }
+"""
+
+def _load_css() -> str:
+    try:
+        return _load_css()
+    except FileNotFoundError:
+        return _CSS
+
 # ── Union App deployment environment ──────────────────────────────────────────
 
 serving_env = flyte.app.AppEnvironment(
@@ -317,7 +364,7 @@ def build_ui() -> gr.Blocks:
 @serving_env.server
 async def _cluster_server():
     import asyncio
-    css = CSS_FILE.read_text()
+    css = _load_css()
     ui = build_ui()
     # Run Gradio in a thread so its internal asyncio usage doesn't conflict
     # with the Union cluster's outer asyncio.run() wrapper.
@@ -334,5 +381,5 @@ if __name__ == "__main__":
         app = flyte.serve(serving_env)
         print(f"App URL: {app.url}")
     else:
-        css = CSS_FILE.read_text()
+        css = _load_css()
         build_ui().launch(server_name="0.0.0.0", server_port=7860, share=False, css=css)
