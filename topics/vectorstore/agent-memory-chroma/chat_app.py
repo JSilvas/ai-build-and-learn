@@ -66,7 +66,10 @@ chat_image = (
 env = flyte.app.AppEnvironment(
     name="agent-memory-chat",
     image=chat_image,
-    resources=flyte.Resources(cpu="2", memory="4Gi"),
+    # Idle pod is just doing single-query BGE encoding + chat-stream proxying
+    # to the vLLM endpoint. 1 CPU is plenty and keeps the single-node devbox
+    # from going into "Insufficient cpu" when sibling apps are also ACTIVE.
+    resources=flyte.Resources(cpu="1", memory="4Gi"),
     port=7860,
     requires_auth=False,
     secrets=[flyte.Secret(key="HF_TOKEN", as_env_var="HF_TOKEN")],

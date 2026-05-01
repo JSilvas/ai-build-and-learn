@@ -95,6 +95,7 @@ Pipeline run: <run-name>
 
 ```bash
 RAG_PIPELINE_RUN=<run-name> python chat_app.py
+RAG_PIPELINE_RUN=rkvqzl9kxsz77fgbr7rl python chat_app.py
 ```
 
 If you don't pin a run, the app uses the latest succeeded run of `rag_pipeline`
