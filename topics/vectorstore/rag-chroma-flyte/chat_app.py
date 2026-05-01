@@ -17,6 +17,7 @@ import os
 
 import flyte
 import flyte.app
+import flyte.io
 
 
 # ── Gemma 4 vLLM endpoint info ────────────────────────────────────────────────
@@ -185,7 +186,7 @@ def _render_chunks(chunks: list[dict]) -> str:
 def chat_server(
     vllm_url: str,
     model_id: str,
-    chroma_dir: str,
+    chroma_dir: flyte.io.Dir,
     embedding_model: str,
     collection_name: str,
     default_top_k: str,
@@ -193,7 +194,9 @@ def chat_server(
     import sys
     import traceback
     try:
-        _run(vllm_url, model_id, chroma_dir, embedding_model, collection_name, int(default_top_k))
+        # `download=True` on the Parameter has already pulled the dir into the
+        # pod's CWD; chroma_dir.path is the local path string Chroma needs.
+        _run(vllm_url, model_id, chroma_dir.path, embedding_model, collection_name, int(default_top_k))
     except BaseException as e:
         print(f"!!! chat_server crashed: {type(e).__name__}: {e}", flush=True)
         traceback.print_exc()
@@ -204,11 +207,12 @@ def chat_server(
 def _run(
     vllm_url: str,
     model_id: str,
-    chroma_dir: str,
+    chroma_path: str,
     embedding_model: str,
     collection_name: str,
     default_top_k: int,
 ):
+    import os
     import chromadb
     import gradio as gr
     from openai import OpenAI
@@ -216,11 +220,16 @@ def _run(
 
     print(f"[chat_server] gradio version: {gr.__version__}", flush=True)
     print(f"[chat_server] vLLM at {vllm_url}/v1 (model={model_id})", flush=True)
-    print(f"[chat_server] Chroma at {chroma_dir} (collection={collection_name})", flush=True)
+    print(f"[chat_server] Chroma at {chroma_path!r} (collection={collection_name})", flush=True)
+    try:
+        contents = sorted(os.listdir(chroma_path))[:10]
+        print(f"[chat_server] Chroma dir contents (first 10): {contents}", flush=True)
+    except OSError as e:
+        print(f"[chat_server] Could not list chroma dir: {e}", flush=True)
     print(f"[chat_server] Loading encoder: {embedding_model}", flush=True)
 
     encoder = SentenceTransformer(embedding_model)
-    chroma_client = chromadb.PersistentClient(path=chroma_dir)
+    chroma_client = chromadb.PersistentClient(path=chroma_path)
     collection = chroma_client.get_collection(name=collection_name)
     print(f"[chat_server] Collection '{collection_name}' has {collection.count()} chunks", flush=True)
 
