@@ -56,6 +56,13 @@ RAG_TOP_K            = 3
 RAG_SIMILARITY_FLOOR = 0.45
 
 LEVEL_MINUTE = "minute"
+LEVEL_HOURLY = "hourly"
+LEVEL_DAILY  = "daily"
+
+COMPACT_CADENCE_S = 300        # compaction check runs every 5 minutes
+TTL_MINUTE_S      = 600        # promote minute entries after 10 minutes
+TTL_HOURLY_S      = 259_200    # promote hourly entries after 72 hours
+MIN_COMPACT_COUNT = 3          # minimum expired entries required to trigger compaction
 
 NEO4J_URI      = "bolt://localhost:7687"
 NEO4J_USER     = "neo4j"
@@ -81,6 +88,7 @@ _driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 _caption_lock     = threading.Lock()
 _consolidate_lock = threading.Lock()
+_compact_lock     = threading.Lock()
 _running = False
 
 
@@ -179,8 +187,24 @@ ENTITY_EXTRACT_PROMPT = (
     "Description: {text}"
 )
 
+HOURLY_COMPACT_PROMPT = (
+    "Summarize these minute-by-minute screen activity notes into a single hourly summary.\n\n"
+    "{entries}\n\n"
+    "Write a cohesive summary under 400 characters. "
+    "Cover the main tasks, tools used, and significant transitions. No preamble."
+)
+
+DAILY_COMPACT_PROMPT = (
+    "Summarize these hourly screen activity summaries into a single daily log entry.\n\n"
+    "{entries}\n\n"
+    "Write a cohesive daily summary under 600 characters. "
+    "Cover what was accomplished, tools/projects used, and notable patterns. No preamble."
+)
+
 CHAT_SYSTEM_PROMPT = (
-    "You are a personal context assistant with access to a log of the user's screen activity.\n\n"
+    "You are a personal context assistant with access to a log of the user's screen activity. "
+    "The log contains entries at different granularities: minute-level outlines, hourly summaries, "
+    "and daily logs — all captured by a screen activity harness.\n\n"
     "{context_block}"
     "Answer the user's question using the activity log. Be specific and direct. "
     "If the log doesn't contain enough information to answer, say so clearly."
@@ -189,6 +213,16 @@ CHAT_SYSTEM_PROMPT = (
 CHAT_SYSTEM_PROMPT_EMPTY = (
     "You are a personal context assistant. The user's screen activity log is currently empty — "
     "no outlines have been stored yet. Let the user know and offer to help once sessions have run."
+)
+
+CHAT_SYSTEM_PROMPT_COMBINED = (
+    "You are a personal context assistant. You have access to two sources:\n"
+    "1. The user's screen activity log (what they worked on, in chronological order)\n"
+    "2. The user's knowledge vault (notes and concepts they've written)\n\n"
+    "{context_block}"
+    "Draw on both sources. When citing activity, note the timestamp. "
+    "When citing a vault note, name it. Be specific and direct. "
+    "If neither source contains enough information, say so clearly."
 )
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -308,6 +342,69 @@ def search_store_graphrag(query: str, top_k: int = RAG_TOP_K) -> list[dict]:
             "score":     meta.get("score", 0.0),
         })
     return hits
+
+
+def search_combined(query: str, top_k: int = RAG_TOP_K, min_sim: float = RAG_SIMILARITY_FLOOR) -> dict:
+    """Run vector search + entity graph expansion + vault note search in one pass.
+
+    Returns:
+        direct       — activity nodes matched by cosine similarity
+        graph_related — activities reached via shared Entity nodes (scored at 0.75× anchor)
+        vault_notes  — vault Note nodes matched by cosine similarity
+    """
+    vec = embed(query)
+    with _driver.session() as s:
+        # 1. direct vector hits on :Activity
+        direct = s.run(
+            """
+            CALL db.index.vector.queryNodes('activity_embedding', $k, $vec)
+            YIELD node, score
+            WHERE score >= $floor
+            RETURN node.id AS id, node.text AS text, node.timestamp AS timestamp,
+                   node.level AS level, score
+            ORDER BY score DESC
+            """,
+            k=top_k, vec=vec, floor=min_sim,
+        ).data()
+
+        # 2. graph expansion: follow :MENTIONS → :Entity ← :MENTIONS from each anchor
+        seen_ids = {r["id"] for r in direct}
+        graph_related: list[dict] = []
+        for hit in direct:
+            rows = s.run(
+                """
+                MATCH (a:Activity {id: $id})-[:MENTIONS]->(e:Entity)<-[:MENTIONS]-(rel:Activity)
+                WHERE rel.id <> $id
+                WITH rel, collect(DISTINCT e.name) AS shared_entities, $score * 0.75 AS rel_score
+                RETURN rel.id AS id, rel.text AS text, rel.timestamp AS timestamp,
+                       rel.level AS level, rel_score AS score, shared_entities
+                ORDER BY rel_score DESC LIMIT 3
+                """,
+                id=hit["id"], score=hit["score"],
+            ).data()
+            for r in rows:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    graph_related.append(r)
+
+        # 3. vault note similarity (note_embedding index may not exist yet — swallow gracefully)
+        vault_notes: list[dict] = []
+        try:
+            vault_notes = s.run(
+                """
+                CALL db.index.vector.queryNodes('note_embedding', $k, $vec)
+                YIELD node, score
+                WHERE score >= $floor AND node:Note
+                RETURN node.title AS title, node.text AS text,
+                       node.tags AS tags, score
+                ORDER BY score DESC
+                """,
+                k=max(3, top_k), vec=vec, floor=max(0.0, min_sim - 0.1),
+            ).data()
+        except Exception:
+            pass
+
+    return {"direct": direct, "graph_related": graph_related, "vault_notes": vault_notes}
 
 
 def store_summary() -> str:
@@ -533,6 +630,7 @@ def build_combined_graph() -> str:
             MATCH (a)-[r]->(b)
             WHERE (a:Activity OR a:Entity OR a:Note OR a:Tag)
               AND (b:Activity OR b:Entity OR b:Note OR b:Tag)
+              AND type(r) <> 'NEXT'
             RETURN a, r, b
             LIMIT 400
             """,
@@ -571,21 +669,37 @@ _EMPTY_GRAPH_HTML = (
 
 def build_activity_graph() -> str:
     try:
+        # Primary view: entity hubs — activities clustered by what they mention.
+        # This is only interesting once entity extraction has run; no time filter
+        # so older sessions still show up.
         eager = _driver.execute_query(
             """
-            MATCH (a)-[r]->(b)
-            WHERE (a:Activity OR a:Entity) AND (b:Activity OR b:Entity)
-            RETURN a, r, b
-            LIMIT 300
+            MATCH (a:Activity)-[r:MENTIONS]->(e:Entity)
+            RETURN a, r, e
+            LIMIT 200
             """,
             routing_=RoutingControl.READ,
         )
+
+        if not eager.records:
+            # Entity extraction hasn't built up yet — show the 30 most recent
+            # activities so at least recent context is visible without the full chain.
+            eager = _driver.execute_query(
+                """
+                MATCH (a:Activity)
+                WITH a ORDER BY a.ts_epoch DESC LIMIT 30
+                MATCH (a)-[r:NEXT]->(b:Activity)
+                RETURN a, r, b
+                """,
+                routing_=RoutingControl.READ,
+            )
+
         if not eager.records:
             return _EMPTY_GRAPH_HTML
 
-        vg = from_neo4j(eager)
-        html_str = vg.render(theme="dark").data
-        safe = html_lib.escape(html_str)
+        vg       = from_neo4j(eager)
+        html_str = vg.render(theme="dark").data or ""
+        safe     = html_lib.escape(html_str)
         return (
             f'<iframe srcdoc="{safe}" width="100%" height="620px" '
             f'style="border:none;" title="Activity Graph"></iframe>'
@@ -761,6 +875,101 @@ def consolidate_tick(host_url: str, model: str, caption_buffer: list[str], outli
         _consolidate_lock.release()
 
 
+# ── COMPACTION ────────────────────────────────────────────────────────────────
+
+def compact_tick(host_url: str, model: str, log: str):
+    """Runs on its own timer — independent of _running.
+    minute entries older than TTL_MINUTE_S → one hourly summary.
+    hourly entries older than TTL_HOURLY_S → one daily summary.
+    Source nodes are deleted after a successful compaction.
+    """
+    if not _compact_lock.acquire(blocking=False):
+        return log, gr.skip()
+
+    try:
+        now = int(time.time())
+        stats_changed = False
+
+        # ── minute → hourly ───────────────────────────────────────────────────
+        with _driver.session() as s:
+            expired_minute = s.run(
+                """
+                MATCH (a:Activity)
+                WHERE a.level = $level AND a.ts_epoch < $cutoff
+                RETURN a.id AS id, a.text AS text, a.timestamp AS timestamp
+                ORDER BY a.ts_epoch ASC
+                """,
+                level=LEVEL_MINUTE, cutoff=now - TTL_MINUTE_S,
+            ).data()
+
+        if len(expired_minute) >= MIN_COMPACT_COUNT:
+            log = append_log(log, f"⚗ Compacting {len(expired_minute)} minute entries → hourly…")
+            entries_text = "\n\n".join(f"[{r['timestamp']}] {r['text']}" for r in expired_minute)
+            try:
+                resp = make_client(host_url).chat(
+                    model=model,
+                    messages=[{"role": "user", "content": HOURLY_COMPACT_PROMPT.format(entries=entries_text)}],
+                    stream=False, think=False,
+                    options={"temperature": 0.2, "num_predict": 150},
+                )
+                summary = (resp.message.content or "").strip()
+                if summary:
+                    save_outline(summary, level=LEVEL_HOURLY)
+                    with _driver.session() as s:
+                        s.run(
+                            "MATCH (a:Activity) WHERE a.id IN $ids DETACH DELETE a",
+                            ids=[r["id"] for r in expired_minute],
+                        )
+                    log = append_log(log, f"✓ {len(expired_minute)} minute → 1 hourly stored")
+                    stats_changed = True
+                else:
+                    log = append_log(log, "✗ Empty hourly compaction — skipping")
+            except Exception as e:
+                log = append_log(log, f"✗ minute→hourly failed: {e}")
+
+        # ── hourly → daily ────────────────────────────────────────────────────
+        with _driver.session() as s:
+            expired_hourly = s.run(
+                """
+                MATCH (a:Activity)
+                WHERE a.level = $level AND a.ts_epoch < $cutoff
+                RETURN a.id AS id, a.text AS text, a.timestamp AS timestamp
+                ORDER BY a.ts_epoch ASC
+                """,
+                level=LEVEL_HOURLY, cutoff=now - TTL_HOURLY_S,
+            ).data()
+
+        if len(expired_hourly) >= MIN_COMPACT_COUNT:
+            log = append_log(log, f"⚗ Compacting {len(expired_hourly)} hourly entries → daily…")
+            entries_text = "\n\n".join(f"[{r['timestamp']}] {r['text']}" for r in expired_hourly)
+            try:
+                resp = make_client(host_url).chat(
+                    model=model,
+                    messages=[{"role": "user", "content": DAILY_COMPACT_PROMPT.format(entries=entries_text)}],
+                    stream=False, think=False,
+                    options={"temperature": 0.2, "num_predict": 200},
+                )
+                summary = (resp.message.content or "").strip()
+                if summary:
+                    save_outline(summary, level=LEVEL_DAILY)
+                    with _driver.session() as s:
+                        s.run(
+                            "MATCH (a:Activity) WHERE a.id IN $ids DETACH DELETE a",
+                            ids=[r["id"] for r in expired_hourly],
+                        )
+                    log = append_log(log, f"✓ {len(expired_hourly)} hourly → 1 daily stored")
+                    stats_changed = True
+                else:
+                    log = append_log(log, "✗ Empty daily compaction — skipping")
+            except Exception as e:
+                log = append_log(log, f"✗ hourly→daily failed: {e}")
+
+        return log, store_summary() if stats_changed else gr.skip()
+
+    finally:
+        _compact_lock.release()
+
+
 # ── CONTEXT CHAT ──────────────────────────────────────────────────────────────
 
 def context_chat(
@@ -771,9 +980,74 @@ def context_chat(
     if not message.strip():
         return history, "", ""
 
+    use_combined = (rag_mode == "Combined")
     use_graphrag = (rag_mode == "GraphRAG")
 
-    if use_graphrag:
+    if use_combined:
+        results      = search_combined(message, top_k=top_k, min_sim=min_similarity)
+        direct       = results["direct"]
+        graph_related = results["graph_related"]
+        vault_notes  = results["vault_notes"]
+
+        debug_lines = [
+            f"**Combined — {len(direct)} direct · {len(graph_related)} graph-related · "
+            f"{len(vault_notes)} vault notes** (min score: {min_similarity})\n"
+        ]
+        context_parts: list[str] = []
+
+        if direct:
+            debug_lines.append("**Direct (vector similarity):**")
+            lines = []
+            for h in direct:
+                s = round(h["score"], 3)
+                debug_lines.append(f"✓ **[{h['timestamp']}]** `{h['level']}` score `{s}`  \n> {h['text']}")
+                lines.append(f"[{h['timestamp']} {h['level']}] (similarity {s}) {h['text']}")
+            context_parts.append("Activity log — direct matches:\n" + "\n".join(lines))
+
+        if graph_related:
+            debug_lines.append("\n**Graph-related (entity traversal):**")
+            lines = []
+            for h in graph_related:
+                s   = round(h["score"], 3)
+                ent = ", ".join(h.get("shared_entities") or [])
+                debug_lines.append(
+                    f"✓ **[{h['timestamp']}]** `{h['level']}` score `{s}`"
+                    + (f"  via: _{ent}_" if ent else "")
+                    + f"  \n> {h['text']}"
+                )
+                line = f"[{h['timestamp']} {h['level']}] (score {s}) {h['text']}"
+                if ent:
+                    line += f"  [shared entities: {ent}]"
+                lines.append(line)
+            context_parts.append("Activity log — graph-related:\n" + "\n".join(lines))
+
+        if vault_notes:
+            debug_lines.append("\n**Vault notes:**")
+            lines = []
+            for h in vault_notes:
+                s    = round(h["score"], 3)
+                tags = ", ".join(f"#{t}" for t in (h.get("tags") or []))
+                preview = (h.get("text") or "")[:120].replace("\n", " ")
+                debug_lines.append(
+                    f"✓ **{h['title']}** score `{s}`"
+                    + (f"  tags: _{tags}_" if tags else "")
+                    + f"  \n> {preview}"
+                )
+                line = f"[vault: {h['title']}] (similarity {s}) {h.get('text', '')[:300]}"
+                if tags:
+                    line += f"  [tags: {tags}]"
+                lines.append(line)
+            context_parts.append("Vault notes:\n" + "\n".join(lines))
+
+        retrieved_md = "\n\n".join(debug_lines)
+        if not context_parts:
+            retrieved_md += "\n\n_No results above threshold — LLM receives no context._"
+            system = CHAT_SYSTEM_PROMPT_EMPTY
+        else:
+            context_block = "\n\n".join(context_parts) + "\n\n"
+            system = CHAT_SYSTEM_PROMPT_COMBINED.format(context_block=context_block)
+
+    elif use_graphrag:
         raw_hits = search_store_graphrag(message, top_k=top_k)
         debug_lines = [f"**GraphRAG — {len(raw_hits)} candidates** (vector + entity graph):\n"]
         context_lines = []
@@ -792,7 +1066,20 @@ def context_chat(
                 if entities_str:
                     line += f"  [entities: {entities_str}]"
                 context_lines.append(line)
-    else:
+
+        retrieved_md = "\n\n".join(debug_lines)
+        if not context_lines:
+            retrieved_md += "\n\n_All results filtered — LLM receives no context._"
+            system = CHAT_SYSTEM_PROMPT_EMPTY
+        else:
+            context_block = (
+                f"Activity log ({len(context_lines)} entries):\n"
+                + "\n".join(context_lines)
+                + "\n\n"
+            )
+            system = CHAT_SYSTEM_PROMPT.format(context_block=context_block)
+
+    else:  # Vector RAG
         vec = embed(message)
         with _driver.session() as s:
             raw_hits = list(s.run(
@@ -819,17 +1106,17 @@ def context_chat(
                     f"[{row['timestamp']} {row['level']}] (similarity {sim}) {row['text']}"
                 )
 
-    retrieved_md = "\n\n".join(debug_lines)
-    if not context_lines:
-        retrieved_md += "\n\n_All results filtered — LLM receives no context._"
-        system = CHAT_SYSTEM_PROMPT_EMPTY
-    else:
-        context_block = (
-            f"Activity log ({len(context_lines)} entries):\n"
-            + "\n".join(context_lines)
-            + "\n\n"
-        )
-        system = CHAT_SYSTEM_PROMPT.format(context_block=context_block)
+        retrieved_md = "\n\n".join(debug_lines)
+        if not context_lines:
+            retrieved_md += "\n\n_All results filtered — LLM receives no context._"
+            system = CHAT_SYSTEM_PROMPT_EMPTY
+        else:
+            context_block = (
+                f"Activity log ({len(context_lines)} entries):\n"
+                + "\n".join(context_lines)
+                + "\n\n"
+            )
+            system = CHAT_SYSTEM_PROMPT.format(context_block=context_block)
 
     messages = [{"role": "system", "content": system}]
     for turn in history:
@@ -977,10 +1264,10 @@ def build_ui() -> gr.Blocks:
 
                 with gr.Row():
                     rag_mode = gr.Radio(
-                        choices=["Vector RAG", "GraphRAG"],
-                        value="Vector RAG",
+                        choices=["Combined", "Vector RAG", "GraphRAG"],
+                        value="Combined",
                         label="Retrieval Mode",
-                        info="Vector RAG: cosine similarity only · GraphRAG: vector + entity graph traversal",
+                        info="Combined: vector similarity + entity graph + vault notes · Vector RAG: cosine only · GraphRAG: vector + entity graph traversal",
                     )
 
                 with gr.Accordion("RAG Parameters", open=True):
@@ -1038,6 +1325,7 @@ def build_ui() -> gr.Blocks:
 
         capture_timer     = gr.Timer(value=CAPTURE_CADENCE_S,       active=True)
         consolidate_timer = gr.Timer(value=CONSOLIDATE_CADENCE_S,   active=True)
+        compact_timer     = gr.Timer(value=COMPACT_CADENCE_S,       active=True)
         graph_timer       = gr.Timer(value=GRAPH_REFRESH_CADENCE_S, active=True)
 
         capture_timer.tick(
@@ -1050,6 +1338,12 @@ def build_ui() -> gr.Blocks:
             consolidate_tick,
             inputs=[host_url, model_select, caption_buffer, outline_state, log_box],
             outputs=[summary_md, outline_state, caption_buffer, log_box, stats_chat_md],
+        )
+
+        compact_timer.tick(
+            compact_tick,
+            inputs=[host_url, model_select, log_box],
+            outputs=[log_box, stats_md],
         )
 
         graph_timer.tick(build_activity_graph, outputs=[graph_html])
