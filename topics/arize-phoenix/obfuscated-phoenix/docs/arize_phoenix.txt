@@ -1,0 +1,25 @@
+Arize Phoenix — LLM Observability Platform
+
+Arize Phoenix is an open-source observability and evaluation platform designed for LLM applications. It provides tracing, debugging, and evaluation capabilities for AI systems including RAG pipelines, agents, and chatbots.
+
+Phoenix collects traces using the OpenTelemetry (OTel) protocol. Each LLM call, retrieval step, or tool invocation becomes a span within a trace. Spans capture input messages, output messages, token counts, latency, and metadata. The Phoenix UI lets you browse traces, filter by project or time range, and drill into individual spans to inspect exactly what was sent to and received from the LLM.
+
+Key concepts in Phoenix:
+- Span: A single unit of work, such as one LLM call or one vector search.
+- Trace: A tree of related spans representing a complete request through the system.
+- Project: A named grouping of traces, used to separate different apps or experiments.
+- Annotation: A label or score attached to a span after the fact, typically added by an evaluator.
+
+Phoenix supports multiple instrumentation libraries via the OpenInference standard:
+- openinference-instrumentation-openai: auto-instruments the OpenAI Python SDK
+- openinference-instrumentation-langchain: auto-instruments LangChain chains and agents
+- openinference-instrumentation-llamaindex: auto-instruments LlamaIndex pipelines
+
+To start Phoenix locally, run: phoenix serve
+The default UI is at http://localhost:6006
+
+Phoenix stores traces in a SQLite database by default, and can be configured to use PostgreSQL for production deployments.
+
+The Phoenix Python client (arize-phoenix-client) allows you to query spans programmatically via Client.spans.get_spans_dataframe(), which returns a pandas DataFrame of span attributes. You can use this to pull traces into your evaluation code or export them for analysis.
+
+Evaluations in Phoenix are written back to spans as annotations. Each annotation has a name (e.g. "answer_relevance"), a label (e.g. "relevant" or "irrelevant"), a numeric score, and an optional explanation. Annotations are visible in the Phoenix UI alongside the original span.

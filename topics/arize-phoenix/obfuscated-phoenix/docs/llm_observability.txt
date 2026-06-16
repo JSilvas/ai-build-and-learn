@@ -1,0 +1,29 @@
+LLM Observability
+
+LLM observability refers to the practice of instrumenting, monitoring, and analyzing AI applications built on large language models. It extends traditional software observability (logs, metrics, traces) with LLM-specific concerns: prompt quality, context utilization, hallucination rates, latency, and token cost.
+
+Why observability matters for LLMs:
+LLMs are non-deterministic black boxes. Unlike traditional services where a failing function throws an error, an LLM can silently return a wrong, incomplete, or harmful answer. Without observability, these failures are invisible until a user reports them. Tracing every LLM call gives you a record of exactly what was sent to the model and what came back, so you can replay, debug, and evaluate any response.
+
+Core pillars of LLM observability:
+1. Tracing: Capturing the full context of each request — prompts, responses, tool calls, and their timing. Tracing is typically implemented via OpenTelemetry (OTel), which provides a vendor-neutral protocol for emitting structured telemetry data.
+2. Evaluation: Automatically scoring responses for quality dimensions like relevance, faithfulness, toxicity, or task completion. Evaluations can be run as batch jobs over captured traces, or inline during request processing.
+3. Monitoring: Tracking aggregated metrics over time — average latency, error rate, token cost per query, retrieval hit rate, and evaluation score distributions.
+
+OpenTelemetry and OpenInference:
+OpenTelemetry is a CNCF standard for distributed tracing, originally designed for microservices. LLM observability platforms like Phoenix adopt OTel because it's language-agnostic and widely supported. OpenInference is an open standard built on top of OTel that adds LLM-specific semantic conventions: input.value, output.value, retrieval.documents, llm.token_count.prompt, llm.model_name, and so on.
+
+Key metrics to track in production LLM apps:
+- Latency: Time to first token (TTFT) and total generation time. Retrieval latency is often a significant contributor.
+- Token usage: Prompt tokens and completion tokens per request. Token cost can grow unexpectedly as context windows fill up.
+- Retrieval quality: Whether retrieved chunks are actually relevant to the query (measurable with LLM-as-judge evals).
+- Answer quality: Relevance, faithfulness (does the answer stick to the retrieved context?), and completeness.
+- Error rate: API failures, timeout errors, context length exceeded errors.
+
+LLM-as-judge evaluation:
+Because human evaluation doesn't scale, teams use a stronger LLM to judge the outputs of their production LLM. The judge model is given the input question, the retrieved context, and the generated answer, then asked to score dimensions like relevance or faithfulness on a rubric. This approach scales automatically and can be run continuously over captured traces.
+
+Limitations of LLM-as-judge:
+- The judge model can have its own biases (length bias, self-preference bias).
+- Judge reliability depends on prompt quality — vague rubrics produce inconsistent scores.
+- Smaller judge models often struggle with nuanced judgments. Using a stronger model than the one being evaluated produces more reliable scores.

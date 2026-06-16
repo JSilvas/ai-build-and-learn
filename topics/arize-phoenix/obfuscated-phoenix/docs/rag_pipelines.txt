@@ -1,0 +1,29 @@
+Retrieval-Augmented Generation (RAG) Pipelines
+
+RAG is a technique that improves LLM responses by supplying relevant external knowledge at query time. Instead of relying solely on what the model learned during training, RAG retrieves relevant documents from a knowledge base and includes them in the prompt as context.
+
+A basic RAG pipeline has three stages:
+1. Indexing: Documents are split into chunks, embedded into vectors, and stored in a vector store.
+2. Retrieval: When a user asks a question, the question is embedded and the vector store returns the most similar chunks by cosine similarity.
+3. Generation: The retrieved chunks are formatted as context and passed to the LLM with the original question. The LLM generates an answer grounded in that context.
+
+Vector search works by measuring the geometric distance or angular similarity between embedding vectors. Cosine similarity is the most common metric — two vectors with high cosine similarity represent semantically similar text. FAISS (Facebook AI Similarity Search) is a popular library for fast approximate nearest-neighbor search over large embedding collections.
+
+Common failure modes in RAG:
+- Retrieval misses: The relevant information is in the knowledge base but isn't returned because the query embedding doesn't match the document embedding closely enough. This often happens with short queries or technical jargon.
+- Hallucination: The LLM generates information not present in the retrieved context, either because the context is insufficient or because the model ignores it.
+- Context stuffing: Retrieving too many chunks dilutes the relevant signal and can confuse the model with irrelevant text.
+- Chunking artifacts: If chunks are too small, they lack context. If too large, they introduce noise. Overlap between chunks can help preserve context at boundaries.
+
+Improving RAG retrieval:
+- Hybrid search: Combine dense vector search with sparse keyword search (BM25) for better coverage.
+- Re-ranking: After initial retrieval, use a cross-encoder model to re-score and re-order the top-k candidates.
+- Query expansion: Rephrase or expand the user query before embedding it to capture more relevant documents.
+- Metadata filtering: Filter documents by date, source, or category before or after vector search.
+
+Embedding models for RAG:
+- all-MiniLM-L6-v2: 384-dimensional, fast, good general-purpose baseline (22M parameters)
+- text-embedding-ada-002: OpenAI's embedding model, strong performance on English text
+- bge-large-en-v1.5: BAAI's strong open-source model, often outperforms ada-002 on benchmarks
+
+Chunk size is a key hyperparameter. Typical values range from 256 to 1000 tokens. Smaller chunks are more precise but lose surrounding context; larger chunks retain context but are harder to match against short queries. An overlap of 10-20% of chunk size helps avoid boundary artifacts.

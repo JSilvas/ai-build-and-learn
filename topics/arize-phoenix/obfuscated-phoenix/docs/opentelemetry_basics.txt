@@ -1,0 +1,41 @@
+OpenTelemetry Basics
+
+OpenTelemetry (OTel) is an open-source observability framework and CNCF project that provides APIs, SDKs, and tooling for generating and collecting telemetry data: traces, metrics, and logs. It is vendor-neutral — you instrument your code once and export to any compatible backend.
+
+Core concepts:
+- Tracer: The entry point for creating spans. You get a tracer from the global TracerProvider.
+- Span: Represents a single unit of work. A span has a name, start time, end time, status, and a collection of attributes (key-value pairs).
+- Trace: A directed acyclic graph of spans with a single root span. Each span records its parent span ID, so the full trace can be reconstructed.
+- Context: The mechanism for propagating trace context across function calls and process boundaries (via HTTP headers like traceparent).
+- Exporter: Sends telemetry data to a backend. The OTLP (OpenTelemetry Protocol) exporter sends data over gRPC or HTTP to any OTel-compatible backend.
+
+How tracing works:
+When you call OpenAIInstrumentor().instrument(), the instrumentation library monkey-patches the OpenAI SDK. Every time your code calls client.chat.completions.create(...), the instrumented version automatically:
+1. Creates a new span with the model name and token counts as attributes.
+2. Records the input messages as the span's input.value attribute.
+3. Records the response as the span's output.value attribute.
+4. Ends the span and exports it to the configured backend.
+
+Batch vs. synchronous export:
+By default, spans are sent in batches to reduce network overhead. The BatchSpanProcessor collects spans in memory and flushes them every few seconds or when the buffer is full. In short-lived scripts, call tracer_provider.force_flush() before exit to ensure all spans are sent.
+
+Registering Phoenix as the OTLP backend:
+from phoenix.otel import register
+tracer_provider = register(
+    endpoint="http://localhost:6006/v1/traces",
+    project_name="my-project",
+    batch=True,
+)
+
+The register() call configures an OTLP HTTP exporter pointing at Phoenix and returns a TracerProvider. Pass this provider to your instrumentation library so it sends spans to Phoenix rather than the global (default) provider.
+
+Why set_global_tracer_provider=False:
+If your app uses multiple OTel providers (e.g., Phoenix for LLM spans and a separate Jaeger exporter for service spans), setting set_global_tracer_provider=False prevents Phoenix from taking over all instrumentation. You explicitly pass the Phoenix provider to the LLM instrumentation library only.
+
+Common OTLP span attributes for LLM calls (OpenInference conventions):
+- llm.model_name: The model identifier (e.g., "gpt-4o", "local-model")
+- llm.token_count.prompt: Number of tokens in the input
+- llm.token_count.completion: Number of tokens in the output
+- input.value: Serialized input messages (JSON)
+- output.value: Serialized output messages (JSON)
+- session.id: Groups spans from the same user session in the Phoenix UI
