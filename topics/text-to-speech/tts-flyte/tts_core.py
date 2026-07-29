@@ -402,7 +402,17 @@ def load_model(spec):
 
     if spec.adapter == "chatterbox":
         from chatterbox.tts import ChatterboxTTS
-        return ChatterboxTTS.from_pretrained(device="cuda")
+        h = ChatterboxTTS.from_pretrained(device="cuda")
+        # Chatterbox keeps its speaker conditionals as MUTABLE STATE on the model:
+        # generate(audio_prompt_path=...) overwrites handle.conds, and every later
+        # generate() WITHOUT a prompt silently reuses them. So once a clone has run,
+        # the model has no way back to its own voice, and a "default voice" control
+        # take is really a second clone. Measured, before this snapshot existed:
+        # chatterbox's supposed stock voice scored 0.944 against the reference where
+        # its clone scored 0.925, i.e. the control looked like a better clone than the
+        # clone. Stash the pristine conditionals at load; synth_one restores them.
+        h._stock_conds = h.conds
+        return h
 
     if spec.adapter == "dia":
         import torch
@@ -466,6 +476,11 @@ def synth_one(handle, spec, text: str) -> tuple[np.ndarray, int, float]:
         return wav, spec.sample_rate, time.time() - t0
 
     if spec.adapter == "chatterbox":
+        # Undo any conditionals a previous clone left on the handle (see load_model).
+        # Without this the model's "own voice" is whatever it last cloned.
+        stock = getattr(handle, "_stock_conds", None)
+        if stock is not None:
+            handle.conds = stock
         t0 = time.time()
         wav = handle.generate(clean_for_plain(text))
         return to_mono_float32(wav), int(getattr(handle, "sr", spec.sample_rate)), time.time() - t0
@@ -595,9 +610,15 @@ def synth_clone(handle, spec, text: str, ref: RefVoice) -> tuple[np.ndarray, int
             ]},
             {"role": "0", "content": [{"type": "text", "text": clean_for_plain(text)}]},
         ]
+        # dtype, not just device. The plain path has no audio in it, so every tensor it
+        # produces is integer ids and a bare .to(device) is enough; the moment a
+        # reference clip enters the template the processor emits float32 audio features
+        # and the bf16 model rejects them with "Input type (float) and bias type
+        # (c10::BFloat16) should be the same". BatchFeature.to casts floating-point
+        # tensors only, so the token ids stay integral.
         inputs = processor.apply_chat_template(
             conversation, tokenize=True, return_dict=True,
-        ).to(model.device)
+        ).to(device=model.device, dtype=model.dtype)
         t0 = time.time()
         with torch.no_grad():
             audio = model.generate(**inputs, output_audio=True)
@@ -768,41 +789,80 @@ class CloneScore:
     error: str = ""
 
 
-# From the validated reference palette: sequential blue, one hue. The scoreboard is two
-# ranked bar panels rather than a similarity-vs-WER scatter on purpose. A scatter would
-# need one color per model, and a 5-series scatter is exactly the case where categorical
-# palettes stop being colorblind-separable; two single-hue panels sharing a row order
-# show the same trade-off (a model long in BOTH panels is buying similarity with
-# intelligibility) while keeping one measure per axis.
+# From the validated reference palette: sequential blue, one hue at two steps. The
+# scoreboard is two ranked bar panels rather than a similarity-vs-WER scatter on purpose.
+# A scatter would need one color per model, and a 5-series scatter is exactly the case
+# where categorical palettes stop being colorblind-separable; two single-hue panels
+# sharing a row order show the same trade-off (a model long in BOTH panels is buying
+# similarity with intelligibility) while keeping one measure per axis.
+#
+# The two steps encode the run's central comparison: the CLONED clip against the same
+# model's own DEFAULT voice. That is one hue at two lightnesses rather than two hues, so
+# it stays readable in grayscale and to a colorblind reader, and it reads as "same thing,
+# two conditions", which is what it is.
 _BAR = "#2a78d6"
+_BAR_STOCK = "#b3cdec"
 _INK = "#0b0b0b"
 _INK_MUTED = "#898781"
 _GRID = "#e1e0d9"
 
 
-def scoreboard_png(rows: list[tuple[str, float, float]], ceiling: float = 0.0) -> str:
+def scoreboard_png(rows: list[tuple[str, float, float, float, float]],
+                   ceiling: float = 0.0) -> str:
     """Two ranked bar panels (similarity, then WER) as a base64 PNG data URI.
 
-    `rows` is (model_key, mean_similarity, mean_wer), and it is drawn in the order
-    given: the caller sorts by similarity so the two panels share a row order and can
-    be read across. `ceiling` is the reference-vs-itself control, drawn as the dashed
-    line the similarity bars are measured against; without it a bar of "0.82" means
-    nothing, because the scale has no natural top.
+    `rows` is (model_key, clone_sim, clone_wer, stock_sim, stock_wer) and it is drawn in
+    the order given: the caller sorts by cloned similarity so the two panels share a row
+    order and can be read across. A stock value of 0 means the model produced no default
+    voice to compare against (the Qwen -Base checkpoints are clone-only), and that bar is
+    simply omitted rather than drawn at zero, which would read as "scored terribly".
+
+    Two controls make the similarity scale interpretable, because a raw cosine has no
+    natural top OR bottom:
+      - `ceiling`, the reference scored against itself, is the dashed line.
+      - the pale DEFAULT-voice bar is the floor: what this model scores against the
+        reference when it is not imitating anyone. The gap between the two bars is the
+        only honest measure of how much of the similarity number cloning actually bought.
     """
     if not rows:
         return ""
     keys = [r[0] for r in rows]
     sims = [r[1] for r in rows]
     wers = [r[2] * 100 for r in rows]
-    y = np.arange(len(keys))
-    height = max(2.0, 0.46 * len(keys) + 1.15)
+    st_sims = [r[3] for r in rows]
+    st_wers = [r[4] * 100 for r in rows]
+    has_stock = any(s > 0 for s in st_sims)
+    y = np.arange(len(keys), dtype=float)
+    # Paired rows need roughly twice the vertical space of single ones, plus room for
+    # the legend strip above the panels.
+    per_row = 0.72 if has_stock else 0.46
+    height = max(2.2, per_row * len(keys) + 1.35)
+    off, bh = (0.19, 0.34) if has_stock else (0.0, 0.62)
 
     fig, (ax_s, ax_w) = plt.subplots(1, 2, figsize=(9.6, height), dpi=120, sharey=True)
 
-    ax_s.barh(y, sims, height=0.62, color=_BAR)
+    def _pair(ax, clone_vals, stock_vals, fmt, pad):
+        """Draw the cloned bar and, where there is one, the default-voice bar under it."""
+        ax.barh(y - off, clone_vals, height=bh, color=_BAR, label="cloned")
+        for yi, v in zip(y, clone_vals):
+            ax.text(v + pad, yi - off, fmt(v), va="center", fontsize=8, color=_INK)
+        if not has_stock:
+            return
+        drawn = False
+        for yi, v in zip(y, stock_vals):
+            if v <= 0:      # no default voice on this checkpoint; say so, don't plot 0
+                ax.text(pad, yi + off, "no default voice", va="center", fontsize=7,
+                        color=_INK_MUTED, style="italic")
+                continue
+            ax.barh(yi + off, v, height=bh, color=_BAR_STOCK,
+                    label=None if drawn else "the model's own default voice")
+            drawn = True
+            ax.text(v + pad, yi + off, fmt(v), va="center", fontsize=8, color=_INK_MUTED)
+
     ax_s.set_title("speaker similarity vs the reference", fontsize=9,
                    color=_INK, loc="left", pad=8)
-    ax_s.set_xlim(0, max(1.0, max(sims + [ceiling]) * 1.12))
+    _pair(ax_s, sims, st_sims, lambda v: f"{v:.2f}", 0.012)
+    ax_s.set_xlim(0, max(1.0, max(sims + st_sims + [ceiling]) * 1.12))
     if ceiling:
         ax_s.axvline(ceiling, color=_INK_MUTED, linestyle="--", linewidth=1.2)
         # Label in axes-fraction y so it rides just under the title instead of
@@ -810,21 +870,16 @@ def scoreboard_png(rows: list[tuple[str, float, float]], ceiling: float = 0.0) -
         ax_s.text(ceiling, 1.005, f"ceiling {ceiling:.2f}", fontsize=7,
                   color=_INK_MUTED, ha="center", va="bottom",
                   transform=ax_s.get_xaxis_transform())
-    for yi, v in zip(y, sims):        # direct labels: no reading values off the axis
-        ax_s.text(v + 0.012, yi, f"{v:.2f}", va="center", fontsize=8, color=_INK)
 
-    ax_w.barh(y, wers, height=0.62, color=_BAR)
     ax_w.set_title("word error rate  (lower is better)", fontsize=9,
                    color=_INK, loc="left", pad=8)
-    ax_w.set_xlim(0, max(5.0, max(wers) * 1.16))
-    for yi, v in zip(y, wers):
-        ax_w.text(v + max(wers) * 0.015 + 0.15, yi, f"{v:.1f}%", va="center",
-                  fontsize=8, color=_INK)
+    _pair(ax_w, wers, st_wers, lambda v: f"{v:.1f}%", max(wers + st_wers) * 0.015 + 0.15)
+    ax_w.set_xlim(0, max(5.0, max(wers + st_wers) * 1.16))
 
     # Best at the top. Set the limits directly rather than invert_yaxis(): the panels
     # are sharey, so inverting each one in turn flips the order back and silently puts
     # the WORST model at the top of a chart whose rows are sorted best-first.
-    ax_s.set_ylim(len(keys) - 0.5, -0.75)
+    ax_s.set_ylim(len(keys) - 0.4, -0.85)
     for ax in (ax_s, ax_w):
         ax.set_yticks(y)
         ax.set_yticklabels(keys, fontsize=8, color=_INK)
@@ -834,8 +889,12 @@ def scoreboard_png(rows: list[tuple[str, float, float]], ceiling: float = 0.0) -
         ax.set_axisbelow(True)
         for side in ("top", "right", "left", "bottom"):
             ax.spines[side].set_visible(False)
+    if has_stock:
+        handles, labels = ax_s.get_legend_handles_labels()
+        fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=8,
+                   frameon=False, labelcolor=_INK_MUTED)
 
-    fig.tight_layout(pad=1.1)
+    fig.tight_layout(pad=1.1, rect=(0, 0.055 if has_stock else 0, 1, 1))
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor="white")
     plt.close(fig)
@@ -857,14 +916,23 @@ def _score_badges(sc: CloneScore | None) -> str:
     return sim + wer + mark
 
 
-def _clone_cell(spec, r: AudioResult, sc: CloneScore | None) -> str:
-    """A compare-grid cell plus the two scores and what Whisper actually heard."""
-    if r.error:
-        return (f'<div class="tts-cell"><div class="tts-err">⚠️ {html.escape(r.error)}</div>'
-                f'<div class="tts-cap"><div class="tts-model">{html.escape(spec.key)}</div>'
-                f'</div></div>')
+def _clone_pane(spec, r: AudioResult | None, sc: CloneScore | None,
+                label: str, *, muted: bool = False) -> str:
+    """One condition of one model: player, waveform, scores, and what Whisper heard.
 
-    spec_img = (f'<div class="tts-spec">{_zoom_img(r.spec_uri, f"{spec.key} · {r.text[:60]}")}</div>'
+    `muted` styles the default-voice pane as the control it is, so the eye lands on the
+    cloned pane first without the two being visually incomparable.
+    """
+    cls = "tts-pane tts-pane-muted" if muted else "tts-pane"
+    head = f'<div class="tts-panehead">{html.escape(label)}</div>'
+    if r is None:
+        return (f'<div class="{cls}">{head}'
+                f'<div class="tts-none">not generated</div></div>')
+    if r.error:
+        return (f'<div class="{cls}">{head}'
+                f'<div class="tts-err">⚠️ {html.escape(r.error)}</div></div>')
+
+    spec_img = (f'<div class="tts-spec">{_zoom_img(r.spec_uri, f"{spec.key} · {label} · {r.text[:60]}")}</div>'
                 if r.spec_uri else "")
     fast = f'<span class="tts-fast">{r.speedup:.1f}x real-time</span>' if r.speedup else ""
     # The transcript is the receipt for the WER number: it shows WHICH words went wrong,
@@ -872,13 +940,35 @@ def _clone_cell(spec, r: AudioResult, sc: CloneScore | None) -> str:
     # thirty' as 'forty three'".
     heard = (f'<div class="tts-heard">heard: “{html.escape(sc.transcript)}”</div>'
              if sc and sc.transcript else "")
-    cap = (
-        f'<div class="tts-cap"><div class="tts-model">{html.escape(spec.key)}</div>'
-        f'{_score_badges(sc)}{fast}{heard}'
+    return (
+        f'<div class="{cls}">{head}{spec_img}{_player(r)}'
+        f'<div class="tts-cap">{_score_badges(sc)}{fast}{heard}'
         f'<div class="tts-sub">{r.seconds:.1f}s to synth · {r.audio_seconds:.1f}s audio '
-        f'@ {r.sample_rate/1000:.0f}kHz<br>{html.escape(spec.license)}</div></div>'
+        f'@ {r.sample_rate/1000:.0f}kHz</div></div></div>'
     )
-    return f'<div class="tts-cell">{spec_img}{_player(r)}{cap}</div>'
+
+
+def _clone_cell(spec, clone_r: AudioResult, clone_sc: CloneScore | None,
+                stock_r: AudioResult | None = None,
+                stock_sc: CloneScore | None = None) -> str:
+    """One model on one script: the cloned take above the model's own default voice.
+
+    The pair is the point. A cloned clip on its own is unfalsifiable: it sounds like a
+    voice, and the reader has nothing to weigh "0.71 similarity" against. Put the same
+    model's stock voice directly underneath, saying the same words through the same
+    synthesis path, and the question stops being "is this good" and becomes "did the
+    reference change anything", which the ear and the two numbers can both answer.
+    """
+    panes = _clone_pane(spec, clone_r, clone_sc, "cloned")
+    if stock_r is not None or stock_sc is not None:
+        panes += _clone_pane(spec, stock_r, stock_sc, "the model's default voice",
+                             muted=True)
+    return (
+        f'<div class="tts-cell">'
+        f'<div class="tts-cellhead"><span class="tts-model">{html.escape(spec.key)}</span>'
+        f'<span class="tts-fam">{html.escape(spec.license)}</span></div>'
+        f'{panes}</div>'
+    )
 
 
 def render_clone_grid(
@@ -892,10 +982,12 @@ def render_clone_grid(
 ) -> str:
     """The clone report: the reference, then the scoreboard, then the script grid.
 
-    `scores` is keyed (text, model_key) -> CloneScore, the same shape render_grid uses
-    for results, so a missing score renders as a cell without badges rather than an error.
+    `results` and `scores` are both keyed (text, model_key, mode) where mode is "clone"
+    or "stock", so every model contributes two takes of every line: the clone, and the
+    same model's default voice as the control. A missing key renders as a pane without
+    badges rather than an error, which is what a model with no default voice needs.
     """
-    by_pair = {(r.text, r.model_key): r for r in results}
+    by_pair = results
 
     # 1. The reference. It goes first and it is a player, not a footnote: every number
     #    below is relative to this clip, so the reader needs to hear it first.
@@ -913,30 +1005,47 @@ def render_clone_grid(
             f'</div></div>'
         )
 
-    # 2. The scoreboard, ranked by similarity.
-    means: list[tuple[str, float, float]] = []
+    # 2. The scoreboard, ranked by cloned similarity, each model paired with its own
+    #    default voice. A model with no default voice contributes zeros, which
+    #    scoreboard_png draws as "no default voice" rather than as a bar at the origin.
+    def _mean(key: str, mode: str) -> tuple[float, float]:
+        got = [scores[(t, key, mode)] for t in texts
+               if (t, key, mode) in scores and not scores[(t, key, mode)].error]
+        if not got:
+            return 0.0, 0.0
+        return (sum(g.similarity for g in got) / len(got),
+                sum(g.wer for g in got) / len(got))
+
+    means: list[tuple[str, float, float, float, float]] = []
     for s in specs:
-        got = [scores[(t, s.key)] for t in texts
-               if (t, s.key) in scores and not scores[(t, s.key)].error]
-        if got:
-            means.append((s.key,
-                          sum(g.similarity for g in got) / len(got),
-                          sum(g.wer for g in got) / len(got)))
+        c_sim, c_wer = _mean(s.key, "clone")
+        if not c_sim:
+            continue
+        st_sim, st_wer = _mean(s.key, "stock")
+        means.append((s.key, c_sim, c_wer, st_sim, st_wer))
     means.sort(key=lambda m: -m[1])
     chart = scoreboard_png(means, ceiling=ceiling)
     board = (f'<div class="tts-board"><img src="{chart}" alt="clone scoreboard"/>'
              f'<div class="tts-sub">Similarity is a cosine between x-vector speaker '
-             f'embeddings: read it as a RANKING against the dashed ceiling (the '
-             f'reference scored against itself), not as a percentage. Word error rate '
-             f'is Whisper transcribing each clip against the text it was asked to say. '
-             f'A model needs both.</div></div>') if chart else ""
+             f'embeddings: read it as a RANKING between the pale bar (the model\'s own '
+             f'voice, imitating nobody) and the dashed ceiling (the reference scored '
+             f'against itself), not as a percentage. The distance between the two bars '
+             f'is what the reference clip actually bought. Word error rate is Whisper '
+             f'transcribing each clip against the text it was asked to say. A model '
+             f'needs both.</div></div>') if chart else ""
 
-    # 3. The grid, one block per script.
+    # 3. The grid, one block per script, one cell per model, two takes per cell.
     blocks = []
     for text in texts:
         cells = "".join(
-            _clone_cell(s, by_pair.get((text, s.key), AudioResult(s.key, text, error="no result")),
-                        scores.get((text, s.key)))
+            _clone_cell(
+                s,
+                by_pair.get((text, s.key, "clone"),
+                            AudioResult(s.key, text, error="no result")),
+                scores.get((text, s.key, "clone")),
+                by_pair.get((text, s.key, "stock")),
+                scores.get((text, s.key, "stock")),
+            )
             for s in specs
         )
         blocks.append(f'<div class="tts-script">🗣️ {html.escape(text)}</div>'
@@ -960,6 +1069,17 @@ CLONE_CSS = """
   .tts-warnlist { margin: 8px 0 0; padding-left: 18px; color: #92400e; font-size: 12px; }
   .tts-board { margin: 0 0 18px; }
   .tts-board img { width: 100%; height: auto; display: block; }
+  /* One cell is now one model in TWO conditions, so the model name moves up to a cell
+     header and each condition gets a labelled pane under it. */
+  .tts-cellhead { display: flex; align-items: baseline; justify-content: space-between;
+                  gap: 8px; padding: 9px 11px; border-bottom: 1px solid #e5e7eb; }
+  .tts-pane { padding: 2px 0 8px; }
+  .tts-pane + .tts-pane { border-top: 1px dashed #e5e7eb; }
+  .tts-pane-muted { background: #fafafa; }
+  .tts-panehead { font-size: 11px; font-weight: 600; letter-spacing: .03em;
+                  text-transform: uppercase; color: #6b7280; padding: 8px 11px 0; }
+  .tts-pane-muted .tts-panehead { color: #9ca3af; }
+  .tts-none { padding: 8px 11px; font-size: 12px; color: #9ca3af; font-style: italic; }
   .tts-sim { display: inline-block; font-size: 11px; color: #1e3a8a; background: #dbeafe;
              border-radius: 999px; padding: 1px 8px; margin: 4px 4px 0 0; font-weight: 600; }
   .tts-wer { display: inline-block; font-size: 11px; color: #3f3f46; background: #f4f4f5;

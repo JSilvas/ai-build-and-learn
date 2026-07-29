@@ -65,6 +65,10 @@ logging.basicConfig(level=logging.INFO)
 @dataclass
 class CloneItem:
     text: str
+    # "clone" = said in the reference voice, "stock" = the same model's own default
+    # voice saying the same line. Every model produces both so the report can put them
+    # side by side, and so the stock similarity can act as the no-clone floor.
+    mode: str = "clone"
     filename: str = ""            # wav in the model's Dir; "" if this line failed
     seconds: float = 0.0          # synth wall-clock
     audio_seconds: float = 0.0
@@ -88,6 +92,7 @@ class CloneRun:
 class ClipScore:
     model_key: str
     text: str
+    mode: str = "clone"
     similarity: float = 0.0
     wer: float = 0.0
     transcript: str = ""
@@ -114,7 +119,18 @@ async def _load_ref(ref_audio: flyte.io.File, ref_text: str) -> tts_core.RefVoic
 
 async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
                      ref_audio: flyte.io.File, ref_text: str) -> CloneRun:
-    """Load one cloner once, say every line in the reference voice, return a CloneRun."""
+    """Load one cloner once and say every line TWICE: cloned, and in its own voice.
+
+    The second take is the control the report is built around. It costs one extra synth
+    per line and no extra model load, and without it the cloned clip is unfalsifiable:
+    a similarity of 0.71 could mean the clone worked or could mean this model's stock
+    voice already happens to sit that close to the reference in embedding space. The
+    stock take is the floor that tells the two apart.
+
+    Not every checkpoint HAS a default voice: the Qwen -Base weights exist only to
+    clone. That failure is caught per line and recorded as an error item, so the report
+    says "no default voice" for those and still ranks their clones normally.
+    """
     spec = get_spec(model_key)
     if not spec.clone_capable:
         raise ValueError(f"{model_key} cannot clone; use compare_pipeline.py for it.")
@@ -132,7 +148,15 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
     out_dir = Path(tempfile.mkdtemp(prefix=f"clone_{model_key}_"))
     items: list[CloneItem] = []
     results: list[tts_core.AudioResult] = []
-    meta = f"{spec.repo} · cloning {ref.seconds:.1f}s of reference · {spec.license}"
+    meta = (f"{spec.repo} · cloning {ref.seconds:.1f}s of reference, "
+            f"each line also in the model's own voice · {spec.license}")
+
+    # The live in-task report is the plain compare grid, which keys cells by
+    # (text, model_key); the two takes would collide there. Give the stock take a
+    # stand-in spec with its own key so both show up as adjacent columns while the
+    # task runs. Only this task's live view uses these; the parent report keys by mode.
+    stock_spec = replace(spec, key=f"{spec.key} · own voice")
+    live_specs = [spec, stock_spec]
 
     handle = None
     try:
@@ -141,34 +165,44 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
         handle = tts_core.load_model(spec)
 
         for i, text in enumerate(texts):
-            try:
-                tts_core.reset_peak_memory()
-                wav, sr, secs = tts_core.synth_clone(handle, spec, text, ref)
-                peak = tts_core.peak_memory_gb()
-                fn = f"{model_key}__{i:02d}.wav"
-                tts_core.write_wav(wav, sr, out_dir / fn)
-                r = tts_core.build_audio_result(spec, text, wav, sr, secs, peak)
-                results.append(r)
+            # ("clone", the reference voice) then ("stock", the model's own). Same
+            # handle, same line, so the only variable between them is the reference.
+            for mode in ("clone", "stock"):
+                use = spec if mode == "clone" else stock_spec
+                try:
+                    tts_core.reset_peak_memory()
+                    if mode == "clone":
+                        wav, sr, secs = tts_core.synth_clone(handle, spec, text, ref)
+                    else:
+                        wav, sr, secs = tts_core.synth_one(handle, spec, text)
+                    peak = tts_core.peak_memory_gb()
+                    fn = f"{model_key}__{i:02d}_{mode}.wav"
+                    tts_core.write_wav(wav, sr, out_dir / fn)
+                    r = tts_core.build_audio_result(use, text, wav, sr, secs, peak)
+                    results.append(r)
 
-                # Detect the watermark HERE, in the generation image: Chatterbox's image
-                # is the only one with `perth` installed (it ships as one of that
-                # package's deps), and metrics.detect_watermark returns None everywhere
-                # else, so this costs nothing in the other four images.
-                mark = metrics.detect_watermark(wav, sr)
-                items.append(CloneItem(
-                    text=text, filename=fn, seconds=secs, audio_seconds=r.audio_seconds,
-                    sample_rate=sr, peak_gb=peak,
-                    watermark="" if mark is None else ("yes" if mark else "no"),
-                ))
-                log.info(f"[{model_key}] {i+1}/{len(texts)}: {secs:.1f}s -> "
-                         f"{r.audio_seconds:.1f}s audio ({r.speedup:.1f}x RT)")
-            except Exception as e:  # one bad line must not kill the model's other lines
-                log.exception(f"[{model_key}] line {i} failed")
-                results.append(tts_core.AudioResult(model_key, text, error=repr(e)))
-                items.append(CloneItem(text=text, error=repr(e)))
+                    # Detect the watermark HERE, in the generation image: Chatterbox's
+                    # image is the only one with `perth` installed (it ships as one of
+                    # that package's deps), and metrics.detect_watermark returns None
+                    # everywhere else, so this costs nothing in the other four images.
+                    mark = metrics.detect_watermark(wav, sr)
+                    items.append(CloneItem(
+                        text=text, mode=mode, filename=fn, seconds=secs,
+                        audio_seconds=r.audio_seconds, sample_rate=sr, peak_gb=peak,
+                        watermark="" if mark is None else ("yes" if mark else "no"),
+                    ))
+                    log.info(f"[{model_key}] {i+1}/{len(texts)} {mode}: {secs:.1f}s -> "
+                             f"{r.audio_seconds:.1f}s audio ({r.speedup:.1f}x RT)")
+                except Exception as e:
+                    # One bad line must not kill the model's other lines, and a model
+                    # with no default voice must not lose its clones. A -Base checkpoint
+                    # failing every "stock" take is the expected path, not a broken run.
+                    log.warning(f"[{model_key}] line {i} ({mode}) failed: {e!r}")
+                    results.append(tts_core.AudioResult(use.key, text, error=repr(e)))
+                    items.append(CloneItem(text=text, mode=mode, error=repr(e)))
 
             await flyte.report.replace.aio(
-                tts_core.render_grid(texts[: i + 1], [spec], results,
+                tts_core.render_grid(texts[: i + 1], live_specs, results,
                                      title=f"{model_key} · cloning", meta=meta))
             await flyte.report.flush.aio()
     finally:
@@ -257,25 +291,27 @@ async def score_clones(ref_audio: flyte.io.File, ref_text: str,
             usable = [it for it in run.items if it.filename and not it.error]
             if not run.clips or not usable:
                 out.clips.extend(
-                    ClipScore(run.model_key, it.text, error=it.error or "no output")
+                    ClipScore(run.model_key, it.text, it.mode, error=it.error or "no output")
                     for it in run.items)
                 continue
 
             local = Path(await run.clips.download())
             for it in run.items:
                 if it.error or not it.filename:
-                    out.clips.append(ClipScore(run.model_key, it.text,
+                    out.clips.append(ClipScore(run.model_key, it.text, it.mode,
                                                error=it.error or "no output"))
                     continue
                 try:
                     wav, sr = sf.read(str(local / it.filename), dtype="float32")
                     s = scorer.score(tts_core.to_mono_float32(wav), int(sr), it.text)
                     out.clips.append(ClipScore(
-                        run.model_key, it.text, similarity=s.similarity, wer=s.wer,
-                        transcript=s.transcript, error=s.error))
-                    log.info(f"[{run.model_key}] sim={s.similarity:.3f} wer={s.wer:.3f}")
+                        run.model_key, it.text, it.mode, similarity=s.similarity,
+                        wer=s.wer, transcript=s.transcript, error=s.error))
+                    log.info(f"[{run.model_key}/{it.mode}] sim={s.similarity:.3f} "
+                             f"wer={s.wer:.3f}")
                 except Exception as e:
-                    out.clips.append(ClipScore(run.model_key, it.text, error=repr(e)))
+                    out.clips.append(ClipScore(run.model_key, it.text, it.mode,
+                                               error=repr(e)))
     except Exception as e:      # scoring must never take the audio down with it
         log.exception("scoring failed")
         out.error = repr(e)
@@ -284,23 +320,33 @@ async def score_clones(ref_audio: flyte.io.File, ref_text: str,
 
 # ── Re-derive report objects from a run's wavs, in the parent ────────────────────
 
-async def _to_results(spec, run: CloneRun) -> list[tts_core.AudioResult]:
+async def _to_results(spec, run: CloneRun) -> dict[tuple[str, str, str], tts_core.AudioResult]:
+    """Rebuild the report objects for one model's run, keyed (text, model_key, mode).
+
+    Keyed rather than listed because a model now returns two takes of every line and
+    AudioResult carries no mode of its own: the key is what keeps the clone and the
+    stock take apart in the parent's report.
+    """
+    def _err(it: CloneItem, msg: str) -> tuple[tuple[str, str, str], tts_core.AudioResult]:
+        return (it.text, spec.key, it.mode), tts_core.AudioResult(spec.key, it.text, error=msg)
+
     if not run.clips or not any(it.filename and not it.error for it in run.items):
-        return [tts_core.AudioResult(spec.key, it.text, error=it.error or "no output")
-                for it in run.items]
+        return dict(_err(it, it.error or "no output") for it in run.items)
 
     local = Path(await run.clips.download())
-    out: list[tts_core.AudioResult] = []
+    out: dict[tuple[str, str, str], tts_core.AudioResult] = {}
     for it in run.items:
         if it.error or not it.filename:
-            out.append(tts_core.AudioResult(spec.key, it.text, error=it.error or "no output"))
+            k, v = _err(it, it.error or "no output")
+            out[k] = v
             continue
         try:
             wav, sr = sf.read(str(local / it.filename), dtype="float32")
-            out.append(tts_core.build_audio_result(spec, it.text, wav, sr, it.seconds, it.peak_gb))
+            out[(it.text, spec.key, it.mode)] = tts_core.build_audio_result(
+                spec, it.text, wav, sr, it.seconds, it.peak_gb)
         except Exception as e:
-            out.append(tts_core.AudioResult(spec.key, it.text,
-                                            error=f"could not read {it.filename}: {e}"))
+            k, v = _err(it, f"could not read {it.filename}: {e}")
+            out[k] = v
     return out
 
 
@@ -355,19 +401,20 @@ async def clone(
     ], return_exceptions=True)
 
     runs: list[CloneRun] = []
-    all_results: list[tts_core.AudioResult] = []
+    all_results: dict[tuple[str, str, str], tts_core.AudioResult] = {}
     done = {s.key: res for s, res in zip(launch, raw)}
     for s in specs:
         res = done.get(s.key)
-        if s.key in fetch_errors:
-            all_results.extend(tts_core.AudioResult(s.key, t, error=fetch_errors[s.key])
-                               for t in texts)
-        elif isinstance(res, Exception):
-            all_results.extend(tts_core.AudioResult(s.key, t, error=f"clone failed: {res}")
-                               for t in texts)
+        if s.key in fetch_errors or isinstance(res, Exception):
+            why = fetch_errors.get(s.key) or f"clone failed: {res}"
+            # Only the clone take: a model that never ran has no default voice to show
+            # either, and an error printed twice per cell says nothing extra.
+            all_results.update(
+                {(t, s.key, "clone"): tts_core.AudioResult(s.key, t, error=why)
+                 for t in texts})
         else:
             runs.append(res)
-            all_results.extend(await _to_results(s, res))
+            all_results.update(await _to_results(s, res))
 
     # Score everything that survived, in one pass, with one scorer.
     report = ScoreReport()
@@ -380,11 +427,12 @@ async def clone(
 
     # The watermark verdict lives on the generation items, the scores on the score
     # report; join them here for the renderer.
-    marks = {(it.text, r.model_key): it.watermark for r in runs for it in r.items}
-    scores: dict[tuple[str, str], tts_core.CloneScore] = {}
+    marks = {(it.text, r.model_key, it.mode): it.watermark
+             for r in runs for it in r.items}
+    scores: dict[tuple[str, str, str], tts_core.CloneScore] = {}
     for c in report.clips:
-        mark = marks.get((c.text, c.model_key), "")
-        scores[(c.text, c.model_key)] = tts_core.CloneScore(
+        mark = marks.get((c.text, c.model_key, c.mode), "")
+        scores[(c.text, c.model_key, c.mode)] = tts_core.CloneScore(
             similarity=c.similarity, wer=c.wer, transcript=c.transcript,
             watermarked=None if mark == "" else (mark == "yes"),
             error=c.error,
@@ -404,12 +452,14 @@ async def clone(
 
     note = f" · scoring error: {report.error}" if report.error else ""
     meta = (f"{len(specs)} models · {len(texts)} scripts · one reference voice · "
+            f"every line twice: cloned, and in the model's own voice · "
             f"similarity vs WER, same scorer for every clip{note}")
     await flyte.report.replace.aio(tts_core.render_clone_grid(
         texts, specs, all_results, scores,
         ref_result=ref_result, ref_transcript=ref_text, ref_warnings=ref_warnings,
         ceiling=report.ceiling,
-        title="Voice cloning: one reference, five models", meta=meta))
+        title=f"Voice cloning: one reference, {len(specs)} models, "
+              f"each against its own voice", meta=meta))
     await flyte.report.flush.aio()
     return report
 
@@ -440,9 +490,17 @@ if __name__ == "__main__":
 
     flyte.init_from_config(root_dir=pathlib.Path(__file__).parent)
     here = pathlib.Path(__file__).parent
-    wav, txt = here / "refs" / "sage.wav", here / "refs" / "sage.txt"
-    if not wav.exists():
-        raise SystemExit(f"no reference clip at {wav}; record one first (see the README)")
+    # A recorded voice if there is one, else the committed public-domain stand-in, so
+    # the demo runs for someone who just cloned the repo. `REF=<stem>` picks explicitly.
+    refs = here / "refs"
+    stems = [os.environ["REF"]] if os.environ.get("REF") else ["sage", "librispeech"]
+    wav = next((refs / f"{s}.wav" for s in stems if (refs / f"{s}.wav").exists()), None)
+    if wav is None:
+        raise SystemExit(f"no reference clip in {refs}; record one first (see the README)")
+    txt = wav.with_suffix(".txt")
+    if not txt.exists():
+        raise SystemExit(f"{wav.name} has no transcript at {txt.name}; three of the "
+                         "five cloners condition on it (see refs/README.md)")
     # from_local_sync, not from_local: we're outside the event loop here.
     run = flyte.run(clone, ref_audio=flyte.io.File.from_local_sync(str(wav)),
                     ref_text=txt.read_text().strip(), suite="clone-quick")

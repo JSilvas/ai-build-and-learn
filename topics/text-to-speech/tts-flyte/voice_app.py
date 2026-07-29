@@ -38,29 +38,32 @@ from pathlib import Path
 import flyte
 import flyte.app
 
-from config import VOICE_APP_NAME, VOICE_APP_PORT, voice_app_pod, voice_image
+from config import (VOICE_APP_NAME, VOICE_APP_PORT, voice_app_pod, voice_image,
+                    voice_ollama_image)
 
 log = logging.getLogger("voice.app")
 logging.basicConfig(level=logging.INFO)
 
 _here = Path(__file__).parent
 
-# The app needs the whole engine room in its image: unlike the launcher studios, this
-# one actually loads models, so tts_core/models/voice_core all ride along.
-_bundled = voice_image.with_source_file(_here / "voice_core.py") \
-                      .with_source_file(_here / "tts_core.py") \
-                      .with_source_file(_here / "models.py")
-
 # The backend decides the SHAPE of this pod, which is the whole point of the split:
 #
 #   vllm    the LLM lives in its own GPU pod (voice_vllm.py), so this one is CPU-only.
-#           Kokoro still streams (~5x real-time on CPU) and Whisper runs int8-ish on
-#           CPU. Crucially the GPU stays free, so the compare/clone pipelines still run.
+#           Kokoro still streams (~5x real-time on CPU) and Whisper runs on CPU.
+#           Crucially the GPU stays free, so the compare/clone pipelines still run.
 #   ollama  the LLM lives HERE, so this pod takes the GPU, and TTS/STT get it too
 #           (Kokoro at 78x, Whisper fp16, and Chatterbox voice cloning becomes possible).
 #           While it is up, the pipelines queue behind it.
 _BACKEND = os.environ.get("LLM_BACKEND", "vllm").strip().lower()
 _IS_OLLAMA = _BACKEND == "ollama"
+
+# The app needs the whole engine room in its image: unlike the launcher studios, this
+# one actually loads models, so tts_core/models/voice_core all ride along. Only the
+# ollama deployment pulls the image carrying the ollama server binary.
+_bundled = (voice_ollama_image if _IS_OLLAMA else voice_image) \
+    .with_source_file(_here / "voice_core.py") \
+    .with_source_file(_here / "tts_core.py") \
+    .with_source_file(_here / "models.py")
 
 _env_vars = {
     "HF_HOME": "/root/.cache/huggingface",

@@ -6,22 +6,22 @@ plugin into the base image's system Python, `flyte.prefetch.hf_model` + `RunOutp
 the weights are fetched once instead of on every cold start.
 
 Deploy:
-    python voice_vllm.py
+    python voice_vllm.py                      # qwen3-4b by default
+    VOICE_LLM=gemma12b python voice_vllm.py   # any key from MODELS below
     # then point the voice app at the URL it prints:
     LLM_BACKEND=vllm VLLM_URL=<url> python voice_app.py
 
-── Why a QUANTIZED checkpoint here and not bf16 ─────────────────────────────────
-The Spark is memory-bandwidth-bound, so tokens/sec tracks bytes-read-per-token, and a
-voice assistant has to stay ahead of speech (~3 tok/s of talking) with margin. The
-gemma4 devbox app serves bf16 (~52GB), which is the right call for batch throughput and
-the wrong one here. NVFP4 puts the same 26B-A4B at ~16.5GB: smaller than ollama's Q4
-(18GB) and on vLLM's kernels, so this should be the fastest option available on the box.
+── How to pick the model ────────────────────────────────────────────────────────
+The Spark is memory-bandwidth-bound, so tokens/sec tracks bytes-read-per-token. A voice
+assistant only has to stay ahead of speech (~3 tok/s of actual talking) with margin, and
+that bar is low: an 8GB model clears it roughly tenfold. So size DOWN. The capability you
+give up is worth less here than the latency you buy, because replies are one to three
+spoken sentences and the system prompt asks for exactly that.
 
-RISK, untested at the time of writing: NVFP4 kernels want Blackwell, and while the GB10
-IS Blackwell, it is sm_121 rather than the B200's sm_100. This repo has been bitten by
-sm_121 gaps repeatedly (CUDA-graph capture hangs, torch.compile failures, the whole
-voxtral deferral). If NVFP4 will not load, fall back to FP8 and then to bf16 by flipping
-CHECKPOINT below; the voice app does not care which one is behind the endpoint.
+Two failures on 2026-07-22 taught the rest, and both are recorded against MODELS below:
+oversized `gpu-memory-utilization` will OOM the box (the reservation is system RAM on a
+GB10), and vLLM's quantized-MoE kernels are the fragile path right now. Dense + bf16 has
+no quantization code path at all, which is why the default is a small dense Qwen.
 """
 
 from __future__ import annotations
@@ -33,22 +33,57 @@ from flyteplugins.vllm import VLLMAppEnvironment
 import flyte
 import flyte.app
 
-# Ordered best-to-safest. NVFP4 is the smallest and should be fastest; FP8 is the
-# conservative Blackwell choice; the bf16 base always loads but reads ~3x more per token.
-CHECKPOINTS = {
-    "nvfp4": ("nvidia/Gemma-4-26B-A4B-NVFP4", "gemma-4-26b-a4b-nvfp4"),
-    "fp8":   ("RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic", "gemma-4-26b-a4b-fp8"),
-    "bf16":  ("google/gemma-4-26B-A4B-it", "gemma-4-26b-a4b-it"),
+# Which model this app serves. `VOICE_LLM=<key> python voice_vllm.py`.
+#
+# The third field is gpu-memory-utilization, which MUST be sized per model: vLLM reserves
+# `util * 119.7GiB` up front, so one constant across models either starves the big ones or
+# leaves a small one squatting on most of the box's RAM. On the GB10 that reservation is
+# system RAM everything else is also using, which is exactly how the first deploy died.
+# Roughly: weights + a comfortable 8192-token KV cache, and nothing more, because a voice
+# assistant serves ONE conversation and has no use for batch headroom.
+#
+# ── Learned the hard way, 2026-07-22 ─────────────────────────────────────────────
+# Prefer DENSE + bf16 for anything that has to work today. Both deploy failures came from
+# the exotic end of the stack, and the second one was specifically vLLM's quantized-MoE
+# kernels:
+#
+#   gemma26b-nvfp4  BROKEN. vLLM 0.19.1.dev picks its VLLM_CUTLASS NvFp4 MoE backend and
+#                   dies on `KeyError: layers.13.experts.100.down_proj.input_scale`. The
+#                   tensor IS in the checkpoint (safetensors index shows 128 experts and
+#                   3840 down_proj.input_scale entries) but under the full multimodal name
+#                   `model.language_model.layers.13...`. So: a vLLM name-mapping bug in the
+#                   experimental ModelOpt NVFP4 path, NOT a bad checkpoint and NOT the
+#                   Flyte streaming loader (2 shards, both streamed fine). Retry after a
+#                   vLLM bump.
+#   gemma26b-fp8    UNTESTED. FP8-*dynamic* quantizes activations at runtime so it ships no
+#                   static input_scale tensors, making the failure above structurally
+#                   impossible; but it is still a quantized-MoE path, so treat with care.
+#
+# A dense bf16 model has no quantization path at all, which is why the small Qwen entries
+# are the safe default. MoE is not a bad idea in principle: 26B-A4B reads only ~4B active
+# params per token, so it can be FASTER than its size suggests while being far more
+# capable. It is just the fragile path in vLLM right now.
+MODELS = {
+    # key              hf repo                                    served id           util
+    "qwen3-1.7b":     ("Qwen/Qwen3-1.7B",                        "qwen3-1.7b",       "0.15"),
+    "qwen3-4b":       ("Qwen/Qwen3-4B",                          "qwen3-4b",         "0.20"),
+    "qwen3-8b":       ("Qwen/Qwen3-8B",                          "qwen3-8b",         "0.30"),
+    "gemma12b":       ("google/gemma-4-12B-it",                  "gemma-4-12b-it",   "0.35"),
+    "gemma26b-fp8":   ("RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic", "gemma-4-26b-fp8", "0.45"),
+    "gemma26b-nvfp4": ("nvidia/Gemma-4-26B-A4B-NVFP4",           "gemma-4-26b-nvfp4", "0.35"),
+    "gemma26b-bf16":  ("google/gemma-4-26B-A4B-it",              "gemma-4-26b-it",   "0.70"),
 }
-CHECKPOINT = os.environ.get("VOICE_LLM_QUANT", "nvfp4")
-HF_REPO, MODEL_ID = CHECKPOINTS[CHECKPOINT]
+VOICE_LLM = os.environ.get("VOICE_LLM", "qwen3-4b")
+HF_REPO, MODEL_ID, _DEFAULT_UTIL = MODELS[VOICE_LLM]
 
-APP_NAME = f"tts-voice-llm-{CHECKPOINT}"
+APP_NAME = f"tts-voice-llm-{VOICE_LLM.replace('.', '-')}"
 
-# vLLM budgets `util * total` of the pool and refuses to start unless that much is free.
-# The OS holds ~20Gi of the 119.7Gi, so anything above ~0.83 can never be satisfied; 0.75
-# is the value the gemma4 app settled on and the same one the GB10 memory notes recommend.
-GPU_MEMORY_UTILIZATION = os.environ.get("VOICE_GPU_MEM_UTIL", "0.75")
+# Override the per-model default only if you know why. The gemma4 devbox app hardcodes
+# 0.75, which is correct for the bf16 52GB model IT serves and catastrophic here: copying
+# it verbatim is what made the first deploy reserve ~90GB of the 119.7GiB pool and die with
+# `torch.AcceleratorError: CUDA error: out of memory` (rustfs was sitting on 49GB of leaked
+# heap at the time, so the pool was smaller than it looked; see the README recovery note).
+GPU_MEMORY_UTILIZATION = os.environ.get("VOICE_GPU_MEM_UTIL", _DEFAULT_UTIL)
 
 # from_base() returns a FROZEN dataclass pinned to linux/amd64 and clone() exposes no
 # platform kwarg, so the freeze is bypassed to set arm64. Straight from vllm_server.py.
@@ -109,7 +144,7 @@ if __name__ == "__main__":
         print(f"Prefetch run: {run.url}")
         run_name = run.name
 
-    print(f"Deploying vLLM for {MODEL_ID} ({CHECKPOINT}) …")
+    print(f"Deploying vLLM for {MODEL_ID} ({VOICE_LLM}, util={GPU_MEMORY_UTILIZATION}) …")
     app = flyte.serve(
         vllm_app.clone_with(
             name=vllm_app.name,
@@ -117,7 +152,17 @@ if __name__ == "__main__":
             model_hf_path=None,
         )
     )
-    print(f"vLLM app deployed: {app.url}")
+    print(f"vLLM app deployed. Console: {app.url}")
+    print()
+    # app.url is the CONSOLE link, not the serving endpoint: posting to it does not
+    # reach vLLM. The endpoint is the Knative route, and which one you want depends on
+    # who is calling. Resolve it rather than printing app.url and misleading the reader.
+    svc = f"{APP_NAME}-{os.environ.get('FLYTE_PROJECT', 'text-to-speech')}-development"
+    print(f"  OpenAI base URL, from INSIDE the cluster (what voice_app uses in a pod):")
+    print(f"    http://{svc}.flyte.svc.cluster.local/v1")
+    print(f"  From the devbox host (RUN_MODE=host, or curl):")
+    print(f"    http://{svc}.localhost:30081/v1")
     print()
     print("Point the voice app at it:")
-    print(f"  LLM_BACKEND=vllm VLLM_URL={app.url} VLLM_MODEL_ID={MODEL_ID} python voice_app.py")
+    print(f"  LLM_BACKEND=vllm VLLM_MODEL_ID={MODEL_ID} \\")
+    print(f"    VLLM_URL=http://{svc}.flyte.svc.cluster.local python voice_app.py")

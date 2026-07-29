@@ -294,20 +294,37 @@ clone_orch_env = flyte.TaskEnvironment(
 # vLLM is one model per process. ollama also serves GGUF quantized weights, which is
 # load-bearing on this box (see voice_core: 26B at Q4 measured 14.1 tok/s; bf16 would be
 # ~3x slower per token because the Spark is memory-bandwidth-bound).
+# The base voice image: TTS + STT + the UI, and NOTHING about the LLM. In the `vllm`
+# deployment the model lives in its own pod, so this image never needs an LLM server.
 voice_image = (
     _base("tts-voice")
-    .with_apt_packages("curl")
     .with_pip_packages(
         "kokoro>=0.9.4", "misaki[en]>=0.9.4",   # the streaming TTS (78x real-time here)
         "transformers>=4.57.3", "accelerate",   # Whisper for STT, same stack as metrics.py
-        "gradio==5.42.0", "ollama",
+        "gradio==5.42.0", "openai",             # the UI + the OpenAI-compatible client
     )
-    # The ollama server itself, alongside its Python client. Installed from the official
-    # arm64 tarball rather than the convenience script: the script wants systemd, which
-    # a container does not have, and fails the build trying to enable a service.
+)
+
+# Only the `ollama` deployment needs a local LLM server, so it gets its own image rather
+# than burdening the vllm one with ~1GB of binary it will never execute. That separation
+# is not cosmetic: the first attempt baked ollama into the single shared image and a bad
+# download URL failed the build for a deployment that does not even use it.
+#
+# Pinned, and from the GitHub release rather than ollama.com/download (which 404s for
+# this asset). Note the archive is .tar.zst, NOT .tgz, so it needs zstd to unpack.
+_OLLAMA_VERSION = "v0.32.1"
+_OLLAMA_URL = (f"https://github.com/ollama/ollama/releases/download/{_OLLAMA_VERSION}"
+               "/ollama-linux-arm64.tar.zst")
+voice_ollama_image = (
+    voice_image.clone(name="tts-voice-ollama")
+    .with_apt_packages("curl", "zstd")
+    .with_pip_packages("ollama")
+    # The official install script is not usable here: it wants systemd to enable a
+    # service, which a container does not have, and it fails the build.
     .with_commands([
-        "curl -fsSL https://ollama.com/download/ollama-linux-arm64.tgz "
-        "-o /tmp/ollama.tgz && tar -C /usr -xzf /tmp/ollama.tgz && rm /tmp/ollama.tgz"
+        f"curl -fsSL {_OLLAMA_URL} -o /tmp/ollama.tar.zst "
+        "&& tar --use-compress-program=unzstd -C /usr -xf /tmp/ollama.tar.zst "
+        "&& rm /tmp/ollama.tar.zst && /usr/bin/ollama --version"
     ])
 )
 

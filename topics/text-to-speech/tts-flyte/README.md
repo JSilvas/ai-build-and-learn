@@ -131,8 +131,17 @@ Hand it **one recording of one person** and it says five new scripts in that voi
 across every cloning-capable model, then **scores** each clip. Same report shape, but
 this one has numbers, because cloning has a ground truth the compare run never did.
 
+Every line is generated **twice**: once cloned, once in the model's own default voice.
+The report stacks the pair in one cell, so the question stops being "does this clip
+sound good" and becomes "did the reference clip change anything" (see
+[the control that makes the number mean something](#the-control-that-makes-the-number-mean-something)).
+
 ```bash
-# record ~15s of yourself reading refs/sage.txt, save it as refs/sage.wav, then:
+# a public-domain reference ships with the repo, so this runs out of the box:
+flyte run clone_pipeline.py clone \
+    --ref_audio refs/librispeech.wav --ref_text "$(cat refs/librispeech.txt)"
+
+# your own voice: record ~15s reading refs/sage.txt, save it as refs/sage.wav, then:
 flyte run clone_pipeline.py clone \
     --ref_audio refs/sage.wav --ref_text "$(cat refs/sage.txt)"
 
@@ -160,24 +169,82 @@ third word, and SIM alone cannot see that: **high similarity is the classic way 
 a cloning demo look better than it is.** The report also shows Whisper's actual
 transcript per clip, which is the receipt for the WER number.
 
-SIM is a ranking, not a grade. A raw cosine has no natural top, so the run computes a
-**ceiling**: it splits the reference in half and scores half A against half B. That's
-the same person, different audio, through the identical embedding path, i.e. realistically
-the best any clone could score. It's the dashed line on the scoreboard, and every bar
-is read against it.
+### The control that makes the number mean something
+
+SIM is a ranking, not a grade: a raw cosine has no natural top **and no natural bottom**,
+so the run brackets it from both ends.
+
+- The **ceiling** is the reference split in half, scored A against B. Same person,
+  different audio, identical embedding path, i.e. realistically the best any clone could
+  score. It's the dashed line on the scoreboard.
+- The **floor** is each model saying the same line in its own default voice, imitating
+  nobody. It's the pale bar under every model's bar, and the gap between the two is the
+  only honest measure of what the reference clip actually bought.
+
+The floor is not decoration. The first green run of this pipeline had Chatterbox's
+"default voice" scoring **0.944** against the reference while its clone scored **0.925**:
+the control beat the clone. That was a bug, and only the pairing made it visible.
+Chatterbox keeps its speaker conditionals as mutable state on the model, so
+`generate(audio_prompt_path=…)` overwrites them and every later plain `generate()`
+silently keeps cloning. The control take was a second clone. `load_model` now snapshots
+the pristine conditionals and `synth_one` restores them; the same run then reads 0.904 /
+0.965 cloned against 0.748 / 0.665 stock, with the ceiling at 0.975 and the model card's
+same-speaker threshold at 0.86.
+
+Worth sitting with: a single similarity number would have called that broken run a
+**success**. Two clips that were both the reference voice scored 0.93-0.96 against it,
+which is exactly what a working clone looks like.
+
+Models with no default voice (the Qwen `-Base` checkpoints exist only to clone) say so
+in the cell and on the chart, and their clones still rank normally.
+
+### What the first full run actually showed
+
+Five models x the five-script clone suite, against `refs/librispeech.wav` (ceiling
+**0.975**, same-speaker threshold 0.86). Ranges are across the five scripts.
+
+| model | cloned SIM | its own voice | reads as |
+|---|---|---|---|
+| `qwen3-1.7b-clone` | 0.967-0.979 | — | at the ceiling, 0% WER on every line |
+| `qwen3-0.6b-clone` | 0.950-0.974 | — | a hair below the 1.7B, and it pays in words: one line came back at 150% WER |
+| `csm-1b` | 0.962-0.987 | 0.750-0.829 | strong, but its stock voice already sits high |
+| `chatterbox` | 0.904-0.945 | 0.577-0.650 | the cleanest separation of the five |
+| `dia-1.6b` | 0.466-0.966 | 0.504-0.917 | unstable in both directions, see below |
+
+Two things the pairing makes visible that a similarity column alone would not:
+
+- **Dia is a coin flip.** Its clone ranged 0.466 to 0.966 across five lines, and its
+  "default voice" is a *random* speaker per call, which on one line landed at 0.917
+  against a reference it had never heard. A run without the control would have read that
+  0.917-adjacent behaviour as a good clone. Dia is a dialogue model being asked to do a
+  job it was not built for, and the spread says so.
+- **A high floor is not a good sign.** CSM scores 0.75-0.83 in its own voice, so its
+  0.96+ clone is a smaller jump than Chatterbox's 0.94 off a 0.6 floor. Ranking by the
+  cloned bar alone puts CSM above Chatterbox; ranking by what the reference *bought*
+  reverses them.
+
+Rough cost on the GB10: the full five-model run takes ~35 minutes wall clock including
+the two Qwen `-Base` downloads (5.2GB + 3.2GB), and the second take roughly doubles
+generation time. `--suite clone-quick --models '["chatterbox"]'` is the ~4 minute
+smoke test.
 
 ### The models that can clone
 
 Five, and **all of them ride images the compare demo already built**, which is the nice
 property of this half: the only new thing on disk is weights.
 
-| key | how it clones | needs a transcript? | image |
-|---|---|---|---|
-| `qwen3-1.7b-clone` | `generate_voice_clone()` | yes | existing `qwen` |
-| `qwen3-0.6b-clone` | same, a third the size | yes | existing `qwen` |
-| `chatterbox` | `generate(audio_prompt_path=…)` | **no** | existing `chatterbox` |
-| `dia-1.6b` | audio as decoder prefix, transcript prepended to the target | yes | existing `transformers` |
-| `csm-1b` | the reference becomes a prior conversation turn | yes | existing `transformers` |
+| key | how it clones | needs a transcript? | has a default voice? | image |
+|---|---|---|---|---|
+| `qwen3-1.7b-clone` | `generate_voice_clone()` | yes | no, `-Base` only clones | existing `qwen` |
+| `qwen3-0.6b-clone` | same, a third the size | yes | no, same reason | existing `qwen` |
+| `chatterbox` | `generate(audio_prompt_path=…)` | **no** | yes, but it is sticky (see above) | existing `chatterbox` |
+| `dia-1.6b` | audio as decoder prefix, transcript prepended to the target | yes | yes, a random speaker per call | existing `transformers` |
+| `csm-1b` | the reference becomes a prior conversation turn | yes | yes, speaker `[0]` with no context | existing `transformers` |
+
+The "default voice" column is the control take: same model, same line, no reference. Two
+of the five have nothing to put there, which is itself the answer to "what does this
+checkpoint do" — the Qwen `-Base` weights have no built-in speakers, that is what
+`-CustomVoice` is for.
 
 Cloning Qwen means a **different checkpoint**, not a different call: `-CustomVoice` (the
 compare run's) has no `generate_voice_clone`; only `-Base` does. Same `qwen-tts` package,
@@ -356,7 +423,9 @@ that every word is one specific person's voice.
   tasks, and the `compare` orchestrator.
 - `clone_pipeline.py` — the cloning tasks: four adapter `clone_*` tasks, `score_clones`,
   and the `clone` orchestrator. Reuses `fetch_weights`, so weights the compare run
-  already pulled are cache hits.
+  already pulled are cache hits. Every line is generated in two `mode`s, `"clone"` and
+  `"stock"`, and results/scores are keyed `(text, model_key, mode)` all the way to the
+  renderer.
 - `voice_core.py` — Flyte-free: the `SentenceChunker`, the Whisper `Transcriber`, the
   ollama streaming client, the `Speaker` (TTS engine cache), and the `converse` loop.
 - `voice_app.py` — the Gradio voice-chat app + its Flyte `AppEnvironment`. The pod is

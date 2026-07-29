@@ -275,10 +275,54 @@ def stream_llm(messages: list[dict], model: str = DEFAULT_LLM,
     is a voice assistant with four seconds of dead air, even though the text chat app
     next door exposes thinking as a slider.
     """
-    if LLM_BACKEND == "vllm":
-        yield from _stream_vllm(messages, model, temperature)
-    else:
-        yield from _stream_ollama(messages, model, temperature)
+    raw = (_stream_vllm(messages, model, temperature) if LLM_BACKEND == "vllm"
+           else _stream_ollama(messages, model, temperature))
+    yield from _strip_thinking(raw)
+
+
+# Reasoning models emit their scratchpad inside <think>...</think>. Asking for it to be
+# off is per-model and easy to get wrong (ollama takes think=False, Qwen wants
+# chat_template_kwargs), so this is the belt to that suspenders: whatever leaks through,
+# never reaches the TTS. Without it a voice assistant reads its own reasoning out loud.
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+
+
+def _strip_thinking(stream):
+    """Drop <think>…</think> spans from a token stream, tolerating split tags.
+
+    Tags routinely straddle chunk boundaries ("<th" + "ink>"), so a naive per-chunk
+    replace misses them. Text is held back only while it could still be the start of a
+    tag, which is at most a few characters, so this costs no meaningful latency.
+    """
+    buf, inside = "", False
+    for delta in stream:
+        buf += delta
+        while buf:
+            if inside:
+                end = buf.find(_THINK_CLOSE)
+                if end == -1:
+                    # Keep only enough to recognize a close tag split across chunks.
+                    buf = buf[-len(_THINK_CLOSE):]
+                    break
+                buf, inside = buf[end + len(_THINK_CLOSE):], False
+                continue
+            start = buf.find(_THINK_OPEN)
+            if start != -1:
+                if head := buf[:start]:
+                    yield head
+                buf, inside = buf[start + len(_THINK_OPEN):], True
+                continue
+            # No tag. Emit everything that cannot be a partial "<think>" prefix.
+            hold = 0
+            for n in range(1, min(len(_THINK_OPEN), len(buf) + 1)):
+                if buf.endswith(_THINK_OPEN[:n]):
+                    hold = n
+            if out := buf[: len(buf) - hold]:
+                yield out
+            buf = buf[len(buf) - hold:]
+            break
+    if not inside and buf:
+        yield buf
 
 
 def _stream_vllm(messages: list[dict], model: str, temperature: float):
@@ -293,6 +337,11 @@ def _stream_vllm(messages: list[dict], model: str, temperature: float):
     stream = client.chat.completions.create(
         model=model or VLLM_MODEL_ID, messages=messages, stream=True,
         temperature=float(temperature), max_tokens=512,
+        # Qwen3 (and several others) reason by DEFAULT. Measured on the deployed
+        # qwen3-4b: without this the model spent an entire 120-token budget inside
+        # <think> and never emitted a reply at all. For voice that is both dead air and,
+        # worse, something the TTS would read aloud.
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     for part in stream:
         if not part.choices:

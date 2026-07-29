@@ -34,3 +34,29 @@ If you deliberately want a shareable reference so the demo runs for other people
 public-domain clip with a clear license (LibriSpeech, or a Common Voice sample) and
 force-add it with a note about where it came from. Do not commit anyone's voice,
 including your own, without deciding you meant to.
+
+## `librispeech.wav`, the shipped stand-in
+
+So the pipeline runs for someone who just cloned the repo, and so a run does not need
+anyone's real voiceprint to be green.
+
+- **Source**: LibriSpeech `dev-clean`, speaker 1272, chapter 128104, utterances 0000 and
+  0001, concatenated with a 0.2s gap. Fetched from the `hf-internal-testing/
+  librispeech_asr_dummy` mirror of the corpus.
+- **License**: LibriSpeech is CC BY 4.0, derived from public-domain LibriVox recordings.
+- **Transcript**: `librispeech.txt` is the corpus's own transcript, which is why this
+  clip is a good stand-in specifically: the words are verified, not ASR-guessed, which is
+  the whole reason this directory pairs wavs with hand-written text.
+  Casing and punctuation were restored (the corpus stores transcripts uppercased and
+  unpunctuated); **not one word was changed**.
+- **10.9s, mono, peak 0.62** — inside the 8-15s window and nowhere near clipping.
+
+One caveat to read the numbers with: it is **16kHz**, because that is the rate
+LibriSpeech was recorded at. Every model here takes it (`RefVoice.at()` resamples to
+whatever each one wants) and the speaker scorer runs at 16kHz anyway, but upsampling
+invents no detail, so a clone off this clip has less high-frequency material to work with
+than one off a 24kHz recording of your own voice. Fine as a control, not the best case.
+
+It is committed with `git add -f`, against the `*.wav` rule above, deliberately: this one
+is a published corpus recording of someone who consented to exactly that, not a
+voiceprint anyone here has a claim to protect.

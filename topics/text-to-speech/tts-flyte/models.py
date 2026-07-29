@@ -153,6 +153,11 @@ SPECS: list[TTSModelSpec] = [
         download_gb=5.2,
         sample_rate=24000,
         language="English",
+        # Set only so the clone run's "same model, no reference" control take is a
+        # well-formed call rather than an empty speaker id. -Base very likely has no
+        # named speakers at all (that is what -CustomVoice is for), in which case the
+        # control fails cleanly and the report says "no default voice" for this model.
+        voice="Vivian",
         clone_capable=True,
         ref_seconds="3s minimum, 8-15s better",
         native="Zero-shot clone across 10 languages; ref_audio + ref_text. Clones from 3s.",
@@ -171,6 +176,7 @@ SPECS: list[TTSModelSpec] = [
         download_gb=3.2,
         sample_rate=24000,
         language="English",
+        voice="Serena",         # see the 1.7B-Base note above
         clone_capable=True,
         ref_seconds="3s minimum, 8-15s better",
         native="Lightweight zero-shot clone, same API as the 1.7B Base.",
