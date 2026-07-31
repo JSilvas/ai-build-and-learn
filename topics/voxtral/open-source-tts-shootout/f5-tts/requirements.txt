@@ -1,0 +1,2 @@
+f5-tts
+soundfile>=0.12

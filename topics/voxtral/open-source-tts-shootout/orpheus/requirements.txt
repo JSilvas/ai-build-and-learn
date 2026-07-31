@@ -1,0 +1,6 @@
+# Unverified — see README's "Apple Silicon caveat" before trusting this list.
+# Build with Metal support, e.g.:
+#   CMAKE_ARGS="-DGGML_METAL=on" uv pip install llama-cpp-python
+llama-cpp-python
+snac
+soundfile>=0.12

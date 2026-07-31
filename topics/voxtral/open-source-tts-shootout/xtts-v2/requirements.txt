@@ -1,0 +1,4 @@
+# Community-maintained fork of Coqui's TTS toolkit (same `TTS.api.TTS` import).
+# If unavailable, `pip install TTS` (original, unmaintained) also works for XTTS v2.
+coqui-tts
+torch

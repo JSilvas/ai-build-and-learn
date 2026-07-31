@@ -16,3 +16,8 @@ topics/autoresearch/upstream/
 # Gemma 4 Smart Gallery — ignore user photos and generated DB
 topics/gemma4/gemma4-smart-gallary/images/
 topics/gemma4/gemma4-smart-gallary/gemma_photos.db
+
+# Realtime voice / TTS shootout — local run logs and personal reference clips
+topics/voxtral/realtime-voice-showdown/results.jsonl
+topics/voxtral/open-source-tts-shootout/results.jsonl
+topics/voxtral/open-source-tts-shootout/common/reference_voice.wav

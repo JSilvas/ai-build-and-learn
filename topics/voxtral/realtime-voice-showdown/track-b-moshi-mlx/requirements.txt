@@ -1,0 +1,5 @@
+# MLX is Apple-Silicon-only; this will not install on Linux/CUDA boxes.
+mlx>=0.18
+moshi_mlx
+sentencepiece
+huggingface_hub
