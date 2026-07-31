@@ -1,0 +1,10 @@
+# MLX is Apple-Silicon-only; this will not install on Linux/CUDA boxes.
+mlx>=0.18
+mlx-whisper
+mlx-lm
+sounddevice>=0.4.6
+numpy>=1.26
+soundfile>=0.12
+# csm-mlx is often ahead of its last PyPI release — if this fails, install with:
+#   uv pip install "git+https://github.com/senstella/csm-mlx"
+csm-mlx
