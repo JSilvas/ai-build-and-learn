@@ -16,8 +16,15 @@ Development progression:
      (the fast loop: the UI runs on the devbox host and imports `compare_pipeline`
       directly, so no deploy is needed. Runs still execute in the cluster.)
   2. Deploy the pipeline, then the app:
-       flyte deploy compare_pipeline.py   # register the tasks + build the 7 images
-       python app.py                      # deploy the studio itself
+       flyte deploy compare_pipeline.py orch_env   # see the note below
+       python app.py                               # deploy the studio itself
+
+`orch_env` is the argument to pass, and it is enough: `flyte deploy` wants ONE
+environment and `orch_env` declares `depends_on=[cpu_env, *GPU_ENVS.values()]`, so
+deploying it registers the fetch task and all seven adapter tasks too. The GPU envs
+are dict values rather than module-level names, so the CLI cannot name them directly
+anyway. The app needs this because `remote.Task.get` below resolves a REGISTERED
+task: without the deploy the studio comes up fine and then fails at launch time.
 
 ── One thing to know before you press the button ────────────────────────────────
 The grid is scripts x VOICE COLUMNS, not scripts x models. With `Voices = all`,

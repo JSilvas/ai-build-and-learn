@@ -136,9 +136,21 @@ report.
 RUN_MODE=local .venv/bin/python app.py        # http://localhost:7864
 
 # deploy it as a Flyte app instead (register the pipeline first)
-.venv/bin/flyte deploy compare_pipeline.py
+.venv/bin/flyte deploy compare_pipeline.py orch_env
 .venv/bin/python app.py
+# -> http://tts-studio-text-to-speech-development.localhost:30081
 ```
+
+`flyte deploy` takes exactly one environment, and `orch_env` is the one to name:
+`depends_on=[cpu_env, *GPU_ENVS.values()]` means deploying it registers `fetch_weights`
+and all seven `generate_*` tasks alongside the orchestrator. The deployed app **needs**
+that, because it launches through `remote.Task.get("tts-orch.compare")`, which resolves
+a registered task; skip the deploy and the studio still comes up and then errors the
+moment you press the button. The host-mode UI above is immune, since it imports
+`compare_pipeline` directly.
+
+If a redeploy reports `failed!`, `flyte delete app tts-studio` and deploy again: a stale
+revision that never became ready will block the new one (there is no `flyte stop app`).
 
 Like the image and video studios, this one is a thin **launcher**: 1 CPU, 1Gi, no torch
 and no TTS package in its image, so it cannot pin a model or hold the GPU that its own
