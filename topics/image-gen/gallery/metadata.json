@@ -1,0 +1,46 @@
+[
+  {
+    "id": "25d72e3a962a",
+    "type": "image",
+    "filename": "25d72e3a962a.png",
+    "prompt": "An artfully hand-drawn portrait of a red panda puffing smoke rings from a tobacco pipe, Natural History Illustration, Botanical-styled Illustration. Negative prompt: (canvas frame, watermark, signature, username, artist name:1.1)",
+    "model": "stabilityai/sd-turbo",
+    "params": {
+      "num_inference_steps": 2,
+      "guidance_scale": 0.0,
+      "device": "mps",
+      "dtype": "torch.float16"
+    },
+    "created_at": "2026-07-17T19:12:29.615222+00:00"
+  },
+  {
+    "id": "3387e7ee76e0",
+    "type": "video",
+    "filename": "3387e7ee76e0.mp4",
+    "prompt": "portrait of a blacksmith hammering a hot metal with their bare hands, cinematic lighting, 8k, ultra realistic, hyper detailed, photorealistic, trending on artstation",
+    "model": "damo-vilab/text-to-video-ms-1.7b",
+    "params": {
+      "num_inference_steps": 25,
+      "num_frames": 40,
+      "fps": 10,
+      "device": "mps",
+      "dtype": "torch.float16"
+    },
+    "created_at": "2026-07-17T19:12:29.616346+00:00"
+  },
+  {
+    "id": "5116a7f47890",
+    "type": "video",
+    "filename": "5116a7f47890.mp4",
+    "prompt": "panning shot of a blacksmith hammering a molten metal robot , cinematic lighting, 8k, ultra realistic, hyper detailed, photorealistic, trending on artstation",
+    "model": "damo-vilab/text-to-video-ms-1.7b",
+    "params": {
+      "num_inference_steps": 25,
+      "num_frames": 40,
+      "fps": 10,
+      "device": "mps",
+      "dtype": "torch.float16"
+    },
+    "created_at": "2026-07-17T19:16:51.775062+00:00"
+  }
+]
