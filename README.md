@@ -2,9 +2,9 @@
 
 Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new topic and learn by building together.
 
-> **Up next: Open-Source Image Generation: Diffusion Models & LoRA** (2026-07-10)
-> Explore the best open-source image models, both diffusion and transformer-based, and try fine-tuning with LoRA.
-> [RSVP](https://luma.com/amopzrup) | [Join the Slack](https://slack.flyte.org/)
+> **Up next: Open-Source Text-to-Speech: Natural Voices & Voice Cloning** (2026-07-31)
+> Turn text into speech with open-source TTS: natural voices, voice cloning, and multilingual output.
+> [RSVP](https://luma.com/oxhti59k) | [Join the Slack](https://slack.flyte.org/)
 
 ## Upcoming:
 
@@ -16,26 +16,6 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 </tr>
 </thead>
 <tbody>
-<tr><td>
-      <div style="padding: 8px 0;">
-        <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Open-Source Image Generation: Diffusion Models &amp; LoRA</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-07-10</div>
-        <div style="font-size: 13px; color: #666;">
-          <a href="topics/image-generation">code</a> • <a href="https://luma.com/amopzrup">register</a>
-        </div>
-      </div>
-    </td><td><div style="padding: 8px 0; line-height: 1.5;">Explore the best open-source image models, both diffusion and transformer-based, and try fine-tuning with LoRA.
-</div></td></tr>
-<tr><td>
-      <div style="padding: 8px 0;">
-        <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Open-Source Video Generation: Diffusion &amp; Transformer Models</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-07-17</div>
-        <div style="font-size: 13px; color: #666;">
-          <a href="topics/video-generation">code</a> • <a href="https://luma.com/ieq093mk">register</a>
-        </div>
-      </div>
-    </td><td><div style="padding: 8px 0; line-height: 1.5;">Open-source text-to-video and image-to-video with diffusion and transformer/DiT models.
-</div></td></tr>
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Open-Source Text-to-Speech: Natural Voices &amp; Voice Cloning</strong></div>
@@ -119,6 +99,26 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 </tr>
 </thead>
 <tbody>
+<tr><td>
+      <div style="padding: 8px 0;">
+        <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Open-Source Video Generation: Diffusion &amp; Transformer Models</strong></div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-07-17</div>
+        <div style="font-size: 13px; color: #666;">
+          <a href="topics/video-generation">code</a>
+        </div>
+      </div>
+    </td><td><div style="padding: 8px 0; line-height: 1.5;">Open-source text-to-video and image-to-video with diffusion and transformer/DiT models.
+</div></td></tr>
+<tr><td>
+      <div style="padding: 8px 0;">
+        <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Open-Source Image Generation: Diffusion Models &amp; LoRA</strong></div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-07-10</div>
+        <div style="font-size: 13px; color: #666;">
+          <a href="topics/image-generation">code</a>
+        </div>
+      </div>
+    </td><td><div style="padding: 8px 0; line-height: 1.5;">Explore the best open-source image models, both diffusion and transformer-based, and try fine-tuning with LoRA.
+</div></td></tr>
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>MLflow: ML Tracking, LLM Tracing &amp; LLM-as-a-Judge</strong></div>
