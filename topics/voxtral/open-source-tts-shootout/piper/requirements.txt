@@ -1,0 +1,2 @@
+piper-tts
+soundfile>=0.12
