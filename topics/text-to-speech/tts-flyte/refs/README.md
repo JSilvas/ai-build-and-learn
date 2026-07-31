@@ -57,6 +57,9 @@ whatever each one wants) and the speaker scorer runs at 16kHz anyway, but upsamp
 invents no detail, so a clone off this clip has less high-frequency material to work with
 than one off a 24kHz recording of your own voice. Fine as a control, not the best case.
 
-It is committed with `git add -f`, against the `*.wav` rule above, deliberately: this one
-is a published corpus recording of someone who consented to exactly that, not a
-voiceprint anyone here has a claim to protect.
+The `*.wav` rule above still hides it, so committing it takes a deliberate
+`git add -f refs/librispeech.wav`. Do that: this one is a published corpus recording of
+someone who consented to exactly that, not a voiceprint anyone here has a claim to
+protect, and force-adding it is what makes the demo runnable for someone who just cloned
+the repo. To rebuild it instead of committing it, the recipe is the source note above:
+rows 0 and 1 of `hf-internal-testing/librispeech_asr_dummy`, concatenated with a 0.2s gap.

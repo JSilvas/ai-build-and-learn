@@ -125,6 +125,31 @@ pip install qwen-tts && python run_local.py --model qwen3-1.7b --text "Hello the
 pip install kokoro   && python run_local.py --model kokoro-82m --text "Hello there."
 ```
 
+### The studio app (`app.py`)
+
+The same comparison without the CLI: paste however many lines you want (one script per
+line), tick the models, pick the voice expansion, and it launches the run and links the
+report.
+
+```bash
+# fast loop: the UI runs on the devbox host, runs still execute in the cluster
+RUN_MODE=local .venv/bin/python app.py        # http://localhost:7864
+
+# deploy it as a Flyte app instead (register the pipeline first)
+.venv/bin/flyte deploy compare_pipeline.py
+.venv/bin/python app.py
+```
+
+Like the image and video studios, this one is a thin **launcher**: 1 CPU, 1Gi, no torch
+and no TTS package in its image, so it cannot pin a model or hold the GPU that its own
+runs need. That is exactly the opposite of `voice_app.py` below, which holds the GPU on
+purpose, and the reason both cannot be up at once on a one-GPU box.
+
+The box under the Voices radio does the arithmetic before you commit to it: with
+`Voices = all` the default 7 models expand to **11 voice columns**, and 5 scripts × 11
+columns is 55 clips on one GPU, one column at a time. `default` (one column per model)
+is the setting to demo with; `all` is the one to leave running while you go get coffee.
+
 ## Voice cloning (`clone_pipeline.py`)
 
 Hand it **one recording of one person** and it says five new scripts in that voice
@@ -201,27 +226,40 @@ in the cell and on the chart, and their clones still rank normally.
 ### What the first full run actually showed
 
 Five models x the five-script clone suite, against `refs/librispeech.wav` (ceiling
-**0.975**, same-speaker threshold 0.86). Ranges are across the five scripts.
+**0.975**, same-speaker threshold 0.86). Means across the five scripts, ranked by what
+the reference actually bought:
 
-| model | cloned SIM | its own voice | reads as |
-|---|---|---|---|
-| `qwen3-1.7b-clone` | 0.967-0.979 | — | at the ceiling, 0% WER on every line |
-| `qwen3-0.6b-clone` | 0.950-0.974 | — | a hair below the 1.7B, and it pays in words: one line came back at 150% WER |
-| `csm-1b` | 0.962-0.987 | 0.750-0.829 | strong, but its stock voice already sits high |
-| `chatterbox` | 0.904-0.945 | 0.577-0.650 | the cleanest separation of the five |
-| `dia-1.6b` | 0.466-0.966 | 0.504-0.917 | unstable in both directions, see below |
+| model | cloned SIM | its own voice | lift | mean WER |
+|---|---|---|---|---|
+| `csm-1b` | 0.972 | 0.718 | +0.254 | 4.5% |
+| `chatterbox` | 0.938 | 0.642 | +0.296 | 11.2% |
+| `dia-1.6b` | 0.727 | 0.569 | +0.158 | 24.3% |
+| `qwen3-1.7b-clone` | 0.968 | — | — | **0.0%** |
+| `qwen3-0.6b-clone` | 0.970 | — | — | 5.0% |
 
-Two things the pairing makes visible that a similarity column alone would not:
+**Qwen3-TTS 1.7B-Base is the one to beat.** Its similarity is a three-way tie with CSM and
+the 0.6B — 0.968 / 0.972 / 0.970 against a 0.975 ceiling is not a real ordering — and it
+breaks the tie on the other axis by transcribing perfectly on all five scripts. That is
+the whole argument for reporting both numbers.
 
-- **Dia is a coin flip.** Its clone ranged 0.466 to 0.966 across five lines, and its
-  "default voice" is a *random* speaker per call, which on one line landed at 0.917
-  against a reference it had never heard. A run without the control would have read that
-  0.917-adjacent behaviour as a good clone. Dia is a dialogue model being asked to do a
-  job it was not built for, and the spread says so.
-- **A high floor is not a good sign.** CSM scores 0.75-0.83 in its own voice, so its
-  0.96+ clone is a smaller jump than Chatterbox's 0.94 off a 0.6 floor. Ranking by the
-  cloned bar alone puts CSM above Chatterbox; ranking by what the reference *bought*
-  reverses them.
+Three things the pairing makes visible that a similarity column alone would not:
+
+- **A high floor is not a good sign.** CSM tops the cloned column, but its stock voice
+  averages 0.718 and reached **0.917** on one script, meaning it started most of the way
+  to the reference before hearing it. Chatterbox scores lower cloned (0.938) off a much
+  lower floor (0.642), so it gains more. Ranking by the cloned bar puts CSM first;
+  ranking by lift puts Chatterbox first.
+- **Dia is not really cloning.** 0.727 mean, ranging 0.576 to 0.910 across five scripts,
+  off a floor of 0.569 — the smallest lift of the three, with the worst WER. Its "default
+  voice" is a *random* speaker per call, and in one run it landed at 0.917 against a
+  reference it had never heard. Without the control that would have read as a good clone.
+  Dia is a dialogue model being asked to do a job it was not built for.
+- **Five scripts cannot resolve neighbours.** Across three identical full runs the top
+  three kept swapping, and the WER blowups moved with them: the 1.7B was flawless, then
+  lost a line at 119%, then flawless again; the 0.6B went 150%, 6%, 25%. Dia's own voice
+  produced a **1480% WER** runaway on one line, generating far more speech than asked.
+  Believe the gaps (everything above Dia, every clone above its own floor), not the order
+  within a tenth.
 
 Rough cost on the GB10: the full five-model run takes ~35 minutes wall clock including
 the two Qwen `-Base` downloads (5.2GB + 3.2GB), and the second take roughly doubles
@@ -426,6 +464,8 @@ that every word is one specific person's voice.
   already pulled are cache hits. Every line is generated in two `mode`s, `"clone"` and
   `"stock"`, and results/scores are keyed `(text, model_key, mode)` all the way to the
   renderer.
+- `app.py` — the compare studio: a Gradio launcher (checkbox model picker, one script
+  per line) that submits `compare` runs and links the report. Holds no GPU, loads no model.
 - `voice_core.py` — Flyte-free: the `SentenceChunker`, the Whisper `Transcriber`, the
   ollama streaming client, the `Speaker` (TTS engine cache), and the `converse` loop.
 - `voice_app.py` — the Gradio voice-chat app + its Flyte `AppEnvironment`. The pod is

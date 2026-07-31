@@ -180,11 +180,14 @@ fetch_image = _base("tts-fetch")
 # The studio app is a thin LAUNCHER: it submits runs and links the report, so it needs
 # no torch and no TTS package, just flyte + gradio + the registry for the model picker.
 # connectrpc pinned to 0.10.x: 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
+# kubernetes because the app imports THIS module for the app name/port/image, and the
+# pod templates above need kubernetes.client at import time.
 studio_app_image = (
     flyte.Image.from_debian_base(
         name="tts-studio-image", registry=REGISTRY, platform=PLATFORM
     )
-    .with_pip_packages("flyte==2.2.1", "connectrpc==0.10.*", "gradio==5.42.0", "python-dotenv")
+    .with_pip_packages("flyte==2.2.1", "connectrpc==0.10.*", "gradio==5.42.0",
+                       "python-dotenv", "kubernetes")
 )
 
 

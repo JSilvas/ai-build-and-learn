@@ -901,30 +901,54 @@ def scoreboard_png(rows: list[tuple[str, float, float, float, float]],
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
+# Every badge carries its own definition as a tooltip. A reader meeting "🔏 watermarked"
+# for the first time should not have to leave the report to find out whether that is good
+# news, and the answer is not obvious: it means this clip can be identified as synthetic
+# later, which is a feature of the model, not a defect in the clip.
+_SIM_TIP = ("Speaker similarity: cosine between WavLM x-vector speaker embeddings, this "
+            "clip against the reference. Read it against the pale default-voice bar and "
+            "the dashed ceiling on the scoreboard, not as a percentage.")
+_WER_TIP = ("Word error rate: Whisper transcribed this clip, and this is the share of "
+            "words that differ from the script it was asked to say. The 'heard' line "
+            "below is the receipt.")
+_MARK_TIP = ("Perth watermark DETECTED: this clip carries an inaudible signal marking it "
+             "as machine-generated, so it stays identifiable as synthetic afterwards. "
+             "Chatterbox is the only model here that embeds one.")
+_NOMARK_TIP = ("No watermark found: nothing in this audio distinguishes it from a real "
+               "recording. Checked with the same detector, which only exists in "
+               "Chatterbox's image, so a clip that could not be checked says so instead.")
+
+
 def _score_badges(sc: CloneScore | None) -> str:
     if sc is None:
         return ""
     if sc.error:
         return f'<span class="tts-warn">scoring failed</span>'
-    sim = f'<span class="tts-sim">similarity {sc.similarity:.2f}</span>'
-    wer = f'<span class="tts-wer">WER {sc.wer * 100:.0f}%</span>'
+    sim = (f'<span class="tts-sim" title="{_SIM_TIP}">'
+           f'similarity {sc.similarity:.2f}</span>')
+    wer = f'<span class="tts-wer" title="{_WER_TIP}">WER {sc.wer * 100:.0f}%</span>'
     mark = ""
     if sc.watermarked is True:
-        mark = '<span class="tts-mark">🔏 watermarked</span>'
+        mark = f'<span class="tts-mark" title="{_MARK_TIP}">🔏 watermarked</span>'
     elif sc.watermarked is False:
-        mark = '<span class="tts-nomark">no watermark</span>'
+        mark = f'<span class="tts-nomark" title="{_NOMARK_TIP}">no watermark</span>'
     return sim + wer + mark
 
 
 def _clone_pane(spec, r: AudioResult | None, sc: CloneScore | None,
-                label: str, *, muted: bool = False) -> str:
+                label: str, *, muted: bool = False, note: str = "") -> str:
     """One condition of one model: player, waveform, scores, and what Whisper heard.
 
     `muted` styles the default-voice pane as the control it is, so the eye lands on the
-    cloned pane first without the two being visually incomparable.
+    cloned pane first without the two being visually incomparable. `note` replaces the
+    pane with a plain sentence: a checkpoint that CANNOT do this condition is a fact
+    about the checkpoint, not an error, and must not be dressed up as one.
     """
     cls = "tts-pane tts-pane-muted" if muted else "tts-pane"
     head = f'<div class="tts-panehead">{html.escape(label)}</div>'
+    if note:
+        return (f'<div class="{cls}">{head}'
+                f'<div class="tts-none">{html.escape(note)}</div></div>')
     if r is None:
         return (f'<div class="{cls}">{head}'
                 f'<div class="tts-none">not generated</div></div>')
@@ -950,7 +974,8 @@ def _clone_pane(spec, r: AudioResult | None, sc: CloneScore | None,
 
 def _clone_cell(spec, clone_r: AudioResult, clone_sc: CloneScore | None,
                 stock_r: AudioResult | None = None,
-                stock_sc: CloneScore | None = None) -> str:
+                stock_sc: CloneScore | None = None,
+                stock_note: str = "") -> str:
     """One model on one script: the cloned take above the model's own default voice.
 
     The pair is the point. A cloned clip on its own is unfalsifiable: it sounds like a
@@ -960,9 +985,9 @@ def _clone_cell(spec, clone_r: AudioResult, clone_sc: CloneScore | None,
     reference change anything", which the ear and the two numbers can both answer.
     """
     panes = _clone_pane(spec, clone_r, clone_sc, "cloned")
-    if stock_r is not None or stock_sc is not None:
+    if stock_note or stock_r is not None or stock_sc is not None:
         panes += _clone_pane(spec, stock_r, stock_sc, "the model's default voice",
-                             muted=True)
+                             muted=True, note=stock_note)
     return (
         f'<div class="tts-cell">'
         f'<div class="tts-cellhead"><span class="tts-model">{html.escape(spec.key)}</span>'
@@ -976,6 +1001,7 @@ def render_clone_grid(
     ref_result: AudioResult | None = None,
     ref_transcript: str = "",
     ref_warnings: list[str] | None = None,
+    stock_notes: dict[str, str] | None = None,
     ceiling: float = 0.0,
     title: str = "Voice cloning, side by side",
     meta: str = "",
@@ -1034,8 +1060,24 @@ def render_clone_grid(
              f'transcribing each clip against the text it was asked to say. A model '
              f'needs both.</div></div>') if chart else ""
 
-    # 3. The grid, one block per script, one cell per model, two takes per cell.
-    blocks = []
+    # 3. The grid, one block per script, one cell per model, two takes per cell, with a
+    #    legend first. Badges are terse by necessity (they sit four-to-a-cell), so the
+    #    words they abbreviate go somewhere the reader can see without hovering.
+    legend = (
+        '<div class="tts-legend">'
+        f'<span class="tts-sim" title="{_SIM_TIP}">similarity</span> '
+        'how close this clip sits to the reference speaker &nbsp;·&nbsp; '
+        f'<span class="tts-wer" title="{_WER_TIP}">WER</span> '
+        'share of words Whisper heard wrong &nbsp;·&nbsp; '
+        f'<span class="tts-mark" title="{_MARK_TIP}">🔏 watermarked</span> '
+        'the clip carries an inaudible Perth signal marking it as synthetic, so it stays '
+        'identifiable later &nbsp;·&nbsp; '
+        f'<span class="tts-nomark" title="{_NOMARK_TIP}">no watermark</span> '
+        'nothing in the audio distinguishes it from a real recording. Clips whose image '
+        'has no detector show neither badge rather than claiming they are clean.'
+        '</div>'
+    )
+    blocks = [legend]
     for text in texts:
         cells = "".join(
             _clone_cell(
@@ -1045,6 +1087,7 @@ def render_clone_grid(
                 scores.get((text, s.key, "clone")),
                 by_pair.get((text, s.key, "stock")),
                 scores.get((text, s.key, "stock")),
+                (stock_notes or {}).get(s.key, ""),
             )
             for s in specs
         )
@@ -1080,6 +1123,10 @@ CLONE_CSS = """
                   text-transform: uppercase; color: #6b7280; padding: 8px 11px 0; }
   .tts-pane-muted .tts-panehead { color: #9ca3af; }
   .tts-none { padding: 8px 11px; font-size: 12px; color: #9ca3af; font-style: italic; }
+  .tts-legend { font-size: 12px; color: #6b7280; line-height: 1.9; margin: 0 0 14px;
+                padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 10px;
+                background: #fafafa; }
+  .tts-legend span { cursor: help; }
   .tts-sim { display: inline-block; font-size: 11px; color: #1e3a8a; background: #dbeafe;
              border-radius: 999px; padding: 1px 8px; margin: 4px 4px 0 0; font-weight: 600; }
   .tts-wer { display: inline-block; font-size: 11px; color: #3f3f46; background: #f4f4f5;

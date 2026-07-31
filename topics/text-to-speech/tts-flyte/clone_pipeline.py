@@ -86,6 +86,10 @@ class CloneRun:
     model_key: str
     items: list[CloneItem] = field(default_factory=list)
     clips: flyte.io.Dir | None = None
+    # Why this model contributed no default-voice takes, in a sentence a reader wants.
+    # Set when the checkpoint says outright that it cannot synthesize without a
+    # reference; the report then shows a note instead of a ⚠️ five times over.
+    stock_note: str = ""
 
 
 @dataclass
@@ -109,6 +113,25 @@ class ScoreReport:
 
 
 # ── Loading the reference inside a task ──────────────────────────────────────────
+
+# A checkpoint that only clones is not a failure, it is a fact about the checkpoint, and
+# it should read like one. The Qwen -Base weights say so themselves and say it precisely:
+#   ValueError: model with tokenizer_type: qwen3_tts_tokenizer_12hz tts_model_size: 1b7
+#   tts_model_type: base does not support generate_custom_voice, ...
+# Rendering that verbatim in five cells makes a working run look broken, which is exactly
+# the opposite of what the control take is for.
+_NO_DEFAULT_VOICE = ("does not support generate_custom_voice",)
+
+
+def _no_default_voice(exc: Exception) -> str:
+    """A reader-facing reason, or "" if this was a real failure worth showing raw."""
+    msg = str(exc)
+    if any(sig in msg for sig in _NO_DEFAULT_VOICE):
+        return ("This checkpoint has no default voice: it exists only to clone, so "
+                "there is nothing to compare against. (Qwen ships built-in speakers "
+                "in -CustomVoice, which in turn cannot clone.)")
+    return ""
+
 
 async def _load_ref(ref_audio: flyte.io.File, ref_text: str) -> tts_core.RefVoice:
     local = await ref_audio.download()
@@ -157,6 +180,7 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
     # task runs. Only this task's live view uses these; the parent report keys by mode.
     stock_spec = replace(spec, key=f"{spec.key} · own voice")
     live_specs = [spec, stock_spec]
+    stock_note = ""      # set once if the checkpoint tells us it cannot do a stock take
 
     handle = None
     try:
@@ -168,6 +192,8 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
             # ("clone", the reference voice) then ("stock", the model's own). Same
             # handle, same line, so the only variable between them is the reference.
             for mode in ("clone", "stock"):
+                if mode == "stock" and stock_note:
+                    continue     # already established this checkpoint has no own voice
                 use = spec if mode == "clone" else stock_spec
                 try:
                     tts_core.reset_peak_memory()
@@ -196,7 +222,12 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
                 except Exception as e:
                     # One bad line must not kill the model's other lines, and a model
                     # with no default voice must not lose its clones. A -Base checkpoint
-                    # failing every "stock" take is the expected path, not a broken run.
+                    # having no stock take is the expected path, not a broken run: record
+                    # it once as a note and stop retrying it on every remaining line.
+                    if mode == "stock" and (why := _no_default_voice(e)):
+                        stock_note = why
+                        log.info(f"[{model_key}] no default voice; control take skipped")
+                        continue
                     log.warning(f"[{model_key}] line {i} ({mode}) failed: {e!r}")
                     results.append(tts_core.AudioResult(use.key, text, error=repr(e)))
                     items.append(CloneItem(text=text, mode=mode, error=repr(e)))
@@ -215,7 +246,8 @@ async def _run_clone(model_key: str, weights: flyte.io.Dir, texts: list[str],
         tts_core.free_gpu_memory()
 
     clips = await flyte.io.Dir.from_local(str(out_dir))
-    return CloneRun(model_key=model_key, items=items, clips=clips)
+    return CloneRun(model_key=model_key, items=items, clips=clips,
+                    stock_note=stock_note)
 
 
 # ── One task per adapter (one image/env each). Body is shared via _run_clone ──────
@@ -457,6 +489,7 @@ async def clone(
     await flyte.report.replace.aio(tts_core.render_clone_grid(
         texts, specs, all_results, scores,
         ref_result=ref_result, ref_transcript=ref_text, ref_warnings=ref_warnings,
+        stock_notes={r.model_key: r.stock_note for r in runs if r.stock_note},
         ceiling=report.ceiling,
         title=f"Voice cloning: one reference, {len(specs)} models, "
               f"each against its own voice", meta=meta))
