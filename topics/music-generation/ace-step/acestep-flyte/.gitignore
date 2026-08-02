@@ -3,3 +3,9 @@
 out/
 *.wav
 *.ogg
+
+# Local venvs. This directory IS the Flyte source root, so anything here is swept into
+# a run's code bundle; keep it to source.
+.venv/
+.venv-local/
+__pycache__/
