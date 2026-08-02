@@ -1,0 +1,512 @@
+"""The engine room: load ACE-Step, render a track, embed it in a Flyte report.
+
+Deliberately Flyte-free, so the exact same code runs inside the GPU task and inside
+run_local.py. If a track plays in the standalone HTML run_local writes, it plays in
+the Flyte report, because it is the identical renderer.
+
+Three things carry over from the TTS and video demos and matter here too:
+
+  1. Flyte reports render under a CSP that drops external assets and <script> tags.
+     Audio still plays, because HTML5 <audio> needs no JS: a base64 clip in a data URI
+     on an <audio controls> element is enough. That's `audio_data_uri`.
+  2. The report needs a *visual* comparison surface, not just players. For music that
+     is a waveform + full-bandwidth spectrogram: you can see the arrangement (a drop
+     is a visible step in the envelope), see clipping, and see the lowpass brickwall
+     that gives away a model rendering through a lossy bottleneck. That's
+     `waveform_spectrogram_png`.
+  3. Every listening claim in the report needs the numbers next to it, so each card
+     carries wall-clock, audio length, the realized settings, and peak GPU.
+
+── Stereo is not an implementation detail here ──────────────────────────────────
+The TTS core collapsed everything to mono, which was right: a single voice has no
+stereo image to lose. ACE-Step's Oobleck VAE decodes 48kHz *stereo*, and stereo width
+is one of the things you are grading (a narrow, mono-ish mix is a real and audible
+failure). So audio stays stereo end to end: stereo through the wav, stereo through
+the embedded OGG. Only the spectrogram sums to mono, because a two-channel
+spectrogram is unreadable at report size.
+"""
+
+from __future__ import annotations
+
+import base64
+import gc
+import html
+import io
+import os
+import time
+from dataclasses import dataclass, field
+
+import matplotlib
+matplotlib.use("Agg")               # headless: no display, render straight to PNG bytes
+import matplotlib.pyplot as plt
+import numpy as np
+import soundfile as sf
+
+# Past this the <audio> data URI is dropped and only the spectrogram is shown. A 60s
+# stereo 48kHz Vorbis clip is ~1MB, so this is headroom for a full-length track, not a
+# real constraint on the default runs.
+MAX_EMBED_BYTES = 8_000_000
+
+# The GB10's "GPU memory" is the same unified pool the OS is using. Letting an
+# allocation run the pool to the wall does not OOM, it HANGS the whole box, so we cap
+# the process before any large load. 0.90 leaves the host something to live on.
+GPU_MEMORY_FRACTION = 0.90
+
+
+# ── GPU helpers (import-safe on a CPU-only host) ─────────────────────────────────
+
+def free_gpu_memory() -> None:
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def reset_peak_memory() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def peak_memory_gb() -> float:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.max_memory_allocated() / 1e9
+    except Exception:
+        pass
+    return 0.0
+
+
+def prepare_gpu() -> None:
+    """Clean the pool, cap the process, reset the peak counter.
+
+    The cap is the important line. ACE-Step XL is ~11GB in bf16 and nowhere near the
+    unified pool's limit, but `from_pretrained(...).to("cuda")` briefly holds two
+    copies, and the VAE decode of a long track allocates one very large contiguous
+    activation on top. Both are survivable; running the pool dry on a GB10 is not.
+    """
+    free_gpu_memory()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
+    except Exception:
+        pass
+    reset_peak_memory()
+
+
+# ── Generation settings ──────────────────────────────────────────────────────────
+
+@dataclass
+class GenSettings:
+    """One render's knobs. Zero / empty means 'inherit the checkpoint's default'.
+
+    Sentinels rather than Optionals so a whole settings object survives a round trip
+    through the Flyte CLI as plain JSON, and so `--steps 0` reads as "whatever this
+    checkpoint wants" instead of an error. `resolve` folds a MusicModelSpec in and
+    returns the concrete values actually handed to the pipeline; the report shows
+    those, never the sentinels.
+    """
+    seed: int = 42
+    steps: int = 0             # 0 -> spec.steps
+    guidance: float = -1.0     # <0 -> spec.guidance
+    shift: float = -1.0        # <0 -> spec.shift
+    duration: float = 30.0
+    bpm: int = 0               # 0 -> let the model estimate
+    keyscale: str = ""         # "" -> let the model estimate
+    timesignature: str = ""    # "" -> let the model estimate
+    language: str = "en"
+
+    def resolve(self, spec) -> "GenSettings":
+        """Concrete settings for `spec`, with the checkpoint's defaults filled in."""
+        out = GenSettings(**vars(self))
+        if out.steps <= 0:
+            out.steps = spec.steps
+        if out.guidance < 0:
+            out.guidance = spec.guidance
+        if out.shift < 0:
+            out.shift = spec.shift
+        # A distilled checkpoint ignores CFG (the pipeline warns and coerces to 1.0).
+        # Do the coercion here too, so the report card states what the model actually
+        # ran instead of the number that was requested and silently discarded.
+        if spec.distilled and out.guidance > 1.0:
+            out.guidance = 1.0
+        return out
+
+    def summary(self) -> str:
+        """The one-line settings string under a report card."""
+        bits = [f"seed {self.seed}", f"{self.steps} steps",
+                f"cfg {self.guidance:g}", f"shift {self.shift:g}",
+                f"{self.duration:g}s"]
+        if self.bpm:
+            bits.append(f"{self.bpm} bpm")
+        if self.keyscale:
+            bits.append(self.keyscale)
+        if self.timesignature:
+            bits.append(f"{self.timesignature}/4")
+        return " · ".join(bits)
+
+
+# ── Load + generate ──────────────────────────────────────────────────────────────
+
+def load_pipeline(spec, local_dir: str | None = None):
+    """Load one ACE-Step checkpoint onto the GPU.
+
+    `local_dir` points HF_HUB_CACHE at a pre-fetched snapshot (the fetch task's Dir),
+    so this is a disk read, not a download. A cache miss just re-downloads;
+    correctness holds either way.
+    """
+    import torch
+    from diffusers import AceStepPipeline
+
+    if local_dir:
+        os.environ["HF_HUB_CACHE"] = str(local_dir)
+        os.environ["HF_HOME"] = str(local_dir)
+
+    dtype = getattr(torch, spec.dtype)
+    pipe = AceStepPipeline.from_pretrained(spec.repo, torch_dtype=dtype)
+    pipe = pipe.to("cuda")
+
+    # Long-form decode: the VAE otherwise materializes the whole waveform at once, and
+    # a 4-minute stereo 48kHz track is a ~46M-sample activation plus its intermediates.
+    # Tiling bounds that. `enable_tiling()` is the newer API and does not exist on
+    # AutoencoderOobleck in every diffusers release; the attribute underneath always
+    # does, so set whichever is present.
+    try:
+        if hasattr(pipe.vae, "enable_tiling"):
+            pipe.vae.enable_tiling()
+        else:
+            pipe.vae.use_tiling = True
+    except Exception:
+        pass
+
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def generate(pipe, spec, prompt: str, lyrics: str = "",
+             settings: GenSettings | None = None) -> tuple[np.ndarray, int, float, GenSettings]:
+    """Render one track. Returns (audio [channels, samples], sample_rate, seconds, resolved).
+
+    The resolved settings come back out because they are what the report must show: a
+    turbo run asked for cfg 7.0 did not run cfg 7.0, and a card that claims otherwise
+    is the kind of quiet lie that makes a comparison worthless.
+    """
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    t0 = time.perf_counter()
+    out = pipe(
+        prompt=prompt,
+        lyrics=lyrics or "",
+        audio_duration=float(st.duration),
+        vocal_language=st.language or "en",
+        num_inference_steps=int(st.steps),
+        guidance_scale=float(st.guidance),
+        shift=float(st.shift),
+        generator=gen,
+        # None is the pipeline's "estimate it yourself" for all three; the sentinels
+        # only exist to survive the CLI, they must not reach the model.
+        bpm=st.bpm or None,
+        keyscale=st.keyscale or None,
+        timesignature=st.timesignature or None,
+    )
+    seconds = time.perf_counter() - t0
+
+    audio = out.audios[0]                       # (channels, samples), float32 on device
+    audio = audio.detach().to(torch.float32).cpu().numpy()
+    return audio, int(pipe.sample_rate), seconds, st
+
+
+# ── Audio utilities ──────────────────────────────────────────────────────────────
+
+def to_stereo_float32(audio) -> np.ndarray:
+    """Coerce whatever came back to a (channels, samples) float32 array, channels first.
+
+    ACE-Step returns (channels, samples), but run_local reads files back as
+    (samples, channels) and a mono checkpoint would return 1-D, so normalize once.
+    """
+    try:
+        import torch
+        if isinstance(audio, torch.Tensor):
+            audio = audio.detach().to(torch.float32).cpu().numpy()
+    except Exception:
+        pass
+    a = np.asarray(audio, dtype=np.float32)
+    if a.ndim == 1:
+        a = a[None, :]
+    elif a.ndim > 2:
+        a = a.reshape(a.shape[-2], a.shape[-1])
+    # Channels-first: a music clip is always longer than it is wide.
+    if a.shape[0] > a.shape[1]:
+        a = a.T
+    return np.ascontiguousarray(a)
+
+
+def to_mono(audio) -> np.ndarray:
+    return to_stereo_float32(audio).mean(axis=0)
+
+
+def write_wav(audio, sr: int, path) -> None:
+    """PCM16 wav, stereo preserved. soundfile wants (samples, channels)."""
+    sf.write(str(path), to_stereo_float32(audio).T, sr, subtype="PCM_16")
+
+
+def audio_data_uri(audio, sr: int, budget: int = MAX_EMBED_BYTES) -> tuple[str, str]:
+    """(data_uri, note). An empty uri plus a note means 'too big, spectrogram only'.
+
+    A ladder, most-faithful first. Vorbis is ~10x smaller than PCM and plays natively
+    in <audio>, which is what makes a grid of full-length tracks embeddable at all: the
+    same 60s stereo track is ~1MB as OGG and ~11.5MB as PCM16 wav. Each rung says in
+    the note what it gave up, because "why is this one mono?" should never be a mystery.
+    """
+    stereo = to_stereo_float32(audio)
+    rungs = (
+        (stereo.T, "OGG", "VORBIS", "audio/ogg", ""),
+        (to_mono(stereo), "OGG", "VORBIS", "audio/ogg",
+         "stereo track was over the embed budget; player is a mono downmix"),
+        (stereo.T, "WAV", "PCM_16", "audio/wav",
+         "no Vorbis encoder in this image; embedded as uncompressed wav"),
+    )
+    last = ""
+    for data, fmt, sub, mime, note in rungs:
+        try:
+            buf = io.BytesIO()
+            sf.write(buf, data, sr, format=fmt, subtype=sub)
+            raw = buf.getvalue()
+            if len(raw) > budget:
+                last = f"clip is {len(raw)/1e6:.1f} MB, over the embed budget"
+                continue
+            return f"data:{mime};base64,{base64.b64encode(raw).decode()}", note
+        except Exception:
+            continue
+    return "", (last or "could not encode audio for embedding") + "; spectrogram shown"
+
+
+def waveform_spectrogram_png(audio, sr: int) -> str:
+    """A stacked waveform + spectrogram as a base64 PNG data URI.
+
+    The at-a-glance visual, and the fallback surface if a player fails. Two choices
+    differ from the TTS version, both because this is music:
+
+      - the waveform is the mono sum, drawn as an envelope, so an intro/build/drop
+        arc reads as shape rather than as a solid block of ink;
+      - the spectrogram runs to the FULL Nyquist (24kHz), not the 8kHz voice band.
+        The top of that range is exactly where a lowpass brickwall shows up, and a
+        hard horizontal edge at 16kHz is the tell that a model is rendering through a
+        lossy bottleneck. Cropping to the voice band would hide the most diagnostic
+        thing on the plot.
+    """
+    mono = to_mono(audio)
+    if mono.size == 0:
+        mono = np.zeros(int(sr * 0.1), dtype=np.float32)
+    t = np.arange(mono.size) / float(sr)
+
+    fig, (ax_w, ax_s) = plt.subplots(
+        2, 1, figsize=(4.8, 2.6), dpi=110, gridspec_kw={"height_ratios": [1, 1.5]}
+    )
+    ax_w.fill_between(t, mono, -mono, linewidth=0, color="#7c3aed", alpha=0.85)
+    ax_w.set_xlim(0, max(float(t[-1]), 0.1))
+    ax_w.set_ylim(-1.05, 1.05)
+    ax_w.axhline(1.0, color="#ef4444", linewidth=0.5, alpha=0.6)   # the clipping line
+    ax_w.axhline(-1.0, color="#ef4444", linewidth=0.5, alpha=0.6)
+    ax_w.set_yticks([])
+    ax_w.set_xticks([])
+    ax_w.margins(0)
+
+    nfft = 1024 if mono.size >= 1024 else max(32, 1 << int(np.log2(max(mono.size, 32))))
+    ax_s.specgram(mono, NFFT=nfft, Fs=sr, noverlap=nfft // 2, cmap="magma")
+    ax_s.set_ylim(0, sr / 2)
+    ax_s.set_yticks([0, 8000, 16000, sr / 2])
+    ax_s.set_yticklabels(["0", "8k", "16k", f"{sr/2000:.0f}k"], fontsize=6)
+    ax_s.set_xlabel("seconds", fontsize=7, color="#6b7280")
+    ax_s.tick_params(axis="both", labelsize=6, colors="#6b7280")
+
+    fig.subplots_adjust(left=0.06, right=0.99, top=0.98, bottom=0.16, hspace=0.08)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", facecolor="white")
+    plt.close(fig)
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+
+# ── Report data ──────────────────────────────────────────────────────────────────
+
+@dataclass
+class TrackResult:
+    """One rendered card in the report."""
+    label: str                  # the column identity: a model key, or "seed 42"
+    sublabel: str = ""          # the family / axis line under the title
+    settings: str = ""          # GenSettings.summary() of what actually ran
+    seconds: float = 0.0        # render wall-clock
+    audio_seconds: float = 0.0  # duration of the produced audio
+    sample_rate: int = 0
+    channels: int = 0
+    audio_uri: str = ""
+    spec_uri: str = ""
+    peak_gb: float = 0.0
+    badges: list[str] = field(default_factory=list)
+    embed_note: str = ""
+    error: str = ""
+
+    @property
+    def speedup(self) -> float:
+        """Audio seconds produced per second of compute. >1 is faster than real time."""
+        return (self.audio_seconds / self.seconds) if self.seconds else 0.0
+
+
+def build_track_result(label: str, audio, sr: int, seconds: float, *,
+                       sublabel: str = "", settings: str = "", peak_gb: float = 0.0,
+                       badges: list[str] | None = None) -> TrackResult:
+    a = to_stereo_float32(audio)
+    audio_seconds = a.shape[1] / float(sr) if sr else 0.0
+    uri, note = audio_data_uri(a, sr)
+    return TrackResult(
+        label=label, sublabel=sublabel, settings=settings,
+        seconds=seconds, audio_seconds=audio_seconds, sample_rate=sr,
+        channels=int(a.shape[0]), audio_uri=uri,
+        spec_uri=waveform_spectrogram_png(a, sr),
+        peak_gb=peak_gb, badges=list(badges or []), embed_note=note,
+    )
+
+
+@dataclass
+class Block:
+    """One row of the report: a heading, the hypothesis, and the cards to compare."""
+    heading: str
+    note: str = ""          # what to listen for
+    prompt: str = ""        # the style caption used, shown verbatim
+    lyrics: str = ""        # shown collapsed; "" renders as "instrumental"
+    results: list[TrackResult] = field(default_factory=list)
+
+
+# ── Rendering ────────────────────────────────────────────────────────────────────
+
+REPORT_CSS = """
+<style>
+  .mg-wrap { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+             color: #0b0b0b; }
+  .mg-wrap h2 { margin: 0 0 4px; }
+  .mg-meta { color: #6b7280; font-size: 13px; margin-bottom: 20px; }
+  .mg-head { background: #f9fafb; border-left: 3px solid #7c3aed; padding: 10px 14px;
+             border-radius: 6px; margin: 22px 0 10px; }
+  .mg-title { font-weight: 600; font-size: 15px; }
+  .mg-note { color: #4b5563; font-size: 13px; line-height: 1.5; margin-top: 5px; }
+  .mg-prompt { color: #374151; font-size: 12.5px; margin-top: 8px; font-style: italic; }
+  .mg-lyr { margin-top: 8px; font-size: 12.5px; color: #374151; }
+  .mg-lyr pre { white-space: pre-wrap; font-size: 12px; line-height: 1.45;
+                background: #fff; border: 1px solid #e5e7eb; border-radius: 6px;
+                padding: 8px 10px; margin: 6px 0 0; }
+  .mg-grid { display: grid; gap: 16px;
+             grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .mg-cell { border: 1px solid #e5e7eb; border-radius: 12px; overflow: hidden;
+             background: #fff; display: flex; flex-direction: column; }
+  .mg-spec { padding: 10px 11px 0; }
+  .mg-spec img { width: 100%; height: auto; border-radius: 6px; display: block;
+                 cursor: zoom-in; }
+  .mg-audio { padding: 10px 11px 4px; }
+  .mg-audio audio { width: 100%; display: block; }
+  .mg-cap { padding: 6px 11px 12px; }
+  .mg-model { font-weight: 600; font-size: 14px; }
+  .mg-tag { display: inline-block; font-size: 11px; color: #374151; background: #f3f4f6;
+            border-radius: 999px; padding: 1px 8px; margin: 4px 4px 0 0; }
+  .mg-fast { display: inline-block; font-size: 11px; color: #065f46; background: #d1fae5;
+             border-radius: 999px; padding: 1px 8px; margin: 4px 0 0; font-weight: 600; }
+  .mg-set { color: #4338ca; font-size: 11.5px; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .mg-sub { color: #6b7280; font-size: 12px; margin-top: 4px; line-height: 1.4;
+            font-variant-numeric: tabular-nums; }
+  .mg-err { padding: 16px; color: #b91c1c; font-size: 13px; white-space: pre-wrap; }
+  .mg-warn { padding: 8px 11px; color: #92400e; background: #fffbeb; font-size: 12px; }
+  #mg-lb { position: fixed; inset: 0; z-index: 9999; display: none; cursor: zoom-out;
+           flex-direction: column; align-items: center; justify-content: center;
+           gap: 12px; padding: 24px; background: rgba(0,0,0,.88); }
+  #mg-lb img { max-width: 96vw; max-height: 86vh; border-radius: 8px; }
+  #mg-lb #mg-lb-cap { color: #e5e7eb; font-size: 14px; }
+</style>
+"""
+
+_ZOOM = (
+    "document.getElementById('mg-lb-img').src=this.src;"
+    "document.getElementById('mg-lb-cap').textContent=this.dataset.cap;"
+    "document.getElementById('mg-lb').style.display='flex'"
+)
+_LIGHTBOX = (
+    "<div id=\"mg-lb\" onclick=\"this.style.display='none'\" style=\"display:none\">"
+    '<img id="mg-lb-img" src="" alt="zoomed"/><div id="mg-lb-cap"></div></div>'
+)
+
+
+def _zoom_img(uri: str, cap: str) -> str:
+    return (f'<img src="{uri}" alt="{html.escape(cap)}" '
+            f'data-cap="{html.escape(cap, quote=True)}" onclick="{_ZOOM}"/>')
+
+
+def _player(r: TrackResult) -> str:
+    if not r.audio_uri:
+        return ""
+    # controls = native scrub/play/pause, no JS. Not autoplay: six tracks starting at
+    # once is a wall of noise, and the whole point is to play them one at a time.
+    return (f'<div class="mg-audio"><audio controls preload="metadata" '
+            f'src="{r.audio_uri}"></audio></div>')
+
+
+def _cell(r: TrackResult) -> str:
+    if r.error:
+        return (f'<div class="mg-cell"><div class="mg-err">⚠️ {html.escape(r.error)}</div>'
+                f'<div class="mg-cap"><div class="mg-model">{html.escape(r.label)}</div>'
+                f'</div></div>')
+
+    img = (f'<div class="mg-spec">{_zoom_img(r.spec_uri, f"{r.label} · {r.settings}")}</div>'
+           if r.spec_uri else "")
+    note = f'<div class="mg-warn">{html.escape(r.embed_note)}</div>' if r.embed_note else ""
+    fast = (f'<span class="mg-fast">{r.speedup:.1f}x real-time</span>'
+            if r.speedup else "")
+    tags = "".join(f'<span class="mg-tag">{html.escape(b)}</span>' for b in r.badges)
+    settings = f'<div class="mg-set">{html.escape(r.settings)}</div>' if r.settings else ""
+    peak = f' · peak {r.peak_gb:.1f}GB' if r.peak_gb else ""
+    chan = {1: "mono", 2: "stereo"}.get(r.channels, f"{r.channels}ch")
+    sub = (f'<div class="mg-sub">{r.seconds:.1f}s to render · {r.audio_seconds:.1f}s '
+           f'{chan} @ {r.sample_rate/1000:.0f}kHz{peak}</div>')
+    sublabel = (f'<div class="mg-sub">{html.escape(r.sublabel)}</div>'
+                if r.sublabel else "")
+    cap = (f'<div class="mg-cap"><div class="mg-model">{html.escape(r.label)}</div>'
+           f'{tags}{fast}{settings}{sub}{sublabel}</div>')
+    return f'<div class="mg-cell">{img}{_player(r)}{note}{cap}</div>'
+
+
+def _block(b: Block) -> str:
+    note = f'<div class="mg-note">{html.escape(b.note)}</div>' if b.note else ""
+    prompt = (f'<div class="mg-prompt">🎛️ {html.escape(b.prompt)}</div>'
+              if b.prompt else "")
+    if b.lyrics.strip():
+        lyr = (f'<details class="mg-lyr"><summary>lyrics</summary>'
+               f'<pre>{html.escape(b.lyrics.strip())}</pre></details>')
+    elif b.prompt:
+        lyr = '<div class="mg-lyr">🎹 instrumental (no lyrics)</div>'
+    else:
+        lyr = ""
+    cells = "".join(_cell(r) for r in b.results)
+    return (f'<div class="mg-head"><div class="mg-title">{html.escape(b.heading)}</div>'
+            f'{note}{prompt}{lyr}</div><div class="mg-grid">{cells}</div>')
+
+
+def render_report(blocks: list[Block], *, title: str, meta: str = "") -> str:
+    return (
+        f'{REPORT_CSS}<div class="mg-wrap"><h2>{html.escape(title)}</h2>'
+        f'<div class="mg-meta">{html.escape(meta)}</div>'
+        + "".join(_block(b) for b in blocks) + "</div>" + _LIGHTBOX
+    )
+
+
+def render_status(title: str, body: str) -> str:
+    return (f'{REPORT_CSS}<div class="mg-wrap"><h2>{html.escape(title)}</h2>'
+            f'<div class="mg-meta">{html.escape(body)}</div></div>')

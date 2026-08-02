@@ -1,0 +1,5 @@
+# Local smoke-test output: standalone HTML plus the wavs it embeds. Regenerate with
+# `python run_local.py`; never commit (a 60s stereo 48kHz wav is ~11MB).
+out/
+*.wav
+*.ogg

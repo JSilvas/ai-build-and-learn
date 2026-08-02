@@ -1,0 +1,5 @@
+# Source recordings dragged in for the clone tab: someone's actual voice, and tens of
+# MB each. They live here for convenience; they are neither committed nor swept into a
+# run's code bundle (this directory IS the Flyte source root).
+mp3/
+candidates/
