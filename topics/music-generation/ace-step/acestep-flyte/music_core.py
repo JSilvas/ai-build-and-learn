@@ -185,12 +185,25 @@ def gpu_pool_gb() -> tuple[float, float]:
     """
     try:
         import torch
-        if torch.cuda.is_available():
+        if not torch.cuda.is_available():
+            return 0.0, 0.0
+        # mem_get_info needs a live CUDA context. Without this it can raise on the
+        # first call of a fresh process, and a silent `except: pass` then reports
+        # "0/0GB, capped at 0GB" and skips the cap entirely: observed in a real run,
+        # where the only symptom was a log line reading zero.
+        torch.cuda.init()
+        try:
             free_b, total_b = torch.cuda.mem_get_info()
-            budget, _, _ = memory_budget_gb()
-            return (budget or free_b / 1e9), total_b / 1e9
+            total_gb = total_b / 1e9
+        except Exception:
+            log.warning("mem_get_info failed; falling back to device properties",
+                        exc_info=True)
+            free_b = 0
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        budget, _, _ = memory_budget_gb()
+        return (budget or free_b / 1e9), total_gb
     except Exception:
-        pass
+        log.exception("could not size the GPU pool; the memory cap will be SKIPPED")
     return 0.0, 0.0
 
 
@@ -233,7 +246,13 @@ def prepare_gpu() -> float:
             torch.cuda.set_per_process_memory_fraction(frac)
             cap_gb = frac * total_gb
     except Exception:
-        pass
+        log.exception("could not set the GPU memory cap; running UNCAPPED")
+    if cap_gb <= 0:
+        # Loud on purpose. An uncapped process on GB10 is the failure mode this whole
+        # function exists to prevent, and it previously announced itself only as a
+        # cheerful "capped at 0GB" that read like a formatting quirk.
+        log.warning("GPU memory cap NOT applied (pool size unreadable); a large render "
+                    "can exhaust the unified pool and take the box down with it")
     reset_peak_memory()
     return cap_gb
 
@@ -274,17 +293,38 @@ class GenSettings:
         # ran instead of the number that was requested and silently discarded.
         if spec.distilled and out.guidance > 1.0:
             out.guidance = 1.0
+        # Same principle for a hard architectural ceiling. MusicGen was trained on 30s
+        # windows and does not refuse a longer request, it degrades into repetition, so
+        # a `compare` run at 120s would quietly hand it an unwinnable task and let the
+        # report imply it simply sounds worse. Clamp, and let the card show the clamped
+        # number so the difference is legible as a CONSTRAINT rather than a failure.
+        cap = getattr(spec, "max_duration", 0.0)
+        if cap and out.duration > cap:
+            out.duration = cap
         return out
 
     def as_dict(self) -> dict:
         """The knobs as plain JSON-able data. Resolve() first if you want what ran."""
         return dict(vars(self))
 
-    def summary(self) -> str:
-        """The one-line settings string under a report card."""
-        bits = [f"seed {self.seed}", f"{self.steps} steps",
-                f"cfg {self.guidance:g}", f"shift {self.shift:g}",
-                f"{self.duration:g}s"]
+    def summary(self, spec=None) -> str:
+        """The one-line settings string under a report card.
+
+        Adapter-aware, because printing a knob a model does not have is the same class
+        of lie as printing a value it ignored. MusicGen is autoregressive: it has no
+        denoising steps and no flow-matching shift, so a card reading "8 steps · shift
+        3" next to a MusicGen track would be inventing numbers. It does use CFG, so
+        that stays.
+        """
+        adapter = getattr(spec, "adapter", "acestep") if spec is not None else "acestep"
+        diffusion = adapter != "musicgen"
+        bits = [f"seed {self.seed}"]
+        if diffusion:
+            bits.append(f"{self.steps} steps")
+        bits.append(f"cfg {self.guidance:g}")
+        if diffusion:
+            bits.append(f"shift {self.shift:g}")
+        bits.append(f"{self.duration:g}s")
         if self.bpm:
             bits.append(f"{self.bpm} bpm")
         if self.keyscale:
@@ -296,8 +336,11 @@ class GenSettings:
 
 # ── Load + generate ──────────────────────────────────────────────────────────────
 
-def resolve_weights(local_dir: str | None) -> str | None:
-    """Find the diffusers pipeline root inside a downloaded weights Dir.
+def resolve_weights(local_dir: str | None, marker: str = "model_index.json") -> str | None:
+    """Find the model root inside a downloaded weights Dir.
+
+    `marker` is the file that identifies the root: `model_index.json` for a diffusers
+    pipeline, `config.json` for a plain transformers checkpoint.
 
     The fetch task snapshots with `local_dir=`, so the Dir contains a plain repo
     layout: `model_index.json` next to `transformer/`, `vae/`, and friends. But the
@@ -315,10 +358,10 @@ def resolve_weights(local_dir: str | None) -> str | None:
     if not local_dir:
         return None
     p = Path(local_dir)
-    if (p / "model_index.json").exists():
+    if (p / marker).exists():
         return str(p)
     for cand in sorted(p.glob("*/")) + sorted(p.glob("*/*/")):
-        if (cand / "model_index.json").exists():
+        if (cand / marker).exists():
             return str(cand)
     # Nothing recognizable: fall back to the repo id so the run still works (slowly,
     # over the network) rather than failing on a layout surprise.
@@ -326,6 +369,39 @@ def resolve_weights(local_dir: str | None) -> str | None:
 
 
 def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
+    """Load a model onto the GPU, dispatching on `spec.adapter`.
+
+    One image serves every adapter here (diffusers and transformers coexist fine), so
+    unlike the TTS demo next door an adapter selects a code path, not a container.
+    Each branch imports its package LAZILY so a future image that lacks one does not
+    fail at module import.
+    """
+    if spec.adapter == "musicgen":
+        return _load_musicgen(spec, local_dir)
+    return _load_acestep(spec, local_dir, tile)
+
+
+def _load_musicgen(spec, local_dir: str | None = None):
+    """MusicGen: an autoregressive transformer over EnCodec tokens.
+
+    Returns (model, processor) rather than a pipeline object, which is why `generate`
+    dispatches too. `device_map="auto"` rather than `.to("cuda")`: the GB10's unified
+    pool makes a naive load hold two copies of the weights at once, and at 20.4GB for
+    the stereo-large checkpoint that is worth avoiding.
+    """
+    import torch
+    from transformers import AutoProcessor, MusicgenForConditionalGeneration
+
+    source = resolve_weights(local_dir, marker="config.json") or spec.repo
+    log.info(f"loading musicgen from {source}")
+    processor = AutoProcessor.from_pretrained(source)
+    model = MusicgenForConditionalGeneration.from_pretrained(
+        source, dtype=getattr(torch, spec.dtype), device_map="auto")
+    model.eval()
+    return model, processor
+
+
+def _load_acestep(spec, local_dir: str | None = None, tile: bool = False):
     """Load one ACE-Step checkpoint onto the GPU.
 
     `local_dir` is the fetch task's downloaded Dir. When it holds a usable pipeline
@@ -338,7 +414,7 @@ def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
     import torch
     from diffusers import AceStepPipeline
 
-    root = resolve_weights(local_dir)
+    root = resolve_weights(local_dir, marker="model_index.json")
     source = root or spec.repo
     if local_dir and not root:
         log.warning(f"no model_index.json under {local_dir}; falling back to "
@@ -393,6 +469,46 @@ def generate(pipe, spec, prompt: str, lyrics: str = "",
     turbo run asked for cfg 7.0 did not run cfg 7.0, and a card that claims otherwise
     is the kind of quiet lie that makes a comparison worthless.
     """
+    if spec.adapter == "musicgen":
+        return _generate_musicgen(pipe, spec, prompt, settings)
+    return _generate_acestep(pipe, spec, prompt, lyrics, settings)
+
+
+# MusicGen's EnCodec runs at 50 frames/sec, so this converts seconds of audio into the
+# `max_new_tokens` the generate call actually wants.
+MUSICGEN_TOKENS_PER_SEC = 50
+
+
+def _generate_musicgen(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-music through MusicGen.
+
+    Ignores lyrics entirely, because the model has no vocal path at all: feeding it
+    lyrics would silently treat them as style text and muddy the prompt. `compare`
+    passes them anyway (every model gets the same brief), so dropping them here is the
+    right place to do it, and `intended_for` on the card explains why the vocal briefs
+    come back instrumental.
+    """
+    import torch
+
+    model, processor = pipe
+    st = (settings or GenSettings()).resolve(spec)
+
+    inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
+    tokens = int(st.duration * MUSICGEN_TOKENS_PER_SEC)
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = model.generate(**inputs, do_sample=True, guidance_scale=float(st.guidance),
+                             max_new_tokens=tokens)
+    seconds = time.perf_counter() - t0
+
+    audio = out[0].detach().to(torch.float32).cpu().numpy()   # (channels, samples)
+    sr = int(model.config.audio_encoder.sampling_rate)
+    return audio, sr, seconds, st
+
+
+def _generate_acestep(pipe, spec, prompt: str, lyrics: str = "",
+                      settings: GenSettings | None = None):
     import torch
 
     st = (settings or GenSettings()).resolve(spec)
@@ -587,6 +703,7 @@ class Repro:
     brief: str = ""              # the named brief this came from, if any
     settings: dict = field(default_factory=dict)
     entrypoint: str = "generate_one"
+    adapter: str = "acestep"     # drives which flags the command emits
 
     def as_json(self) -> str:
         return json.dumps({
@@ -615,9 +732,12 @@ class Repro:
             if self.lyrics.strip():
                 parts.append(f"--lyrics {shlex.quote(self.lyrics)}")
         s = self.settings
-        for flag, key in (("--duration", "duration"), ("--seed", "seed"),
-                          ("--steps", "steps"), ("--guidance", "guidance"),
-                          ("--shift", "shift")):
+        # Only emit flags this model actually honours: `--steps 8 --shift 3` on a
+        # MusicGen command would run without complaint and mean nothing.
+        flags = [("--duration", "duration"), ("--seed", "seed"), ("--guidance", "guidance")]
+        if self.adapter != "musicgen":
+            flags += [("--steps", "steps"), ("--shift", "shift")]
+        for flag, key in flags:
             if key in s:
                 v = s[key]
                 parts.append(f"{flag} {v:g}" if isinstance(v, float) else f"{flag} {v}")
@@ -637,7 +757,8 @@ def build_repro(spec, job_prompt: str, job_lyrics: str, settings: "GenSettings",
                 brief: str = "", entrypoint: str = "generate_one") -> Repro:
     """Repro for one card, with `settings` resolved against the checkpoint."""
     return Repro(model_key=spec.key, prompt=job_prompt, lyrics=job_lyrics, brief=brief,
-                 settings=settings.resolve(spec).as_dict(), entrypoint=entrypoint)
+                 settings=settings.resolve(spec).as_dict(), entrypoint=entrypoint,
+                 adapter=getattr(spec, "adapter", "acestep"))
 
 
 # ── Report data ──────────────────────────────────────────────────────────────────
@@ -658,6 +779,7 @@ class TrackResult:
     badges: list[str] = field(default_factory=list)
     embed_note: str = ""
     error: str = ""
+    intended_for: str = ""       # what this model is FOR (cross-family fairness)
     repro: Repro | None = None   # how to make this card again
 
     @property
@@ -669,7 +791,8 @@ class TrackResult:
 def build_track_result(label: str, audio, sr: int, seconds: float, *,
                        sublabel: str = "", settings: str = "", peak_gb: float = 0.0,
                        badges: list[str] | None = None,
-                       repro: Repro | None = None) -> TrackResult:
+                       repro: Repro | None = None,
+                       intended_for: str = "") -> TrackResult:
     a = to_stereo_float32(audio)
     audio_seconds = a.shape[1] / float(sr) if sr else 0.0
     uri, note = audio_data_uri(a, sr)
@@ -679,6 +802,7 @@ def build_track_result(label: str, audio, sr: int, seconds: float, *,
         channels=int(a.shape[0]), audio_uri=uri,
         spec_uri=waveform_spectrogram_png(a, sr),
         peak_gb=peak_gb, badges=list(badges or []), embed_note=note, repro=repro,
+        intended_for=intended_for,
     )
 
 
@@ -734,6 +858,8 @@ REPORT_CSS = """
                   border-radius: 6px; padding: 8px 10px; margin: 6px 0 0;
                   user-select: all; }
   .mg-repro .mg-hint { margin-top: 6px; color: #6b7280; font-size: 11px; }
+  .mg-for { color: #4b5563; font-size: 11.5px; margin-top: 6px; padding-top: 6px;
+            border-top: 1px dashed #e5e7eb; line-height: 1.4; }
   .mg-err { padding: 16px; color: #b91c1c; font-size: 13px; white-space: pre-wrap; }
   .mg-warn { padding: 8px 11px; color: #92400e; background: #fffbeb; font-size: 12px; }
   #mg-lb { position: fixed; inset: 0; z-index: 9999; display: none; cursor: zoom-out;
@@ -788,8 +914,13 @@ def _cell(r: TrackResult) -> str:
            f'{chan} @ {r.sample_rate/1000:.0f}kHz{peak}</div>')
     sublabel = (f'<div class="mg-sub">{html.escape(r.sublabel)}</div>'
                 if r.sublabel else "")
+    # What this model is FOR. Only meaningful once the grid spans model families, but
+    # then it is the line that stops a comparison from being unfair by omission: a
+    # 30s instrumental model losing a "sing me a chorus" prompt is not a quality result.
+    intended = (f'<div class="mg-for">{html.escape(r.intended_for)}</div>'
+                if r.intended_for else "")
     cap = (f'<div class="mg-cap"><div class="mg-model">{html.escape(r.label)}</div>'
-           f'{tags}{fast}{settings}{sub}{sublabel}</div>')
+           f'{tags}{fast}{settings}{sub}{sublabel}{intended}</div>')
     return f'<div class="mg-cell">{img}{_player(r)}{note}{cap}{_repro(r)}</div>'
 
 

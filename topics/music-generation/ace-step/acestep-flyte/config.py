@@ -177,14 +177,30 @@ orch_env = flyte.TaskEnvironment(
 )
 
 
-# ── The studio app (not built yet) ───────────────────────────────────────────────
+# ── The studio app ───────────────────────────────────────────────────────────────
 #
-# Kept for parity with the image/video/TTS studios: when the Gradio launcher lands it
-# will be a thin CPU app that submits runs and links the report, holding no GPU and
-# loading no model. AppEnvironment does NOT honor flyte.Resources(gpu=1) on this SDK
-# (it serializes to a bare `gpu` key k8s drops and the pod silently schedules CPU-
-# only); a PodTemplate that sets nvidia.com/gpu directly is the fix, so it is here
-# ready for the day the app wants to hold the model resident instead.
+# A thin LAUNCHER, exactly like the image and video studios: it submits runs and links
+# the report. No torch, no diffusers, no GPU, no model. That is not minimalism for its
+# own sake, it is the only shape that works on a one-GPU box: an app pod stays alive
+# for as long as the app is up, so an app that generated in-process would hold the
+# Spark's only GPU forever and every pipeline task would sit Unschedulable behind it.
+# Launching runs means the GPU is held only while a track is actually rendering.
+#
+# connectrpc pinned to 0.10.x: 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
+# kubernetes because the app imports THIS module for the name/port, and the pod
+# templates below need kubernetes.client at import time.
+studio_app_image = (
+    flyte.Image.from_debian_base(
+        name="acestep-studio-image", registry=REGISTRY, platform=PLATFORM
+    )
+    .with_pip_packages("flyte==2.2.1", "connectrpc==0.10.*", "gradio==5.42.0",
+                       "python-dotenv", "kubernetes")
+)
+
+# Kept for the day the studio wants a model resident instead of launching runs.
+# AppEnvironment does NOT honor flyte.Resources(gpu=1) on this SDK (it serializes to a
+# bare `gpu` key k8s drops and the pod silently schedules CPU-only); a PodTemplate that
+# sets nvidia.com/gpu directly is the fix.
 app_gpu_pod = flyte.PodTemplate(
     primary_container_name="app",
     pod_spec=V1PodSpec(

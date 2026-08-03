@@ -39,12 +39,32 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class MusicModelSpec:
     key: str                  # short handle used on the CLI and in reports
-    repo: str                 # HuggingFace repo id (diffusers layout)
+    repo: str                 # HuggingFace repo id
     family: str               # for the report card
     license: str
     params: str               # human string
     download_gb: float        # measured size of the repo, from the HF API
     sample_rate: int = 48000  # ACE-Step's Oobleck VAE is 48kHz stereo
+
+    # Which loader/generator in music_core drives this model. The TTS demo next door
+    # learned this the hard way: as soon as a registry spans model FAMILIES, "which
+    # pipeline class" stops being a property you can infer and becomes one you declare.
+    # Unlike that demo, an adapter here does NOT imply a separate image: ACE-Step needs
+    # diffusers and MusicGen needs transformers, and one image already has both.
+    adapter: str = "acestep"
+
+    # What the model is FOR, printed on the card. Load-bearing for honesty once the
+    # registry spans families: ACE-Step writes songs with vocals, MusicGen writes
+    # ~30s instrumental beds, Stable Audio makes textures and SFX. Running one prompt
+    # across all three is informative, but only if the report says what each was built
+    # to do. Without this line the grid reads as a beauty contest that the model with
+    # the widest remit always wins.
+    intended_for: str = ""
+
+    # Hard ceiling on a single render, where the architecture has one. MusicGen was
+    # trained on 30s windows; ask for more and it degrades rather than refusing, so we
+    # clamp and say so on the card instead of quietly shipping mush.
+    max_duration: float = 0.0   # 0 = no practical limit
 
     # The checkpoint's own sampling recipe. These are the defaults a job inherits when
     # it does not override them, and they differ per checkpoint by design: handing sft
@@ -67,6 +87,7 @@ MODELS: dict[str, MusicModelSpec] = {
         license="MIT (weights) · Apache-2.0 (Qwen3 text encoder)",
         params="5B DiT + 0.6B text encoder",
         download_gb=11.1,
+        intended_for="Full songs with sung vocals, 10s to 10min, 48kHz stereo.",
         steps=8, guidance=1.0, shift=3.0,
         distilled=True,
         notes="Guidance-distilled. 8 steps, no CFG pass. The one you reach for when "
@@ -79,6 +100,7 @@ MODELS: dict[str, MusicModelSpec] = {
         license="MIT (weights) · Apache-2.0 (Qwen3 text encoder)",
         params="5B DiT + 0.6B text encoder",
         download_gb=11.5,
+        intended_for="Full songs with sung vocals, 10s to 10min, 48kHz stereo.",
         steps=50, guidance=7.0, shift=3.0,
         notes="Instruction-tuned, real CFG. Slower per track but the better listener "
               "when the prompt is specific. Also ships the audio tokenizer pair the "
@@ -91,9 +113,61 @@ MODELS: dict[str, MusicModelSpec] = {
         license="MIT (weights) · Apache-2.0 (Qwen3 text encoder)",
         params="5B DiT + 0.6B text encoder",
         download_gb=11.5,
+        intended_for="Full songs with sung vocals, 10s to 10min, 48kHz stereo.",
         steps=50, guidance=7.0, shift=3.0,
         notes="The pretrained checkpoint under the other two. Here so 'what did the "
               "fine-tune actually buy?' is a question you can answer by ear.",
+    ),
+
+    # ── MusicGen (Meta) ──────────────────────────────────────────────────────────
+    #
+    # A different FAMILY, not another ACE-Step checkpoint, and the comparison is more
+    # interesting for it. MusicGen is an autoregressive transformer over EnCodec tokens
+    # (50 tokens/sec, 32kHz) rather than a diffusion model, it has no concept of lyrics
+    # or vocals, and it was trained on 30s windows. So it is not "ACE-Step but worse":
+    # it is a different tool, and the report says so via `intended_for`.
+    #
+    # Two things make it worth the registry entry:
+    #   1. MELODY CONDITIONING (the -melody checkpoint), which ACE-Step has no
+    #      equivalent of: hum or play a tune and get it arranged in a described style.
+    #   2. LICENSING. The weights are CC-BY-NC: non-commercial, and that extends to
+    #      what you generate. Next to ACE-Step's MIT that is the single most practical
+    #      difference between them, and it costs nothing to demonstrate.
+    #
+    # No new image: transformers ships MusicGen and the ACE-Step image already has it.
+    "musicgen-large": MusicModelSpec(
+        key="musicgen-large",
+        repo="facebook/musicgen-stereo-large",
+        family="MusicGen · autoregressive transformer over EnCodec",
+        license="CC-BY-NC-4.0 (weights AND outputs are non-commercial)",
+        params="3.3B",
+        # 6.9GB fetched, not the repo's 20.4GB: it ships .safetensors AND duplicate
+        # .bin/state_dict copies of the same weights, and fetch_weights ignores those.
+        download_gb=6.9,
+        sample_rate=32000,
+        adapter="musicgen",
+        intended_for="~30s instrumental beds from a text prompt. No lyrics, no vocals.",
+        max_duration=30.0,
+        guidance=3.0,          # the value the model card recommends
+        notes="The stereo 3.3B. Note it is a SMALLER download than any ACE-Step "
+              "checkpoint yet caps out at 30s of instrumental, which is a fair "
+              "one-line summary of how much moved in a year.",
+    ),
+    "musicgen-melody": MusicModelSpec(
+        key="musicgen-melody",
+        repo="facebook/musicgen-melody",
+        family="MusicGen · autoregressive transformer over EnCodec",
+        license="CC-BY-NC-4.0 (weights AND outputs are non-commercial)",
+        params="1.5B",
+        download_gb=6.2,   # 9.2GB repo, minus the duplicate .bin copies
+        sample_rate=32000,
+        adapter="musicgen",
+        intended_for="~30s instrumental beds, optionally conditioned on a hummed or "
+                     "played MELODY. The capability ACE-Step has no answer to.",
+        max_duration=30.0,
+        guidance=3.0,
+        notes="Melody conditioning is not wired to an entry point yet; today this runs "
+              "as plain text-to-music. Half the size of the large checkpoint.",
     ),
 }
 

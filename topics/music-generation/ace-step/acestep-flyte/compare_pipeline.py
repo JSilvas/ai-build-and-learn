@@ -152,9 +152,13 @@ async def fetch_weights(model_key: str) -> flyte.io.Dir:
         # duplicate .bin shards would double the pull on any repo that ships both.
         ignore_patterns=["*.pt", "*.bin", "*.msgpack", "*.onnx"],
     )
-    if not (dest / "model_index.json").exists():
+    # A diffusers pipeline announces itself with model_index.json; a plain transformers
+    # checkpoint (MusicGen) with config.json. Check the right one, and fail here with a
+    # directory listing rather than letting from_pretrained fail in a GPU pod later.
+    marker = "config.json" if spec.adapter == "musicgen" else "model_index.json"
+    if not (dest / marker).exists():
         raise RuntimeError(
-            f"{spec.repo} downloaded without a model_index.json; not a diffusers-layout "
+            f"{spec.repo} downloaded without a {marker}; not a {spec.adapter}-layout "
             f"repo. Got: {sorted(p.name for p in dest.iterdir())[:12]}")
     return await flyte.io.Dir.from_local(str(dest))
 
@@ -202,14 +206,15 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
                 music_core.write_wav(audio, sr, out_dir / fn)
                 r = music_core.build_track_result(
                     job.label, audio, sr, secs,
-                    sublabel=spec.family, settings=resolved.summary(),
-                    peak_gb=peak, badges=job.badges)
+                    sublabel=spec.family, settings=resolved.summary(spec),
+                    peak_gb=peak, badges=job.badges,
+                    intended_for=spec.intended_for)
                 results.append(r)
                 items.append(TrackItem(
                     label=job.label, filename=fn, seconds=secs,
                     audio_seconds=r.audio_seconds, sample_rate=sr,
                     channels=r.channels, peak_gb=peak,
-                    settings=resolved.summary(), badges=job.badges))
+                    settings=resolved.summary(spec), badges=job.badges))
                 log.info(f"[{model_key}] {i+1}/{len(jobs)} {job.label}: {secs:.1f}s -> "
                          f"{r.audio_seconds:.1f}s audio ({r.speedup:.1f}x RT)")
             except Exception as e:  # one bad job must not kill the rest of the batch
@@ -277,7 +282,8 @@ async def _to_results(run: ModelRun, *, sublabel: str = "", spec=None,
             out.append(music_core.build_track_result(
                 it.label, audio.T, sr, it.seconds, sublabel=sublabel,
                 settings=it.settings, peak_gb=it.peak_gb, badges=it.badges,
-                repro=_repro(i)))
+                repro=_repro(i),
+                intended_for=getattr(spec, "intended_for", "") if spec else ""))
         except Exception as e:
             out.append(TrackResult(label=it.label,
                                    error=f"could not read {it.filename}: {e}"))
