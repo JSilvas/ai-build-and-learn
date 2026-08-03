@@ -29,18 +29,29 @@ spectrogram is unreadable at report size.
 from __future__ import annotations
 
 import base64
+import faulthandler
 import gc
 import html
 import io
-import os
+import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")               # headless: no display, render straight to PNG bytes
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
+
+log = logging.getLogger("acestep.core")
+
+# Print a Python traceback to stderr if this process dies on SIGSEGV/SIGBUS/SIGFPE.
+# Earned the hard way: three renders on this box died with exit 139 and left NOTHING
+# in the logs after "loaded", which is what let a cgroup ceiling masquerade first as a
+# track-length limit and then as a VAE tiling bug. A native crash in a CUDA workload
+# is not exotic on unified memory, and one traceback would have saved two wrong turns.
+faulthandler.enable()
 
 # Past this the <audio> data URI is dropped and only the spectrogram is shown. A 60s
 # stereo 48kHz Vorbis clip is ~1MB, so this is headroom for a full-length track, not a
@@ -49,8 +60,29 @@ MAX_EMBED_BYTES = 8_000_000
 
 # The GB10's "GPU memory" is the same unified pool the OS is using. Letting an
 # allocation run the pool to the wall does not OOM, it HANGS the whole box, so we cap
-# the process before any large load. 0.90 leaves the host something to live on.
-GPU_MEMORY_FRACTION = 0.90
+# the process before any large load.
+#
+# MEASURED AGAINST AVAILABLE, NOT TOTAL, and not against CUDA's idea of "free"
+# either. Both halves of that were learned the expensive way:
+#
+#  1. `set_per_process_memory_fraction` is a fraction of the pool's TOTAL size. On a
+#     unified-memory box every other process spends from the same pool, so a leaky
+#     neighbour holding 19GB is 19GB the renderer cannot have. Cap against total and
+#     torch believes it owns 107GB of a pool with 83GB left, then dies mid-render:
+#     once as a catchable CUDA OOM, once as a bare SIGSEGV with no traceback.
+#
+#  2. The obvious fix, `torch.cuda.mem_get_info()`, is WRONG here and is worse than
+#     doing nothing. On this box it reported "3GB free of 129GB" while the host had
+#     108GB available, because the kernel's ~69GB of page cache counts as not-free
+#     even though it is reclaimable on demand. That capped the process at 2.55GB and
+#     the 11GB model load OOMed instantly.
+#
+# So: read MemAvailable from /proc/meminfo, which is the kernel's own estimate of what
+# is obtainable *including* reclaimable cache, and floor the result so that a bad
+# reading can never cap below what the model needs to load at all.
+GPU_MEMORY_FRACTION = 0.90      # ceiling as a share of the whole pool
+GPU_AVAIL_HEADROOM = 0.92       # and no more than this share of what is available now
+GPU_MIN_FRACTION = 0.30         # ~36GB of a 120GB pool: never cap tighter than this
 
 
 # ── GPU helpers (import-safe on a CPU-only host) ─────────────────────────────────
@@ -85,22 +117,123 @@ def peak_memory_gb() -> float:
     return 0.0
 
 
-def prepare_gpu() -> None:
-    """Clean the pool, cap the process, reset the peak counter.
+def container_memory_limit_gb() -> float:
+    """The cgroup memory ceiling this process actually lives under, in GB. 0 if none.
 
-    The cap is the important line. ACE-Step XL is ~11GB in bf16 and nowhere near the
-    unified pool's limit, but `from_pretrained(...).to("cuda")` briefly holds two
-    copies, and the VAE decode of a long track allocates one very large contiguous
-    activation on top. Both are survivable; running the pool dry on a GB10 is not.
+    A real ceiling that host MemAvailable does not capture: on GB10 the GPU pool IS
+    host memory, so a CUDA allocation is charged to this container's cgroup like any
+    other page, and the box can have 100GB free while the pod is capped at 48GB.
+    Telling torch it may use 92GB inside a 48Gi container is asking for trouble, so
+    always cap against the smaller of the two.
+
+    (Honesty note: this was introduced while hunting a run of SIGSEGVs that turned out
+    to be a libsndfile bug in `encode_audio`, NOT a cgroup overrun. Capping against the
+    cgroup is still correct and still worth doing, it just was not the fix for that.)
     """
-    free_gpu_memory()
+    for path, unlimited in (("/sys/fs/cgroup/memory.max", "max"),                    # v2
+                            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", None)):  # v1
+        try:
+            raw = Path(path).read_text().strip()
+            if not raw or raw == unlimited:
+                continue
+            b = int(raw)
+            # cgroup v1 reports a huge sentinel rather than "max" when unlimited.
+            if 0 < b < (1 << 62):
+                return b / 1e9
+        except Exception:
+            continue
+    return 0.0
+
+
+def host_available_gb() -> float:
+    """The kernel's MemAvailable, in GB. 0.0 if it cannot be read.
+
+    This, not `torch.cuda.mem_get_info()`, is the honest number on a unified-memory
+    box: MemAvailable counts reclaimable page cache, and CUDA's `free` does not (see
+    the constants above for what that cost).
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024 / 1e9   # kB -> bytes -> GB
+    except Exception:
+        pass
+    return 0.0
+
+
+def memory_budget_gb() -> tuple[float, float, float]:
+    """(budget_gb, host_available_gb, cgroup_limit_gb) for this process.
+
+    The budget is the smaller of what the host can spare and what the container is
+    allowed, because on unified memory both are ceilings on the same pages and the
+    tighter one wins.
+    """
+    host = host_available_gb()
+    cg = container_memory_limit_gb()
+    candidates = [x for x in (host, cg) if x > 0]
+    return (min(candidates) if candidates else 0.0), host, cg
+
+
+def gpu_pool_gb() -> tuple[float, float]:
+    """(budget_gb, total_gb) for the pool, or (0, 0) off-GPU.
+
+    `budget` is the min of host MemAvailable and the cgroup limit, NOT CUDA's `free`
+    (which counts reclaimable page cache as used and once reported 3GB of 129GB here).
+    """
     try:
         import torch
         if torch.cuda.is_available():
-            torch.cuda.set_per_process_memory_fraction(GPU_MEMORY_FRACTION)
+            free_b, total_b = torch.cuda.mem_get_info()
+            budget, _, _ = memory_budget_gb()
+            return (budget or free_b / 1e9), total_b / 1e9
+    except Exception:
+        pass
+    return 0.0, 0.0
+
+
+def prepare_gpu() -> float:
+    """Clean the pool, cap the process against what is actually free, reset the peak.
+
+    Returns the cap in GB (0.0 off-GPU) so the caller can log it; a run that later dies
+    on OOM should be able to say what ceiling it was working under.
+
+    The cap is the important line. ACE-Step XL is ~11GB in bf16 and nowhere near the
+    unified pool's limit, but `from_pretrained(...).to("cuda")` briefly holds two
+    copies and a long render allocates far more than the weights on top. Both are
+    survivable; running a GB10's pool dry is not, because it hangs the box instead of
+    raising.
+    """
+    free_gpu_memory()
+    cap_gb = 0.0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            _, total_gb = gpu_pool_gb()
+            budget_gb, host_gb, cgroup_gb = memory_budget_gb()
+            frac = GPU_MEMORY_FRACTION
+            if budget_gb and total_gb:
+                frac = min(frac, GPU_AVAIL_HEADROOM * budget_gb / total_gb)
+            # The floor guards against the cure being worse than the disease: a misread
+            # of AVAILABLE memory must degrade to "roughly unconstrained" rather than a
+            # cap so tight the model cannot load. But a cgroup limit is not a misread,
+            # it is a hard ceiling, so never floor above one we actually read.
+            if frac < GPU_MIN_FRACTION:
+                if cgroup_gb:
+                    log.warning(f"cgroup limits this container to {cgroup_gb:.0f}GB of a "
+                                f"{total_gb:.0f}GB pool; honoring it. Raise the task's "
+                                f"`memory=` if renders need more.")
+                else:
+                    log.warning(f"computed cap {frac:.2f} of pool is implausibly tight "
+                                f"(host available {host_gb:.0f}GB); flooring at "
+                                f"{GPU_MIN_FRACTION:.2f}")
+                    frac = GPU_MIN_FRACTION
+            torch.cuda.set_per_process_memory_fraction(frac)
+            cap_gb = frac * total_gb
     except Exception:
         pass
     reset_peak_memory()
+    return cap_gb
 
 
 # ── Generation settings ──────────────────────────────────────────────────────────
@@ -157,36 +290,90 @@ class GenSettings:
 
 # ── Load + generate ──────────────────────────────────────────────────────────────
 
-def load_pipeline(spec, local_dir: str | None = None):
+def resolve_weights(local_dir: str | None) -> str | None:
+    """Find the diffusers pipeline root inside a downloaded weights Dir.
+
+    The fetch task snapshots with `local_dir=`, so the Dir contains a plain repo
+    layout: `model_index.json` next to `transformer/`, `vae/`, and friends. But the
+    Dir may arrive wrapped in the temp directory's own basename, so look one and two
+    levels down before giving up.
+
+    Returning a PATH rather than pointing `HF_HUB_CACHE` at a cache-layout directory is
+    the whole point, and it was a bug fix, not a style choice. The first version
+    downloaded with `cache_dir=` and set `HF_HUB_CACHE` at load time; the GPU task then
+    re-downloaded all 11GB from HuggingFace anyway, and the uploaded Dir carried the
+    weights twice (once under `blobs/`, once under `snapshots/`, because the upload
+    dereferenced the HF cache's symlinks). Handing `from_pretrained` a local path skips
+    the cache-resolution machinery entirely: no network, no symlinks, no duplication.
+    """
+    if not local_dir:
+        return None
+    p = Path(local_dir)
+    if (p / "model_index.json").exists():
+        return str(p)
+    for cand in sorted(p.glob("*/")) + sorted(p.glob("*/*/")):
+        if (cand / "model_index.json").exists():
+            return str(cand)
+    # Nothing recognizable: fall back to the repo id so the run still works (slowly,
+    # over the network) rather than failing on a layout surprise.
+    return None
+
+
+def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
     """Load one ACE-Step checkpoint onto the GPU.
 
-    `local_dir` points HF_HUB_CACHE at a pre-fetched snapshot (the fetch task's Dir),
-    so this is a disk read, not a download. A cache miss just re-downloads;
-    correctness holds either way.
+    `local_dir` is the fetch task's downloaded Dir. When it holds a usable pipeline
+    root the load is a pure disk read; otherwise we fall back to the repo id and pull
+    from HuggingFace, which is slow but correct.
+
+    `tile` turns on the VAE's tiled decode. Default False, deliberately: see the long
+    note below, it crashed every render over ~20.5s on this box.
     """
     import torch
     from diffusers import AceStepPipeline
 
-    if local_dir:
-        os.environ["HF_HUB_CACHE"] = str(local_dir)
-        os.environ["HF_HOME"] = str(local_dir)
+    root = resolve_weights(local_dir)
+    source = root or spec.repo
+    if local_dir and not root:
+        log.warning(f"no model_index.json under {local_dir}; falling back to "
+                    f"{spec.repo} over the network (this costs a full re-download)")
+    else:
+        log.info(f"loading from {source}")
 
     dtype = getattr(torch, spec.dtype)
-    pipe = AceStepPipeline.from_pretrained(spec.repo, torch_dtype=dtype)
+    pipe = AceStepPipeline.from_pretrained(source, torch_dtype=dtype)
     pipe = pipe.to("cuda")
 
-    # Long-form decode: the VAE otherwise materializes the whole waveform at once, and
-    # a 4-minute stereo 48kHz track is a ~46M-sample activation plus its intermediates.
-    # Tiling bounds that. `enable_tiling()` is the newer API and does not exist on
-    # AutoencoderOobleck in every diffusers release; the attribute underneath always
-    # does, so set whichever is present.
-    try:
-        if hasattr(pipe.vae, "enable_tiling"):
-            pipe.vae.enable_tiling()
-        else:
-            pipe.vae.use_tiling = True
-    except Exception:
-        pass
+    # ── VAE tiling is OFF by default, matching upstream ─────────────────────────────
+    #
+    # An earlier version forced `use_tiling = True` on the theory that a long track
+    # decoded in one shot is a huge contiguous activation. Turning it on was wrong for
+    # a boring reason: diffusers defaults it to False, and on a box with ~90GB of
+    # headroom a whole-track decode fits fine. Tiling is what you reach for on a 12GB
+    # consumer card.
+    #
+    # HISTORICAL NOTE, because the comment that used to live here was confidently
+    # wrong: tiling was briefly blamed for a run of SIGSEGVs on long tracks. The
+    # correlation looked airtight (`tile_latent_min_length` is 512 frames at 25
+    # frames/sec, so tiling engages at ~20.5s, and 20s renders worked while 60s and 90s
+    # died). It was a coincidence. The real cause was libsndfile's Vorbis encoder
+    # crashing in `encode_audio` while building the REPORT, long after the decode had
+    # succeeded, and it reproduced with tiling both on and off. Two unrelated things
+    # happened to share a length threshold. See `encode_audio` for the actual bug.
+    #
+    # `tile=True` remains available for genuinely long renders where a single decode
+    # will not fit. Note the model card's `pipe.vae.enable_tiling()` does not exist on
+    # AutoencoderOobleck in diffusers 0.39 (ModelMixin has no such method), so setting
+    # the attribute is the only way in.
+    if tile:
+        log.info("VAE tiling enabled (non-default): bounding decode memory")
+        try:
+            if hasattr(pipe.vae, "enable_tiling"):
+                pipe.vae.enable_tiling()
+            else:
+                pipe.vae.use_tiling = True
+        except Exception:
+            log.exception("could not enable VAE tiling; continuing without it")
 
     pipe.set_progress_bar_config(disable=True)
     return pipe
@@ -262,6 +449,36 @@ def write_wav(audio, sr: int, path) -> None:
     sf.write(str(path), to_stereo_float32(audio).T, sr, subtype="PCM_16")
 
 
+def encode_audio(data: np.ndarray, sr: int, fmt: str, sub: str) -> bytes:
+    """Encode (samples, channels) audio into an in-memory container.
+
+    ── Written in CHUNKS, and that is not a style choice ────────────────────────────
+    A single large `sf.write()` into libsndfile's Vorbis encoder SEGFAULTS the whole
+    process. Not an exception, not an error return: SIGSEGV, exit 139, no Python
+    traceback unless faulthandler is armed.
+
+    Reproduced standalone on libsndfile 1.2.2 / soundfile 0.14.0, no GPU involved:
+    20s and 30s of 48kHz audio encode fine, 60s and 90s crash. It is a function of the
+    size of the one-shot write, not of the destination or the layout: it crashes to a
+    BytesIO and to a real file alike, and in mono as well as stereo. Writing the same
+    audio through `sf.SoundFile` in ~5 second slices produces a byte-identical-sized
+    file and never crashes.
+
+    This cost four failed cluster runs and two wrong theories (a memory cap, then VAE
+    tiling), because the crash lands AFTER a successful render, while building the
+    report. The give-away in hindsight: the failures tracked audio LENGTH, and the
+    renderer is the only thing downstream of length that touches native code.
+    """
+    buf = io.BytesIO()
+    channels = 1 if data.ndim == 1 else int(data.shape[1])
+    step = max(1, sr * 5)
+    with sf.SoundFile(buf, "w", samplerate=sr, channels=channels,
+                      format=fmt, subtype=sub) as f:
+        for i in range(0, len(data), step):
+            f.write(data[i:i + step])
+    return buf.getvalue()
+
+
 def audio_data_uri(audio, sr: int, budget: int = MAX_EMBED_BYTES) -> tuple[str, str]:
     """(data_uri, note). An empty uri plus a note means 'too big, spectrogram only'.
 
@@ -281,9 +498,7 @@ def audio_data_uri(audio, sr: int, budget: int = MAX_EMBED_BYTES) -> tuple[str, 
     last = ""
     for data, fmt, sub, mime, note in rungs:
         try:
-            buf = io.BytesIO()
-            sf.write(buf, data, sr, format=fmt, subtype=sub)
-            raw = buf.getvalue()
+            raw = encode_audio(data, sr, fmt, sub)
             if len(raw) > budget:
                 last = f"clip is {len(raw)/1e6:.1f} MB, over the embed budget"
                 continue

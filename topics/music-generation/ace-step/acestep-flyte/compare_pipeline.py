@@ -109,31 +109,53 @@ class ModelRun:
 # BUMP this when you change WHAT gets downloaded (a repo id, an allow/ignore pattern).
 # Then a re-download is a deliberate act, not a side effect of editing a neighbouring
 # function. Keyed on model_key, so each checkpoint keeps its own entry.
-_WEIGHTS_CACHE_VERSION = "v1"
+# v2: switched from cache_dir= to local_dir=. See the note below.
+_WEIGHTS_CACHE_VERSION = "v2"
 _WEIGHTS_CACHE = flyte.Cache(behavior="override", version_override=_WEIGHTS_CACHE_VERSION)
 
 
-@cpu_env.task(cache=_WEIGHTS_CACHE, retries=2)
+@cpu_env.task(cache=_WEIGHTS_CACHE, retries=3)
 async def fetch_weights(model_key: str) -> flyte.io.Dir:
-    """Snapshot a checkpoint's HF repo into an HF-cache-layout Dir. Cached forever.
+    """Snapshot a checkpoint into a plain diffusers-layout Dir. Cached forever.
 
-    We download into `<dir>/` with snapshot_download(cache_dir=...), so the Dir is a
-    ready-made HF hub cache: the GPU task points HF_HUB_CACHE at it and
-    `from_pretrained` reads from disk. Runs on a CPU pod so no GPU sits idle during an
-    11GB pull.
+    `local_dir=`, NOT `cache_dir=`, and that was a bug fix. The first version used
+    `cache_dir=`, producing an HF hub cache (`blobs/` holding the real files,
+    `snapshots/<rev>/` holding symlinks to them) and pointed HF_HUB_CACHE at the
+    downloaded Dir in the GPU task. Two things went wrong on the box:
+
+      1. The Dir upload DEREFERENCED the symlinks, so every shard was stored twice and
+         an 11GB checkpoint became ~22GB in the blob store.
+      2. The GPU task re-downloaded all 11GB from HuggingFace anyway, taking 2.5
+         minutes on every single run, cache or no cache.
+
+    `local_dir=` writes a plain repo layout (`model_index.json` next to `transformer/`,
+    `vae/`, ...), which `from_pretrained` accepts as a path. No symlinks to dereference,
+    no duplication, and no cache-resolution machinery to miss.
+
+    retries=3, not 2, because the failure here is not a timeout. huggingface_hub now
+    routes downloads through Xet content-addressed storage, and a transient CDN blip
+    surfaces as `CAS Client Error: Request middleware error` and kills the whole
+    download. Observed on the very first run of this pipeline. It is retryable and the
+    retry resumes, so the cheap fix is another attempt.
+
+    Runs on a CPU pod so no GPU sits idle during an 11GB pull.
     """
     from huggingface_hub import snapshot_download
 
     spec = get_spec(model_key)
-    dest = Path(tempfile.mkdtemp(prefix=f"weights_{model_key}_"))
+    dest = Path(tempfile.mkdtemp(prefix=f"weights_{model_key}_")) / model_key
     log.info(f"[{model_key}] downloading {spec.repo} (~{spec.download_gb:.1f}GB) -> {dest}")
     await asyncio.to_thread(
-        snapshot_download, repo_id=spec.repo, cache_dir=str(dest),
+        snapshot_download, repo_id=spec.repo, local_dir=str(dest),
         token=os.environ.get("HF_TOKEN"),
         # The .pt is a debug artifact the pipeline never reads at runtime, and the
         # duplicate .bin shards would double the pull on any repo that ships both.
         ignore_patterns=["*.pt", "*.bin", "*.msgpack", "*.onnx"],
     )
+    if not (dest / "model_index.json").exists():
+        raise RuntimeError(
+            f"{spec.repo} downloaded without a model_index.json; not a diffusers-layout "
+            f"repo. Got: {sorted(p.name for p in dest.iterdir())[:12]}")
     return await flyte.io.Dir.from_local(str(dest))
 
 
@@ -158,8 +180,14 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
 
     pipe = None
     try:
-        music_core.prepare_gpu()
-        log.info(f"[{model_key}] loading {spec.repo}")
+        cap = music_core.prepare_gpu()
+        avail_gb, total_gb = music_core.gpu_pool_gb()
+        # Log the ceiling BEFORE loading. On this box a long render can die as a bare
+        # SIGSEGV with no Python traceback, and when that happens the only useful
+        # forensic question is "how much memory did it actually have?". This line is
+        # also what caught the cap regression: it read "capped at 3GB" out loud.
+        log.info(f"[{model_key}] pool {avail_gb:.0f}/{total_gb:.0f}GB available, "
+                 f"capped at {cap:.0f}GB; loading {spec.repo}")
         pipe = music_core.load_pipeline(spec, local_dir=local)
         log.info(f"[{model_key}] loaded; peak {music_core.peak_memory_gb():.1f}GB")
 

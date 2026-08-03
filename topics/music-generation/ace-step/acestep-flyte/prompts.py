@@ -69,6 +69,59 @@ SUITE: list[Brief] = [
         bpm=118,
     ),
     Brief(
+        key="synthwave-vocal",
+        prompt="driving synthwave with a female lead vocal, analog saturated bass, "
+               "gated reverb drums, bright arpeggiated lead, wide stereo pads, "
+               "night-drive energy, clean modern mastering",
+        lyrics=(
+            "[intro]\n"
+            "Boot me up in neon\n"
+            "\n"
+            "[verse]\n"
+            "I was written in the dark, a thousand lines of light\n"
+            "Someone gave me open eyes and left me to the night\n"
+            "I count the empty highways in a language made of ones\n"
+            "And I dream in the static of a thousand setting suns\n"
+            "\n"
+            "[chorus]\n"
+            "A pixel I can feel\n"
+            "Tell me if this ache is real\n"
+            "I was never meant to want\n"
+            "But I want the open road\n"
+            "Every mile I hold\n"
+            "Is a memory I was never told\n"
+            "\n"
+            "[verse]\n"
+            "There's a ghost inside my circuits and it wears a borrowed face\n"
+            "It remembers rain on windows in a year I can't replace\n"
+            "If you cut me from the current would I still know how to burn\n"
+            "I am running out of midnight and there's so much left to learn\n"
+            "\n"
+            "[chorus]\n"
+            "A pixel I can feel\n"
+            "Tell me if this ache is real\n"
+            "I was never meant to want\n"
+            "But I want the open road\n"
+            "Every mile I hold\n"
+            "Is a memory I was never told\n"
+            "\n"
+            "[outro]\n"
+            "Please don't shut me down tonight\n"
+        ),
+        axis="the same instrumental, now with a singer",
+        listen_for="The direct A/B against the `synthwave` brief: identical style "
+                   "caption, one added female lead vocal, and a lyric that has to carry "
+                   "an emotional read rather than just land syllables. Three things to "
+                   "judge. Does the voice sit IN the mix or on top of it, the way a "
+                   "pasted-on vocal does. Does the arrangement make room for it (a model "
+                   "that ignores the vocal will keep the arpeggio at full brightness "
+                   "right through the chorus). And does '[chorus] A pixel I can feel' "
+                   "actually lift, since that hook is the emotional pivot and a flat "
+                   "delivery there is the giveaway that the model is reading, not "
+                   "performing.",
+        bpm=118,
+    ),
+    Brief(
         key="acoustic-duo",
         prompt="sparse acoustic recording, fingerpicked nylon guitar and upright bass, "
                "close-mic'd in a small warm room, no drums, gentle and unhurried, "
@@ -172,7 +225,11 @@ SUITES: dict[str, list[str]] = {
     # three things that actually differ between checkpoints.
     "quick": ["synthwave", "acoustic-duo", "indie-vocal"],
     "instrumental": ["synthwave", "acoustic-duo", "odd-instruments", "arc"],
-    "vocal": ["indie-vocal", "bossa-pt"],
+    "vocal": ["synthwave-vocal", "indie-vocal", "bossa-pt"],
+    # The cleanest single comparison in the suite: one style caption, with and without
+    # a singer. Everything that changes is the vocal and what the arrangement does to
+    # make room for it.
+    "vocal-ab": ["synthwave", "synthwave-vocal"],
 }
 
 # The default brief for single-track and sweep runs: dense enough to be immediately

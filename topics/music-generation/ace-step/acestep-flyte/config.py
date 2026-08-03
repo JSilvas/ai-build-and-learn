@@ -63,7 +63,6 @@ _COMMON = (
     "numpy",
     "matplotlib",
     "huggingface_hub",
-    "hf_transfer",
     "kubernetes",     # config.py imports kubernetes.client at module top
 )
 
@@ -89,7 +88,7 @@ gen_image = _base("acestep-gen").with_pip_packages(
 # torch-free image that builds in a fraction of the time.
 fetch_image = (
     flyte.Image.from_debian_base(name="acestep-fetch", registry=REGISTRY, platform=PLATFORM)
-    .with_pip_packages("huggingface_hub", "hf_transfer", "kubernetes", "numpy",
+    .with_pip_packages("huggingface_hub", "kubernetes", "numpy",
                        "soundfile", "matplotlib")
 )
 
@@ -108,13 +107,27 @@ _SPARK_ENV = {
     "CUDA_MODULE_LOADING": "EAGER",
 }
 
-_ENV_VARS = {"HF_HOME": HF_HOME, "HF_HUB_ENABLE_HF_TRANSFER": "1"}
-
-# The fetch task turns hf_transfer OFF on purpose: it is a Rust downloader that does
-# its own DNS and bypasses the timeout knobs, so a stalled socket hangs forever. The
-# plain Python downloader honors HF_HUB_DOWNLOAD_TIMEOUT (a per-read bound), so a hung
-# read fails in ~60s and snapshot_download resumes from the .incomplete file.
-_FETCH_ENV_VARS = {**_ENV_VARS, "HF_HUB_ENABLE_HF_TRANSFER": "0", "HF_HUB_DOWNLOAD_TIMEOUT": "60"}
+# NOTE: no HF_HUB_ENABLE_HF_TRANSFER here, and that is deliberate.
+#
+# The image and video demos next door set it, and the TTS demo goes further: it turns
+# hf_transfer OFF in the fetch task so that HF_HUB_DOWNLOAD_TIMEOUT can bound a stalled
+# read. That lore is now DEAD. Current huggingface_hub routes downloads through Xet
+# (content-addressed storage) and ignores hf_transfer entirely; setting the variable
+# only earns a FutureWarning in every pod's logs:
+#
+#   The `HF_HUB_ENABLE_HF_TRANSFER` environment variable is deprecated as
+#   'hf_transfer' is not used anymore. Please use `HF_XET_HIGH_PERFORMANCE` instead.
+#
+# HF_HUB_DOWNLOAD_TIMEOUT does not bound the Xet path either, so the stall protection
+# it was bought for no longer exists. What actually happens on a bad fetch is a hard
+# error, observed on this pipeline's first run:
+#
+#   CAS Client Error: Request middleware error: error sending request for url (...)
+#
+# That is retryable and the retry resumes, so the protection now lives in
+# fetch_weights' `retries=3` rather than in an environment variable.
+_ENV_VARS = {"HF_HOME": HF_HOME}
+_FETCH_ENV_VARS = dict(_ENV_VARS)
 
 _GPU_ENV_VARS = {**_ENV_VARS, **_SPARK_ENV}
 
@@ -136,10 +149,20 @@ cpu_env = flyte.TaskEnvironment(
     env_vars=_FETCH_ENV_VARS,
 )
 
+# memory="96Gi", up from 48Gi. On GB10 the GPU pool IS host memory, so every CUDA
+# allocation is charged to this pod's cgroup: the ceiling has to be sized for the
+# RENDER, not for the 11GB of weights. music_core.prepare_gpu caps torch against this
+# same cgroup limit so the two can never disagree.
+#
+# Raised while chasing a run of SIGSEGVs on long tracks that turned out to be a
+# libsndfile bug in the report renderer, not a cgroup overrun (see
+# music_core.encode_audio). So this is headroom rather than a proven fix; 48Gi may well
+# be sufficient. Left at 96Gi because long renders on a 120GB box have no reason to be
+# tight, but do not treat this number as load-bearing evidence of anything.
 gpu_env = flyte.TaskEnvironment(
     name="acestep-gen",
     image=gen_image,
-    resources=flyte.Resources(cpu="8", memory="48Gi", gpu=1, disk="80Gi"),
+    resources=flyte.Resources(cpu="8", memory="96Gi", gpu=1, disk="80Gi"),
     secrets=[HF_SECRET],
     env_vars=_GPU_ENV_VARS,
 )
