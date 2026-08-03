@@ -33,7 +33,9 @@ import faulthandler
 import gc
 import html
 import io
+import json
 import logging
+import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -273,6 +275,10 @@ class GenSettings:
         if spec.distilled and out.guidance > 1.0:
             out.guidance = 1.0
         return out
+
+    def as_dict(self) -> dict:
+        """The knobs as plain JSON-able data. Resolve() first if you want what ran."""
+        return dict(vars(self))
 
     def summary(self) -> str:
         """The one-line settings string under a report card."""
@@ -554,6 +560,86 @@ def waveform_spectrogram_png(audio, sr: int) -> str:
     return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
 
 
+# ── Reproducing a card ───────────────────────────────────────────────────────────
+#
+# The report used to show settings as prose: "seed 42 · 8 steps · cfg 1 · shift 3".
+# Fine for reading, useless for acting. The whole point of a comparison is that one
+# cell is closer than the others, and the next thing you want is that cell again with
+# one thing changed. Retyping six parameters off a screenshot is where that intent
+# goes to die.
+#
+# So every card also carries a Repro: the exact command that made it, plus the same
+# thing as JSON. Note the settings are the RESOLVED ones (turbo's coerced cfg, each
+# checkpoint's own step count), so the command reproduces what actually ran rather
+# than what was asked for.
+#
+# No copy button, deliberately: Flyte reports render under a CSP that drops <script>,
+# so a clipboard widget would be dead HTML. A <details> block with selectable text
+# works everywhere, including in the standalone HTML run_local writes.
+
+
+@dataclass
+class Repro:
+    """Everything needed to make one card again."""
+    model_key: str
+    prompt: str
+    lyrics: str = ""
+    brief: str = ""              # the named brief this came from, if any
+    settings: dict = field(default_factory=dict)
+    entrypoint: str = "generate_one"
+
+    def as_json(self) -> str:
+        return json.dumps({
+            "entrypoint": self.entrypoint,
+            "model_key": self.model_key,
+            "brief": self.brief,
+            "prompt": self.prompt,
+            "lyrics": self.lyrics,
+            "settings": self.settings,
+        }, indent=2)
+
+    def as_cli(self) -> str:
+        """A runnable `flyte run` line.
+
+        Prefers `--brief` when the card came from one: it keeps the command to a
+        readable length and it is exact, because the brief carries the prompt AND the
+        lyrics AND the musical metadata. Falls back to an inline `--prompt`, which for
+        a lyric of any size is genuinely unwieldy, which is what the JSON is for.
+        """
+        parts = ["flyte run compare_pipeline.py", self.entrypoint,
+                 f"--model_key {shlex.quote(self.model_key)}"]
+        if self.brief:
+            parts.append(f"--brief {shlex.quote(self.brief)}")
+        else:
+            parts.append(f"--prompt {shlex.quote(self.prompt)}")
+            if self.lyrics.strip():
+                parts.append(f"--lyrics {shlex.quote(self.lyrics)}")
+        s = self.settings
+        for flag, key in (("--duration", "duration"), ("--seed", "seed"),
+                          ("--steps", "steps"), ("--guidance", "guidance"),
+                          ("--shift", "shift")):
+            if key in s:
+                v = s[key]
+                parts.append(f"{flag} {v:g}" if isinstance(v, float) else f"{flag} {v}")
+        # Only emit the musical metadata when it was actually set; a brief already
+        # carries its own, and repeating it adds noise without changing the result.
+        if not self.brief:
+            if s.get("bpm"):
+                parts.append(f"--bpm {s['bpm']}")
+            if s.get("keyscale"):
+                parts.append(f"--keyscale {shlex.quote(s['keyscale'])}")
+            if s.get("language") and s["language"] != "en":
+                parts.append(f"--language {shlex.quote(s['language'])}")
+        return " \\\n    ".join(parts)
+
+
+def build_repro(spec, job_prompt: str, job_lyrics: str, settings: "GenSettings",
+                brief: str = "", entrypoint: str = "generate_one") -> Repro:
+    """Repro for one card, with `settings` resolved against the checkpoint."""
+    return Repro(model_key=spec.key, prompt=job_prompt, lyrics=job_lyrics, brief=brief,
+                 settings=settings.resolve(spec).as_dict(), entrypoint=entrypoint)
+
+
 # ── Report data ──────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -572,6 +658,7 @@ class TrackResult:
     badges: list[str] = field(default_factory=list)
     embed_note: str = ""
     error: str = ""
+    repro: Repro | None = None   # how to make this card again
 
     @property
     def speedup(self) -> float:
@@ -581,7 +668,8 @@ class TrackResult:
 
 def build_track_result(label: str, audio, sr: int, seconds: float, *,
                        sublabel: str = "", settings: str = "", peak_gb: float = 0.0,
-                       badges: list[str] | None = None) -> TrackResult:
+                       badges: list[str] | None = None,
+                       repro: Repro | None = None) -> TrackResult:
     a = to_stereo_float32(audio)
     audio_seconds = a.shape[1] / float(sr) if sr else 0.0
     uri, note = audio_data_uri(a, sr)
@@ -590,7 +678,7 @@ def build_track_result(label: str, audio, sr: int, seconds: float, *,
         seconds=seconds, audio_seconds=audio_seconds, sample_rate=sr,
         channels=int(a.shape[0]), audio_uri=uri,
         spec_uri=waveform_spectrogram_png(a, sr),
-        peak_gb=peak_gb, badges=list(badges or []), embed_note=note,
+        peak_gb=peak_gb, badges=list(badges or []), embed_note=note, repro=repro,
     )
 
 
@@ -639,6 +727,13 @@ REPORT_CSS = """
   .mg-set { color: #4338ca; font-size: 11.5px; margin-top: 6px; font-variant-numeric: tabular-nums; }
   .mg-sub { color: #6b7280; font-size: 12px; margin-top: 4px; line-height: 1.4;
             font-variant-numeric: tabular-nums; }
+  .mg-repro { padding: 0 11px 10px; font-size: 12px; color: #4b5563; }
+  .mg-repro summary { cursor: pointer; color: #6d28d9; font-weight: 600; }
+  .mg-repro pre { white-space: pre-wrap; word-break: break-word; font-size: 11px;
+                  line-height: 1.45; background: #faf5ff; border: 1px solid #e9d5ff;
+                  border-radius: 6px; padding: 8px 10px; margin: 6px 0 0;
+                  user-select: all; }
+  .mg-repro .mg-hint { margin-top: 6px; color: #6b7280; font-size: 11px; }
   .mg-err { padding: 16px; color: #b91c1c; font-size: 13px; white-space: pre-wrap; }
   .mg-warn { padding: 8px 11px; color: #92400e; background: #fffbeb; font-size: 12px; }
   #mg-lb { position: fixed; inset: 0; z-index: 9999; display: none; cursor: zoom-out;
@@ -695,7 +790,20 @@ def _cell(r: TrackResult) -> str:
                 if r.sublabel else "")
     cap = (f'<div class="mg-cap"><div class="mg-model">{html.escape(r.label)}</div>'
            f'{tags}{fast}{settings}{sub}{sublabel}</div>')
-    return f'<div class="mg-cell">{img}{_player(r)}{note}{cap}</div>'
+    return f'<div class="mg-cell">{img}{_player(r)}{note}{cap}{_repro(r)}</div>'
+
+
+def _repro(r: TrackResult) -> str:
+    """The 'make this one again' block: the exact command, and the same as JSON."""
+    if not r.repro:
+        return ""
+    return (
+        '<details class="mg-repro"><summary>reproduce / tweak this one</summary>'
+        f'<pre>{html.escape(r.repro.as_cli())}</pre>'
+        '<div class="mg-hint">Change one flag to iterate. The settings above are what '
+        'actually ran, not what was requested.</div>'
+        f'<pre>{html.escape(r.repro.as_json())}</pre></details>'
+    )
 
 
 def _block(b: Block) -> str:

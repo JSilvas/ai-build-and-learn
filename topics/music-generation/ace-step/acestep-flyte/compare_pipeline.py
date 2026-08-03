@@ -237,7 +237,9 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
 
 # ── Re-derive report objects from a run's wavs, in the parent ────────────────────
 
-async def _to_results(run: ModelRun, *, sublabel: str = "") -> list[TrackResult]:
+async def _to_results(run: ModelRun, *, sublabel: str = "", spec=None,
+                      jobs: list[GenJob] | None = None,
+                      brief: str = "") -> list[TrackResult]:
     """Read a run's wavs back out and rebuild TrackResults (with the embedded audio and
     spectrogram) for the aggregate report.
 
@@ -245,17 +247,28 @@ async def _to_results(run: ModelRun, *, sublabel: str = "") -> list[TrackResult]
     run every job from one checkpoint carries the same label (the checkpoint's name,
     which is what the card should say), so a label-keyed dict would silently collapse N
     briefs into one. Position is the only identity that survives.
+
+    `spec` + `jobs` attach a Repro to each card. They are rebuilt HERE rather than
+    shipped back from the GPU task, because `GenSettings.resolve(spec)` is
+    deterministic: the parent already holds the job it sent and the spec it sent it to,
+    so it can derive exactly what ran without widening the task boundary.
     """
     # A checkpoint that failed EVERY job still returns a non-None but EMPTY Dir, and
     # downloading an empty Dir raises DownloadQueueEmpty in the parent, which would
     # take the whole comparison down. So check there is something to download first.
+    def _repro(i: int):
+        if spec is None or not jobs or i >= len(jobs):
+            return None
+        j = jobs[i]
+        return music_core.build_repro(spec, j.prompt, j.lyrics, j.settings, brief=brief)
+
     if not run.tracks or not any(it.filename and not it.error for it in run.items):
         return [TrackResult(label=it.label, error=it.error or "no output")
                 for it in run.items]
 
     local = Path(await run.tracks.download())
     out: list[TrackResult] = []
-    for it in run.items:
+    for i, it in enumerate(run.items):
         if it.error or not it.filename:
             out.append(TrackResult(label=it.label, error=it.error or "no output"))
             continue
@@ -263,7 +276,8 @@ async def _to_results(run: ModelRun, *, sublabel: str = "") -> list[TrackResult]
             audio, sr = sf.read(str(local / it.filename), dtype="float32", always_2d=True)
             out.append(music_core.build_track_result(
                 it.label, audio.T, sr, it.seconds, sublabel=sublabel,
-                settings=it.settings, peak_gb=it.peak_gb, badges=it.badges))
+                settings=it.settings, peak_gb=it.peak_gb, badges=it.badges,
+                repro=_repro(i)))
         except Exception as e:
             out.append(TrackResult(label=it.label,
                                    error=f"could not read {it.filename}: {e}"))
@@ -353,7 +367,8 @@ async def compare(
                                 for _ in the_briefs]
             continue
         runs.append(res)
-        per_model[s.key] = await _to_results(res, sublabel=s.family)
+        per_model[s.key] = await _to_results(res, sublabel=s.family, spec=s,
+                                             jobs=jobs_by_model[s.key])
 
     blocks = []
     for i, b in enumerate(the_briefs):
@@ -362,7 +377,12 @@ async def compare(
             if s.key in fetch_errors:
                 cards.append(TrackResult(label=s.key, error=fetch_errors[s.key]))
             else:
-                cards.append(_at(per_model.get(s.key, []), i, s.key))
+                card = _at(per_model.get(s.key, []), i, s.key)
+                # Each card in this row came from brief `b`, so name it in the repro:
+                # `--brief acoustic-duo` beats inlining a paragraph of prompt text.
+                if card.repro is not None:
+                    card.repro.brief = b.key
+                cards.append(card)
         blocks.append(Block(heading=f"{b.key}: {b.axis}", note=b.listen_for,
                             prompt=b.prompt, lyrics=b.lyrics, results=cards))
 
@@ -442,7 +462,8 @@ async def sweep(
                            prompt=b.prompt, lyrics=b.lyrics, badges=badges, settings=st))
 
     run = await render.override(short_name=f"sweep {axis}")(model_key, w, jobs)
-    cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}")
+    cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}",
+                              spec=spec, jobs=jobs, brief=brief)
 
     block = Block(heading=f"{ax.label}: {brief} on {model_key}",
                   note=ax.listen_for + warn,
@@ -488,12 +509,16 @@ async def generate_one(
                      keyscale=keyscale or ("" if prompt else b.keyscale),
                      language=language)
 
+    jobs = [GenJob(label=model_key, prompt=the_prompt, lyrics=the_lyrics,
+                   badges=[spec.params], settings=st)]
     w = await fetch_weights.override(short_name=f"fetch {model_key}")(model_key)
-    run = await render.override(short_name=f"render {model_key}")(
-        model_key, w, [GenJob(label=model_key, prompt=the_prompt, lyrics=the_lyrics,
-                              badges=[spec.params], settings=st)])
+    run = await render.override(short_name=f"render {model_key}")(model_key, w, jobs)
 
-    cards = await _to_results(run, sublabel=spec.family)
+    # `brief` only names the card honestly when the brief actually supplied the text;
+    # a caller-supplied --prompt overrides it, and claiming otherwise would emit a
+    # command that reproduces something different from what you are looking at.
+    cards = await _to_results(run, sublabel=spec.family, spec=spec, jobs=jobs,
+                              brief="" if prompt else brief)
     block = Block(heading=f"{model_key}: single track", note=spec.notes,
                   prompt=the_prompt, lyrics=the_lyrics,
                   results=[_at(cards, 0, model_key)])

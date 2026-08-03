@@ -119,7 +119,9 @@ def main(model_key, brief, prompt, lyrics, sweep_axis, values, duration, seed, s
             music_core.write_wav(audio, sr, wav_path)
             r = music_core.build_track_result(
                 label, audio, sr, secs, sublabel=spec.family,
-                settings=resolved.summary(), peak_gb=peak)
+                settings=resolved.summary(), peak_gb=peak,
+                repro=music_core.build_repro(spec, the_prompt, the_lyrics, st,
+                                             brief="" if prompt else brief))
             results.append(r)
             click.echo(f"  {i+1}/{len(jobs)} {label}: {secs:.1f}s render -> "
                        f"{r.audio_seconds:.1f}s audio ({r.speedup:.1f}x RT, "
