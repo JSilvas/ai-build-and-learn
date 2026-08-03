@@ -75,6 +75,7 @@ class MusicModelSpec:
     shift: float = 3.0
 
     distilled: bool = False   # guidance-distilled: guidance_scale > 1 is ignored
+    gated: bool = False       # HF repo needs terms accepted on the HF_TOKEN account
     dtype: str = "bfloat16"   # GB10 (Blackwell) is happiest in bf16
     notes: str = ""
 
@@ -153,6 +154,89 @@ MODELS: dict[str, MusicModelSpec] = {
               "checkpoint yet caps out at 30s of instrumental, which is a fair "
               "one-line summary of how much moved in a year.",
     ),
+    # ── AudioLDM 2 (Liu et al. / CVSSP) ──────────────────────────────────────────
+    #
+    # A THIRD architecture: latent diffusion over a mel VAE, conditioned by a GPT-2
+    # that bridges CLAP audio-text embeddings and T5 text embeddings, decoded by a
+    # HiFi-GAN vocoder. Not a flow-matching DiT, not an autoregressive token model.
+    #
+    # Its real contribution to the report is the FIDELITY axis. It renders 16kHz MONO,
+    # so on the card's full-Nyquist spectrogram it shows a hard ceiling at 8kHz next to
+    # ACE-Step's content out to 24kHz. That single image explains "audio quality" better
+    # than any adjective, and it is why the spectrogram is not cropped to the voice band.
+    #
+    # `-music` is the music-finetuned variant; plain `cvssp/audioldm2` is general audio
+    # and `-large` is bigger but not music-specific. Ungated, and diffusers-native, so
+    # once again no new image.
+    "audioldm2-music": MusicModelSpec(
+        key="audioldm2-music",
+        repo="cvssp/audioldm2-music",
+        family="AudioLDM 2 · latent diffusion + CLAP/GPT-2/T5 conditioning",
+        license="CC-BY-NC-SA-4.0 (non-commercial)",
+        params="~1.1B across the stack",
+        download_gb=4.5,
+        sample_rate=16000,
+        adapter="audioldm2",
+        intended_for="Short instrumental clips and textures at 16kHz MONO. No lyrics, "
+                     "no vocals. The fidelity floor in this comparison, by design.",
+        max_duration=30.0,
+        steps=200,          # the model card's own recommendation, and it is slow
+        guidance=3.5,
+        notes="200 denoising steps is its documented default, not a handicap we chose. "
+              "Cheapest download in the registry at 4.5GB. Sweet spot is ~10s; it was "
+              "trained on 10s segments and drifts on longer asks.",
+    ),
+
+    # ── Stable Audio Open (Stability AI) ─────────────────────────────────────────
+    #
+    # The most interesting comparison in the registry after ACE-Step, for three reasons.
+    #
+    # 1. ARCHITECTURE. It is the only other DiT here: autoencoder + T5 text encoder +
+    #    transformer diffusion in latent space. MusicGen is autoregressive and AudioLDM2
+    #    is a UNet, so this is the closest like-for-like against ACE-Step.
+    # 2. DATES. June 2024, sitting between MusicGen/AudioLDM2 (2023) and ACE-Step 1.5 XL
+    #    (April 2026). Listening to the three in order is a timeline, not a leaderboard.
+    # 3. TRAINING DATA. ~48k recordings from Freesound and the Free Music Archive, all
+    #    CC0 / CC BY / CC Sampling+. It is the only model here trained exclusively on
+    #    licensed audio, which for a stream about *open* music generation is a sharper
+    #    talking point than any quality delta.
+    #
+    # GATED (auto-approve): accept the terms at
+    # huggingface.co/stabilityai/stable-audio-open-1.0 on the account behind HF_TOKEN,
+    # or fetch_weights fails with a 401. Nothing in this repo can do that for you.
+    #
+    # Sound-design first, songs second: it is very good at textures, SFX and short
+    # instrumental beds, and it does not sing.
+    "stable-audio": MusicModelSpec(
+        key="stable-audio",
+        repo="stabilityai/stable-audio-open-1.0",
+        family="Stable Audio Open · latent DiT + T5",
+        license="Stability AI Community License (the model card is gated; read it "
+                "before shipping anything commercial)",
+        params="~1.3B DiT + T5",
+        download_gb=15.7,
+        sample_rate=44100,
+        adapter="stableaudio",
+        intended_for="Up to 47s of 44.1kHz stereo. Sound design, textures and short "
+                     "instrumental beds. No lyrics, no vocals. Trained only on "
+                     "CC-licensed audio.",
+        max_duration=47.0,
+        steps=100, guidance=7.0,     # the pipeline's own defaults
+        gated=True,
+        # float16, NOT the bf16 every other model here uses, and this is load-bearing.
+        # The scheduler's noise sampler transforms sigmas with `sigma.log().neg()`, so a
+        # sigma that underflows to exactly 0 becomes +inf and torchsde's interval search
+        # never terminates: RecursionError at any limit, including 50,000. bf16 has ~3
+        # decimal digits of mantissa against fp16's ~3.3 and a much coarser step near
+        # zero, and the diffusers docs for this model use fp16 throughout. Every other
+        # model in the registry is genuinely happier in bf16 on Blackwell; this one is
+        # not, which is exactly why dtype lives on the spec rather than in the loader.
+        dtype="float16",
+        notes="Prompt it like a sound designer, not a songwriter: the docs are explicit "
+              "that descriptive, context-specific prompts ('melodic techno with a fast "
+              "beat and synths') beat bare genre tags ('techno').",
+    ),
+
     "musicgen-melody": MusicModelSpec(
         key="musicgen-melody",
         repo="facebook/musicgen-melody",

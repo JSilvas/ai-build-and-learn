@@ -86,6 +86,31 @@ GPU_MEMORY_FRACTION = 0.90      # ceiling as a share of the whole pool
 GPU_AVAIL_HEADROOM = 0.92       # and no more than this share of what is available now
 GPU_MIN_FRACTION = 0.30         # ~36GB of a 120GB pool: never cap tighter than this
 
+# ── Which knobs does each adapter actually honour? ───────────────────────────────
+#
+# The single source of truth for "does this model have this dial", used by the report
+# card, by the reproduce command, and by the studio's Advanced panel. Printing a knob a
+# model does not have is the same class of dishonesty as printing a value it silently
+# ignored, and once a registry spans architectures the answer stops being guessable:
+#
+#   acestep   flow-matching DiT   : steps, guidance, shift, and musical metadata
+#   musicgen  autoregressive      : guidance only. No denoising steps, no flow shift.
+#   audioldm2 latent diffusion    : steps and guidance, but no shift and no metadata
+#
+# A binary "is it diffusion" test was not enough: AudioLDM2 has steps but no shift.
+ADAPTER_KNOBS: dict[str, set[str]] = {
+    "acestep": {"steps", "guidance", "shift", "bpm", "keyscale", "timesignature",
+                "language", "lyrics"},
+    "musicgen": {"guidance"},
+    "audioldm2": {"steps", "guidance"},
+    "stableaudio": {"steps", "guidance"},
+}
+
+
+def knobs_for(adapter: str) -> set[str]:
+    """The knobs an adapter honours; an unknown adapter gets the shared minimum."""
+    return ADAPTER_KNOBS.get(adapter, {"guidance"})
+
 
 # ── GPU helpers (import-safe on a CPU-only host) ─────────────────────────────────
 
@@ -317,12 +342,13 @@ class GenSettings:
         that stays.
         """
         adapter = getattr(spec, "adapter", "acestep") if spec is not None else "acestep"
-        diffusion = adapter != "musicgen"
+        has = knobs_for(adapter)
         bits = [f"seed {self.seed}"]
-        if diffusion:
+        if "steps" in has:
             bits.append(f"{self.steps} steps")
-        bits.append(f"cfg {self.guidance:g}")
-        if diffusion:
+        if "guidance" in has:
+            bits.append(f"cfg {self.guidance:g}")
+        if "shift" in has:
             bits.append(f"shift {self.shift:g}")
         bits.append(f"{self.duration:g}s")
         if self.bpm:
@@ -378,7 +404,88 @@ def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
     """
     if spec.adapter == "musicgen":
         return _load_musicgen(spec, local_dir)
+    if spec.adapter == "audioldm2":
+        return _load_audioldm2(spec, local_dir)
+    if spec.adapter == "stableaudio":
+        return _load_stableaudio(spec, local_dir)
     return _load_acestep(spec, local_dir, tile)
+
+
+def _load_stableaudio(spec, local_dir: str | None = None):
+    """Stable Audio Open: autoencoder + T5 + latent DiT, 44.1kHz stereo.
+
+    The closest architectural like-for-like against ACE-Step in this registry, and the
+    only other transformer-diffusion model here.
+    """
+    import torch
+    from diffusers import StableAudioPipeline
+
+    source = resolve_weights(local_dir, marker="model_index.json") or spec.repo
+    log.info(f"loading stable-audio from {source}")
+    pipe = StableAudioPipeline.from_pretrained(source, torch_dtype=getattr(torch, spec.dtype))
+    pipe = pipe.to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    return pipe
+
+
+def _load_audioldm2(spec, local_dir: str | None = None):
+    """AudioLDM 2: latent diffusion with a GPT-2 bridging CLAP and T5 embeddings.
+
+    A third architecture in the registry and the one that most changes what the report
+    looks like, because it decodes through a HiFi-GAN vocoder at **16kHz mono** rather
+    than ACE-Step's 48kHz stereo. That is not a small difference: on the card's
+    full-Nyquist spectrogram it shows up as a hard ceiling at 8kHz, right next to a
+    track that has content out to 24kHz. It is the clearest single image in the whole
+    demo for what "audio quality" means before you have listened to anything.
+    """
+    import torch
+    from diffusers import AudioLDM2Pipeline
+
+    source = resolve_weights(local_dir, marker="model_index.json") or spec.repo
+    log.info(f"loading audioldm2 from {source}")
+    pipe = AudioLDM2Pipeline.from_pretrained(source, torch_dtype=getattr(torch, spec.dtype))
+    pipe = pipe.to("cuda")
+    pipe.set_progress_bar_config(disable=True)
+    _shim_audioldm2_generation(pipe)
+    return pipe
+
+
+def _shim_audioldm2_generation(pipe) -> None:
+    """Re-attach the generation helper transformers 5 removed from `PreTrainedModel`.
+
+    diffusers 0.39's AudioLDM2 pipeline drives its GPT-2 "language model" by hand and
+    calls `_update_model_kwargs_for_generation` on it. Until transformers 4.53,
+    `PreTrainedModel` inherited `GenerationMixin` so every model had that method; from
+    4.53 onward it does not, and on 5.x the pipeline dies with:
+
+        AttributeError: 'GPT2Model' object has no attribute
+                        '_update_model_kwargs_for_generation'
+
+    The alternatives were worse. Pinning the shared image to transformers<4.53 would
+    drag ACE-Step and MusicGen back fifteen months to accommodate the oldest and
+    weakest model in the registry; a separate image for AudioLDM2 would mean pairing a
+    2026 diffusers with a 2025 transformers and hoping. Binding the one missing method
+    back onto the instance is smaller than either, and it is honest about being a
+    workaround for an upstream lag rather than a fix.
+
+    Deliberately narrow: it patches ONE method on ONE instance, only when missing, and
+    it is loud if the shim itself stops applying.
+    """
+    import types
+
+    target = getattr(pipe, "language_model", None)
+    if target is None or hasattr(target, "_update_model_kwargs_for_generation"):
+        return
+    try:
+        from transformers.generation import GenerationMixin
+
+        target._update_model_kwargs_for_generation = types.MethodType(
+            GenerationMixin._update_model_kwargs_for_generation, target)
+        log.info("shimmed _update_model_kwargs_for_generation onto AudioLDM2's GPT-2 "
+                 "(transformers >=4.53 dropped it from PreTrainedModel)")
+    except Exception:
+        log.exception("could not shim AudioLDM2's language model; generation will "
+                      "likely fail on this transformers version")
 
 
 def _load_musicgen(spec, local_dir: str | None = None):
@@ -471,7 +578,174 @@ def generate(pipe, spec, prompt: str, lyrics: str = "",
     """
     if spec.adapter == "musicgen":
         return _generate_musicgen(pipe, spec, prompt, settings)
+    if spec.adapter == "audioldm2":
+        return _generate_audioldm2(pipe, spec, prompt, settings)
+    if spec.adapter == "stableaudio":
+        return _generate_stableaudio(pipe, spec, prompt, settings)
     return _generate_acestep(pipe, spec, prompt, lyrics, settings)
+
+
+# The diffusers docs are explicit that a negative prompt "can significantly improve the
+# quality of the generated audio" for this model, and name this exact string. Applying
+# it by default means the comparison uses the model the way its authors intend.
+STABLE_AUDIO_NEGATIVE = "Low quality, average quality"
+
+
+def _widen_brownian_interval() -> None:
+    """Make the SDE noise sampler's Brownian tree span the sigmas it will be asked for.
+
+    THE root cause of Stable Audio's `RecursionError`, found by instrumenting rather
+    than guessing. Measured on the box:
+
+        interval = [0.3, 500]        (scheduler config sigma_min / sigma_max)
+        sigmas   = 500.00006 ... 0.323, 0.3, 0.0      (101 values)
+        outside  = index 0 (500.00006) and index 100 (0.0)
+
+    `CosineDPMSolverMultistepScheduler` builds ONE `BrownianInterval` over
+    [sigma_min, sigma_max], then queries it with consecutive pairs of `sigmas`. The
+    schedule ends at exactly 0.0, which is below sigma_min, so on the final step
+    torchsde bisects toward a point outside its own domain and never converges. That is
+    why it survived a 50,000-frame recursion limit: the recursion is infinite, not deep.
+
+    Ruled out first, so nobody repeats them: torchsde 0.2.5 vs 0.2.6 (identical), and
+    bf16 / fp16 / fp32 (identical). None of them could matter: the domain is wrong in
+    every dtype.
+
+    The patch widens the domain to [0, sigma_max * 1.001] so both out-of-range endpoints
+    fall inside. It does NOT touch the sigma schedule, so the sampling path is unchanged
+    and only the noise tree's bounds move. Patched at the class, because the scheduler
+    constructs the sampler lazily on its first step and there is no earlier hook.
+    """
+    try:
+        import diffusers.schedulers.scheduling_dpmsolver_sde as sde_mod
+    except Exception:
+        log.exception("could not import the SDE scheduler module to widen its interval")
+        return
+    cls = sde_mod.BrownianTreeNoiseSampler
+    if getattr(cls, "_interval_widened", False):
+        return
+    original = cls.__init__
+
+    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda v: v):
+        hi = float(sigma_max) * 1.001      # covers the 500.00006 rounding overshoot
+        original(self, x, 0.0, hi, seed, transform)
+
+    cls.__init__ = __init__
+    cls._interval_widened = True
+    log.info("widened BrownianTreeNoiseSampler domain to [0, sigma_max*1.001]; the "
+             "schedule's final sigma of 0.0 was outside it")
+
+
+def _generate_stableaudio(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-audio through Stable Audio Open. No vocal path, so lyrics are dropped.
+
+    ── The recursion limit is not superstition ──────────────────────────────────────
+    This model's scheduler (CosineDPMSolverMultistepScheduler) draws stochastic noise
+    from a torchsde `BrownianInterval`, and locating a sub-interval runs a recursive
+    binary search in `BrownianInterval._loc`. torchsde routes that through the
+    `trampoline` package specifically to survive deep searches, but the depth here
+    still blows Python's default 1000-frame limit:
+
+        RecursionError: maximum recursion depth exceeded
+          ...torchsde/_brownian/brownian_interval.py:261 in _loc
+             trampoline.trampoline(self._loc_inner(ta, tb, out))
+
+    The depth scales with the ratio between the full sigma range and the queried
+    sub-interval, and a cosine schedule has a very wide range, so this is a property of
+    THIS model's schedule rather than a bug in either library. Two things I tried first
+    and which did NOT help, recorded so nobody repeats them: pinning torchsde back to
+    0.2.5 (the recursion is identical, and the pin drags librosa's numba to a release
+    that will not install on Python 3.12), and looking for a deterministic
+    `algorithm_type` to sidestep the noise sampler (there is none; the scheduler builds
+    a BrownianTreeNoiseSampler unconditionally).
+
+    Raised only around this call and restored afterwards, so one awkward model does not
+    change the stack behaviour of everything else in the process.
+    """
+    import sys
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    # ── Diagnostic: what does the Brownian sampler actually get handed? ──────────
+    # Four dtype/version hypotheses failed before this. The sampler builds ONE
+    # BrownianInterval over [config.sigma_min, config.sigma_max] and then queries it
+    # with consecutive entries of `scheduler.sigmas`; if a queried sigma falls OUTSIDE
+    # that interval the search has nothing to bisect toward. Log both so the next
+    # person reads data instead of guessing.
+    try:
+        sch = pipe.scheduler
+        sch.set_timesteps(int(st.steps), device="cuda")
+        sg = sch.sigmas.detach().float().cpu()
+        lo = float(getattr(sch.config, "sigma_min", float("nan")))
+        hi = float(getattr(sch.config, "sigma_max", float("nan")))
+        outside = [(i, float(v)) for i, v in enumerate(sg) if not (lo <= float(v) <= hi)]
+        log.info(f"[stable-audio] interval=[{lo:g}, {hi:g}] sigmas: n={len(sg)} "
+                 f"min={sg.min():g} max={sg.max():g} first3={[f'{v:g}' for v in sg[:3]]} "
+                 f"last3={[f'{v:g}' for v in sg[-3:]]}")
+        log.info(f"[stable-audio] sigmas OUTSIDE the interval: {len(outside)} "
+                 f"{outside[:4]}{' ...' if len(outside) > 4 else ''}")
+    except Exception:
+        log.exception("[stable-audio] could not inspect the sigma schedule")
+
+    _widen_brownian_interval()
+    prev_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(prev_limit, 50_000))
+    t0 = time.perf_counter()
+    try:
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=STABLE_AUDIO_NEGATIVE,
+            audio_end_in_s=float(st.duration),
+            num_inference_steps=int(st.steps),
+            guidance_scale=float(st.guidance),
+            generator=gen,
+        )
+    finally:
+        sys.setrecursionlimit(prev_limit)
+    seconds = time.perf_counter() - t0
+
+    # .audios is (batch, channels, samples) as a torch tensor; the docs' own example
+    # transposes audios[0] before writing, which confirms the channels-first layout.
+    audio = out.audios[0].detach().to(torch.float32).cpu().numpy()
+    sr = int(pipe.vae.sampling_rate)
+    return audio, sr, seconds, st
+
+
+# AudioLDM2's own docs recommend a negative prompt; without one the output skews toward
+# the low-fidelity, noisy end of what it was trained on. This is the string from the
+# model card, applied by default so the comparison uses the model the way its authors
+# intend rather than a deliberately hobbled version of it.
+AUDIOLDM2_NEGATIVE = "Low quality, average quality, noisy"
+
+
+def _generate_audioldm2(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-audio through AudioLDM 2.
+
+    Like MusicGen it has no vocal path, so lyrics are dropped; `intended_for` on the
+    card explains why a vocal brief comes back instrumental.
+    """
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    t0 = time.perf_counter()
+    out = pipe(
+        prompt=prompt,
+        negative_prompt=AUDIOLDM2_NEGATIVE,
+        audio_length_in_s=float(st.duration),
+        num_inference_steps=int(st.steps),
+        guidance_scale=float(st.guidance),
+        generator=gen,
+        output_type="np",
+    )
+    seconds = time.perf_counter() - t0
+
+    audio = np.asarray(out.audios[0], dtype=np.float32)      # (samples,), mono
+    sr = int(pipe.vocoder.config.sampling_rate)              # 16000
+    return audio, sr, seconds, st
 
 
 # MusicGen's EnCodec runs at 50 frames/sec, so this converts seconds of audio into the
@@ -734,16 +1008,21 @@ class Repro:
         s = self.settings
         # Only emit flags this model actually honours: `--steps 8 --shift 3` on a
         # MusicGen command would run without complaint and mean nothing.
-        flags = [("--duration", "duration"), ("--seed", "seed"), ("--guidance", "guidance")]
-        if self.adapter != "musicgen":
-            flags += [("--steps", "steps"), ("--shift", "shift")]
+        has = knobs_for(self.adapter)
+        flags = [("--duration", "duration"), ("--seed", "seed")]
+        if "guidance" in has:
+            flags.append(("--guidance", "guidance"))
+        if "steps" in has:
+            flags.append(("--steps", "steps"))
+        if "shift" in has:
+            flags.append(("--shift", "shift"))
         for flag, key in flags:
             if key in s:
                 v = s[key]
                 parts.append(f"{flag} {v:g}" if isinstance(v, float) else f"{flag} {v}")
         # Only emit the musical metadata when it was actually set; a brief already
         # carries its own, and repeating it adds noise without changing the result.
-        if not self.brief:
+        if not self.brief and "bpm" in has:
             if s.get("bpm"):
                 parts.append(f"--bpm {s['bpm']}")
             if s.get("keyscale"):

@@ -56,8 +56,8 @@ HF_SECRET = flyte.Secret(key="HF_TOKEN", as_env_var="HF_TOKEN")
 # renders the waveform + spectrogram PNG that is the *visual* comparison surface (you
 # can see a drop, a chorus lift, or a wall of clipping at a glance). transformers is
 # for the Qwen3 text encoder the pipeline loads as a component; accelerate for the
-# low-cpu-mem load path. No librosa: matplotlib's own specgram is enough for the
-# report and keeps the image lighter.
+# low-cpu-mem load path. The report itself needs no librosa (matplotlib's own specgram
+# is enough); AudioLDM2 does, so it is on the generation image only, not here.
 _COMMON = (
     "soundfile",
     "numpy",
@@ -80,8 +80,33 @@ def _base(name: str) -> flyte.Image:
 # encoder is a `Qwen3Model` and older transformers has no Qwen3 architecture; the
 # failure is a KeyError inside from_pretrained, not an import error, so it survives
 # the build and dies in the pod.
+# librosa and sentencepiece are for AudioLDM2: diffusers guards librosa behind
+# `is_librosa_available()`, and sentencepiece backs the T5 tokenizer in its text stack.
+# Both are small next to torch and both are far cheaper to add here than to discover
+# missing inside a GPU pod several minutes into a run.
+# torchsde is for Stable Audio Open: its default scheduler is
+# CosineDPMSolverMultistepScheduler, which diffusers guards behind a torchsde backend.
+# Without it `from_pretrained` fails at load with a dummy-object ImportError, AFTER the
+# 15.7GB download has already succeeded, which is a slow way to learn about a 2MB
+# dependency. Optional scheduler backends are easy to miss precisely because the model
+# card never mentions them.
+#
+# PINNED to 0.2.5, not floating. On torchsde 0.2.6 the generation dies with
+# `RecursionError: maximum recursion depth exceeded` inside diffusers'
+# `BatchedBrownianTree.__call__`, which drives the scheduler's stochastic noise. There
+# is no way around it by configuration: CosineDPMSolverMultistepScheduler constructs a
+# BrownianTreeNoiseSampler unconditionally (scheduling_cosine_dpmsolver_multistep.py
+# line ~650), so there is no deterministic algorithm_type to fall back to.
 gen_image = _base("acestep-gen").with_pip_packages(
-    DIFFUSERS_MIN, "transformers>=4.51", "accelerate", "safetensors"
+    DIFFUSERS_MIN, "transformers>=4.51", "accelerate", "safetensors",
+    "librosa", "sentencepiece", "torchsde==0.2.5",
+    # The numba/llvmlite floor is load-bearing, and it exists because of the torchsde
+    # pin above. Pinning torchsde makes uv backtrack librosa to an old release whose
+    # numba is 0.53.1, which refuses to install on Python 3.12 at all:
+    #   RuntimeError: Cannot install on Python version 3.12.13; only >=3.6,<3.10
+    # Flooring both keeps the resolver on wheels that exist for aarch64/3.12. The TTS
+    # demo next door hit the identical trap through Parler's audio deps.
+    "numba>=0.60", "llvmlite>=0.43",
 )
 
 # The download task is model-agnostic: it only needs huggingface_hub, so it rides a

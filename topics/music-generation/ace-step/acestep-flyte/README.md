@@ -30,6 +30,19 @@ warm. Cost is roughly linear in length plus a fixed overhead, so longer tracks a
 *more* efficient per second of audio. Peak GPU is 11.1GB regardless of length, which
 is essentially just the weights.
 
+### The number that makes the point
+
+| | track | render | real-time factor | peak | per second of audio |
+|---|---|---|---|---|---|
+| ACE-Step xl-turbo | 180s | 12.8s | **14.1x faster than real time** | 11.1GB | 0.07s |
+| MusicGen large | 30s | 56.6s | **0.5x** (slower than real time) | 6.9GB | 1.89s |
+
+**~27x cheaper per second of audio**, and ACE-Step is the bigger model doing the harder
+job, because it is also singing. That is guidance-distilled flow matching against
+autoregressive token generation, and it is a better argument for why the field moved to
+diffusion than any benchmark chart. MusicGen is from June 2023; ACE-Step 1.5 XL from
+April 2026. Under three years.
+
 ---
 
 ## What ACE-Step 1.5 is
@@ -47,27 +60,133 @@ AceStepTransformer1D  ->  flow-matching DiT, denoises in latent space
 AutoencoderOobleck    ->  25Hz stereo latents  ->  48kHz stereo waveform
 ```
 
-### The checkpoint family
+## The models
 
-Only the XL line is reachable from here, and only its `-diffusers` repos. ACE-Step
-publishes each checkpoint twice: a native repo for the upstream `acestep` package, and
-a converted one in the standard diffusers pipeline layout. Only the latter loads with
-`AceStepPipeline.from_pretrained`, and so far only XL has been converted.
+Seven models, four architectures, **one image**. Every one is a text-conditioned
+generative audio model, and that is where the similarity ends: they disagree about what
+"generating music" means, and the report is built to keep those differences visible
+rather than flatten them into a ranking.
 
-| key | repo | recipe | why it is here |
-|---|---|---|---|
-| `xl-turbo` | `acestep-v15-xl-turbo-diffusers` | 8 steps, no CFG | Guidance-distilled. The iteration checkpoint. |
-| `xl-sft` | `acestep-v15-xl-sft-diffusers` | 50 steps, CFG 7.0 | Instruction-tuned. The better listener. |
-| `xl-base` | `acestep-v15-xl-base-diffusers` | 50 steps, CFG 7.0 | The pretrained model under both. |
+### Four architectures, four ideas about how to make audio
 
-Each is ~11GB of bf16 weights. The model card calls the DiT 5B; the shards total
-8.34GB in bf16, which works out closer to ~4.2B, and some launch coverage says 4B.
-Treat it as 4-5B class.
+**Flow-matching DiT (ACE-Step 1.5).** A diffusion transformer that learns a
+straight-line *velocity field* from noise to data rather than a noise-prediction
+schedule. Straighter paths mean fewer steps, and distillation folds the guidance pass
+into the weights on top. Audio lives as 25Hz stereo latents from an Oobleck VAE, and a
+Qwen3 encoder conditions on caption, lyrics and structured metadata together. This is
+the only model here that **sings**.
 
-**Guidance distillation is the whole story of turbo.** CFG normally costs two forward
-passes per step. Turbo has it baked into the weights, so it runs one pass per step and
-8 steps instead of 50, roughly a 12x compute cut. The pipeline enforces it: pass
-`guidance_scale > 1.0` to turbo and it warns and coerces to 1.0.
+**Latent DiT (Stable Audio Open).** Also a transformer diffusion in latent space, but
+noise-prediction rather than flow-matching, and conditioned by T5 text embeddings only.
+No lyric path, no metadata channel. A stochastic (SDE) sampler draws its noise from a
+Brownian tree, which is the source of its one integration headache below.
+
+**Autoregressive over audio tokens (MusicGen).** Not diffusion at all. EnCodec
+compresses audio into discrete tokens at 50/sec and a transformer predicts them one
+frame at a time, like a language model over sound. That is why it has no "steps" knob:
+its cost is *tokens*, so a 30s clip is 1500 sequential forward passes and cannot be
+parallelised across time. It is also why it is by far the slowest thing here.
+
+**Latent diffusion with a UNet (AudioLDM 2).** The oldest design in the set. Diffusion
+over a mel-spectrogram latent, with a GPT-2 bridging CLAP audio-text embeddings and T5
+text embeddings, decoded by a HiFi-GAN vocoder. Mel plus vocoder is what caps it at
+16kHz mono.
+
+### The registry
+
+| key | family | adapter | output | fetched | licence |
+|---|---|---|---|---|---|
+| `xl-turbo` | ACE-Step 1.5 XL | `acestep` | 48kHz stereo, **sings**, to 10min | 11.1GB | MIT |
+| `xl-sft` | ACE-Step 1.5 XL | `acestep` | as above | 11.5GB | MIT |
+| `xl-base` | ACE-Step 1.5 XL | `acestep` | as above | 11.5GB | MIT |
+| `stable-audio` | Stable Audio Open | `stableaudio` | 44.1kHz stereo, to 47s | 15.7GB | Stability Community (**gated**) |
+| `musicgen-large` | MusicGen | `musicgen` | 32kHz stereo, to 30s | 6.9GB | CC-BY-NC |
+| `musicgen-melody` | MusicGen | `musicgen` | 32kHz stereo, melody-conditionable | 6.2GB | CC-BY-NC |
+| `audioldm2-music` | AudioLDM 2 | `audioldm2` | 16kHz **mono**, ~10s sweet spot | 4.5GB | CC-BY-NC-SA |
+
+`adapter` selects the loader and generator in `music_core`. It does **not** select an
+image: diffusers and transformers coexist happily, so all seven share one. Compare that
+to the TTS demo next door, which needs seven images for seven models because every open
+TTS package ships mutually hostile pins.
+
+### Measured on the Spark
+
+| model | track | render | real-time factor | peak |
+|---|---|---|---|---|
+| ACE-Step xl-turbo | 180s | 12.8s | **14.1x** | 11.1GB |
+| ACE-Step xl-turbo | 30s | 1.5-4.2s | 7-20x | 11.1GB |
+| Stable Audio Open | 30s | 19.5s | 1.5x | 2.7GB |
+| AudioLDM 2 music | 10s | 6.4s | 1.6x | 2.2GB |
+| MusicGen large | 30s | 55.3s | **0.5x** | 6.9GB |
+
+ACE-Step is ~27x cheaper per second of audio than MusicGen while being the larger model
+doing the harder job. That is autoregressive token generation versus guidance-distilled
+flow matching, and it is a better argument for why the field moved than any chart.
+
+Read the table as a **timeline**, not a leaderboard: MusicGen and AudioLDM 2 are 2023,
+Stable Audio Open is mid-2024, ACE-Step 1.5 XL is April 2026. The older models are
+context for how fast this moved, and comparing them on a vocal brief is unfair by
+construction, which is what `intended_for` on every card is there to say.
+
+### Which knobs each model actually has
+
+`ADAPTER_KNOBS` in `music_core.py` is the single source of truth, used by the report
+card, the reproduce command, and the studio's Advanced panel. Printing a dial a model
+does not have is the same class of dishonesty as printing a value it silently ignored.
+
+| adapter | steps | guidance | shift | bpm / key / lyrics |
+|---|---|---|---|---|
+| `acestep` | yes | yes | yes | yes |
+| `stableaudio` | yes | yes | no | no |
+| `audioldm2` | yes | yes | no | no |
+| `musicgen` | no | yes | no | no |
+
+So a MusicGen card reads `seed 42 · cfg 3 · 30s` and its reproduce command omits
+`--steps` and `--shift`, because it is autoregressive and has neither. A binary
+"is it diffusion?" test was not enough to get this right: AudioLDM 2 and Stable Audio
+have steps but no flow-matching `shift`.
+
+`max_duration` works the same way. MusicGen was trained on 30s windows and Stable Audio
+tops out at 47s; neither refuses a longer request, they degrade. So the spec clamps and
+the card shows the **clamped** number, making the limit legible as a constraint instead
+of looking like a quality failure.
+
+### What each one cost to integrate
+
+Three of the four families needed a workaround. All are documented at their call sites
+with the evidence that motivated them.
+
+- **ACE-Step**: nothing. `diffusers>=0.39`, one `from_pretrained`, done.
+- **MusicGen**: nothing. transformers already ships it.
+- **AudioLDM 2**: a one-method shim. diffusers 0.39 drives its GPT-2 by hand and calls
+  `_update_model_kwargs_for_generation`, which transformers dropped from
+  `PreTrainedModel` in 4.53. Pinning the shared image back fifteen months to suit the
+  oldest model in the registry was the wrong trade, so `_shim_audioldm2_generation`
+  rebinds that one method onto that one instance.
+- **Stable Audio Open**: two. `torchsde` is a required backend for its scheduler and is
+  not mentioned on the model card; and its Brownian noise tree is built over
+  `[sigma_min, sigma_max]` = `[0.3, 500]` while the schedule it generates runs
+  `500.00006 … 0.3, 0.0`, so **both endpoints fall outside the tree's own domain** and
+  torchsde recurses forever looking for them. `_widen_brownian_interval` widens the
+  domain to `[0, sigma_max × 1.001]`. It does not touch the schedule, so sampling is
+  unchanged; a wider domain does change the Brownian path for a given seed, so seeds
+  will not match another implementation bit-for-bit.
+
+That last one took five failed hypotheses (torchsde version, recursion limit, bf16,
+fp16, fp32) before one instrumented run logging the sigma schedule against the interval
+bounds gave the answer immediately. The lesson is in the Gotchas section and it is the
+same one `faulthandler` taught: **instrument before theorising.**
+
+### Adding another
+
+Write a `_load_<adapter>` and `_generate_<adapter>` in `music_core`, add an
+`ADAPTER_KNOBS` entry, and add a `MusicModelSpec` with `adapter`, `intended_for` and
+`max_duration`. No image change if it loads through diffusers or transformers.
+
+**DiffRhythm** (`ASLP-lab/DiffRhythm2`, 5.07GB, Apache-2.0) is the obvious next one and
+the only true ACE-Step rival found so far: full-length **lyrics-to-song with vocals**,
+also flow-matching, from November 2025. It would be the first model here to need its own
+image, since it ships a custom package rather than loading through either library.
 
 ---
 
@@ -337,6 +456,15 @@ upload dereferenced the cache's symlinks so every shard was stored **twice** (11
 became ~22GB in the blob store), and the GPU task re-downloaded all 11GB from
 HuggingFace anyway, costing 2.5 minutes on every run. A plain repo layout handed to
 `from_pretrained` as a path skips the cache machinery entirely.
+
+**`torch.cuda.mem_get_info()` is unusable on GB10, in two different ways.** It
+**raises** `AcceleratorError: CUDA error: out of memory` from `cudaMemGetInfo` on a
+healthy box with 100GB+ free; a bare `except: pass` around it then skips the memory cap
+entirely and logs a cheerful `pool 0/0GB, capped at 0GB` that reads like a formatting
+quirk rather than "this process is now uncapped". And when it *does* return, its `free`
+counts reclaimable page cache as used (3GB of 129GB, while MemAvailable said 108GB).
+Use `MemAvailable` for free and `get_device_properties(0).total_memory` as the fallback
+for total, and log loudly when the cap cannot be applied.
 
 **Cap GPU memory against the cgroup, not the host.** On GB10 the GPU pool *is* host
 memory, so CUDA allocations are charged to the pod's cgroup: the box can have 100GB
