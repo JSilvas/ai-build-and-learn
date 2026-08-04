@@ -1,0 +1,11 @@
+# Local smoke-test output: standalone HTML plus the wavs it embeds. Regenerate with
+# `python run_local.py`; never commit (a 60s stereo 48kHz wav is ~11MB).
+out/
+*.wav
+*.ogg
+
+# Local venvs. This directory IS the Flyte source root, so anything here is swept into
+# a run's code bundle; keep it to source.
+.venv/
+.venv-local/
+__pycache__/

@@ -182,12 +182,21 @@ fetch_image = _base("tts-fetch")
 # connectrpc pinned to 0.10.x: 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
 # kubernetes because the app imports THIS module for the app name/port/image, and the
 # pod templates above need kubernetes.client at import time.
+#
+# soundfile/numpy/matplotlib are for the clone tab's drag-in path, and they are the
+# line this image will not cross: soundfile (libsndfile, so mp3 decodes) cuts the
+# reference clip locally, and tts_core.RefVoice grades it with the SAME warnings the
+# pipeline's report card uses, which is worth matplotlib riding along at import. No
+# torch, no TTS package: the app still cannot load a model even by accident. ffmpeg is
+# apt-level insurance for a container format libsndfile declines.
 studio_app_image = (
     flyte.Image.from_debian_base(
         name="tts-studio-image", registry=REGISTRY, platform=PLATFORM
     )
+    .with_apt_packages("ffmpeg")
     .with_pip_packages("flyte==2.2.1", "connectrpc==0.10.*", "gradio==5.42.0",
-                       "python-dotenv", "kubernetes")
+                       "python-dotenv", "kubernetes",
+                       "soundfile", "numpy", "matplotlib")
 )
 
 

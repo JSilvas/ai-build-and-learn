@@ -17,3 +17,18 @@ Some things to look up to get started:
 **Tooling:**
 - AudioCraft (Meta) — MusicGen / AudioGen: https://github.com/facebookresearch/audiocraft
 - Hugging Face — audio models and pipelines: https://huggingface.co/models?pipeline_tag=text-to-audio
+
+## The demos
+
+`ace-step/acestep-flyte/` is what we build on the stream: render a musical brief with
+[ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) on the DGX Spark and get one
+Flyte report **with tracks that play right in the browser**, plus a waveform and
+spectrogram for each. Two entry points: `compare` puts the turbo, sft and base
+checkpoints side by side on the same brief, and `sweep` holds everything fixed and
+moves exactly one parameter (seed, steps, guidance, shift, bpm, key, duration) across a
+row you play left to right. See
+[ace-step/acestep-flyte/README.md](ace-step/acestep-flyte/README.md).
+
+`magenta/magenta-rt-flyte/` is the live one: Magenta RealTime 2 streaming a continuous
+track you steer with text prompts while it plays. See
+[magenta/magenta-rt-flyte/README.md](magenta/magenta-rt-flyte/README.md).

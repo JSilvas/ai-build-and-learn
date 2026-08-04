@@ -152,6 +152,36 @@ moment you press the button. The host-mode UI above is immune, since it imports
 If a redeploy reports `failed!`, `flyte delete app tts-studio` and deploy again: a stale
 revision that never became ready will block the new one (there is no `flyte stop app`).
 
+### Cloning from a recording, in the browser (the studio's second tab)
+
+The clone pipeline below wants a purpose-recorded reference. The studio's **Voice clone**
+tab is the path for when what you actually have is an hour of stream audio: drag the file
+in, and the app finds the best few seconds of continuous speech, trims them, and uploads
+only that clip.
+
+```
+drag in 64 min of mp3
+  -> ref_clip.best_window()   RMS framing, in the app pod, no GPU
+  -> 12s mono wav             uploaded as flyte.io.File; the hour never leaves the pod
+  -> transcribe_ref (GPU run) optional; fills an EDITABLE transcript box
+  -> clone (GPU runs)         cloned + control per line, then SIM/WER
+```
+
+Two things about it are load-bearing:
+
+- **The window picker is energy-based, not diarization.** It finds continuous speech and
+  rejects dead air and hot passages; it has no idea whose voice it is. On this repo's own
+  video-gen stream recording, the second-best window it found was `"...what was that Jay
+  you're muted I can hear it..."`, which is two people. That is why the tab has a preview
+  player and why the docstring tells you to listen before launching.
+- **The transcript box is editable on purpose.** `refs/README.md` argues against ASR'd
+  references because Qwen, Dia and CSM all condition on the text, and Whisper on that
+  same recording produced `"kadenski 5-1"` for Kandinsky 5.1 and `"LTX and 1"` for LTX
+  and Wan. Both are exactly the errors that turn into a worse clone. `transcribe_ref`
+  gets you 95% of the way; reading the box is the other 5%.
+
+For a clip you cut outside the app, `candidates/` and the CLI below still work the same.
+
 Like the image and video studios, this one is a thin **launcher**: 1 CPU, 1Gi, no torch
 and no TTS package in its image, so it cannot pin a model or hold the GPU that its own
 runs need. That is exactly the opposite of `voice_app.py` below, which holds the GPU on
@@ -476,8 +506,13 @@ that every word is one specific person's voice.
   already pulled are cache hits. Every line is generated in two `mode`s, `"clone"` and
   `"stock"`, and results/scores are keyed `(text, model_key, mode)` all the way to the
   renderer.
-- `app.py` — the compare studio: a Gradio launcher (checkbox model picker, one script
-  per line) that submits `compare` runs and links the report. Holds no GPU, loads no model.
+- `app.py` — the studio: a Gradio launcher with two tabs, **Compare models** (checkbox
+  model picker, one script per line) and **Voice clone** (drag in a recording, cut a
+  reference out of it, clone it). Submits runs and links reports; holds no GPU, loads no
+  model.
+- `ref_clip.py` — Flyte-free, numpy + soundfile only: finds the best window of continuous
+  speech in a long recording and trims it. What lets the clone tab accept an hour of
+  stream audio. Energy-based, NOT diarization, so it cannot tell one speaker from another.
 - `voice_core.py` — Flyte-free: the `SentenceChunker`, the Whisper `Transcriber`, the
   ollama streaming client, the `Speaker` (TTS engine cache), and the `converse` loop.
 - `voice_app.py` — the Gradio voice-chat app + its Flyte `AppEnvironment`. The pod is
