@@ -62,7 +62,7 @@ AutoencoderOobleck    ->  25Hz stereo latents  ->  48kHz stereo waveform
 
 ## The models
 
-Seven models, four architectures, **one image**. Every one is a text-conditioned
+Eight models, five architectures, and one image for seven of them. Every one is a text-conditioned
 generative audio model, and that is where the similarity ends: they disagree about what
 "generating music" means, and the report is built to keep those differences visible
 rather than flatten them into a ranking.
@@ -103,6 +103,7 @@ text embeddings, decoded by a HiFi-GAN vocoder. Mel plus vocoder is what caps it
 | `musicgen-large` | MusicGen | `musicgen` | 32kHz stereo, to 30s | 6.9GB | CC-BY-NC |
 | `musicgen-melody` | MusicGen | `musicgen` | 32kHz stereo, melody-conditionable | 6.2GB | CC-BY-NC |
 | `audioldm2-music` | AudioLDM 2 | `audioldm2` | 16kHz **mono**, ~10s sweet spot | 4.5GB | CC-BY-NC-SA |
+| `diffrhythm` | DiffRhythm 2 | `diffrhythm` | 48kHz stereo, **sings**, to 210s | 5.1GB | Apache-2.0 |
 
 `adapter` selects the loader and generator in `music_core`. It does **not** select an
 image: diffusers and transformers coexist happily, so all seven share one. Compare that
@@ -118,6 +119,7 @@ TTS package ships mutually hostile pins.
 | Stable Audio Open | 30s | 19.5s | 1.5x | 2.7GB |
 | AudioLDM 2 music | 10s | 6.4s | 1.6x | 2.2GB |
 | MusicGen large | 30s | 55.3s | **0.5x** | 6.9GB |
+| DiffRhythm 2 | 96s | 206.0s | **0.5x** | subprocess |
 
 ACE-Step is ~27x cheaper per second of audio than MusicGen while being the larger model
 doing the harder job. That is autoregressive token generation versus guidance-distilled
@@ -140,6 +142,7 @@ does not have is the same class of dishonesty as printing a value it silently ig
 | `stableaudio` | yes | yes | no | no |
 | `audioldm2` | yes | yes | no | no |
 | `musicgen` | no | yes | no | no |
+| `diffrhythm` | yes | yes | no | lyrics only |
 
 So a MusicGen card reads `seed 42 · cfg 3 · 30s` and its reproduce command omits
 `--steps` and `--shift`, because it is autoregressive and has neither. A binary
@@ -183,49 +186,65 @@ Write a `_load_<adapter>` and `_generate_<adapter>` in `music_core`, add an
 `ADAPTER_KNOBS` entry, and add a `MusicModelSpec` with `adapter`, `intended_for` and
 `max_duration`. No image change if it loads through diffusers or transformers.
 
-### DiffRhythm: wired up, not yet rendering (WIP)
+### DiffRhythm 2: the only other model here that sings
 
-`ASLP-lab/DiffRhythm-full`, Apache-2.0, the only true ACE-Step rival found so far:
-full-length **lyrics-to-song with vocals**, also flow-matching. It is fully plumbed and
-**does not yet produce audio**. Recording exactly where it stands, because most of the
-hard parts are done and the remaining blocker is narrow.
+`ASLP-lab/DiffRhythm2`, Apache-2.0, 5.1GB, November 2025. Block flow matching over its
+own DiT with a BigVGAN vocoder, 48kHz stereo, full-length songs from timed lyrics. The
+only genuine ACE-Step **rival** in the registry rather than an era baseline, because
+everything else here is instrumental-only.
 
-**Working and verified on the box:**
+**The one model with its own image**, and it earns it: no PyPI package and no packaging
+metadata at all, so it is a git clone on `PYTHONPATH`, and it needs `transformers`
+pinned where the rest of the registry does not.
 
-- Its own image builds on aarch64 (`config.diffrhythm_image`). No PyPI package and no
-  packaging metadata at all, so it is a git clone on `PYTHONPATH`.
-- `model/__init__.py` imports the trainer, which drags in wandb / pylance / pandas. One
-  `sed` deleting that import removes the entire training dependency tree; inference only
-  needs `CFM` and `DiT`.
-- `CFM`, `DiT` and MuQ-MuLan import cleanly in a GPU pod: `torch=2.13.0+cu130 cuda=True`.
-- Two-image dispatch: `render_task_for(spec)` routes it to `render_diffrhythm` in its own
-  env while the other seven stay on the shared `render`. Both share `_render_jobs`.
-- `orch_env` must list `diffrhythm_env` in `depends_on`, or the run dies at submit with
-  `MissingEnvironment: 'acestep-diffrhythm' not found in image cache`.
-- `self_downloads=True`: its code calls `hf_hub_download` itself, so `_weights_for` hands
-  it an empty Dir and **both** download call sites skip it (`Dir.download()` on an empty
-  Dir raises `DownloadQueueEmpty`).
-- Subprocess adapters must leave the parent CUDA-free, including `reset_peak_memory` /
-  `peak_memory_gb`, which create a context via `torch.cuda.is_available()`.
-- Stripping our inherited `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` from the
-  child moved the failure from model load to the forward pass. Imposing our allocator
-  tuning on someone else's process was our bug.
+Measured: **96s of audio in 206s** (0.5x real time) against ACE-Step's 180s in 12.8s
+(14.1x). Roughly 28x more expensive per second of audio for the same job.
 
-**The remaining blocker, and it is a genuine bind:**
+Getting it running took seven distinct layers, each worth knowing:
 
-| transformers | what happens |
-|---|---|
-| 5.14.1 (shared) | imports fine, **fails in the forward pass** inside `LlamaDecoderLayer` -> `self.self_attn(...)`; Llama's attention signature changed in 5.x and `dit.py` drives that class directly |
-| 4.49.0 (their pin) | **driver-level `CUDA error: out of memory`** at `cfm.to(device)`, moving a 2.2GB model onto a GPU with 90GB+ free, with no "Tried to allocate" detail |
+1. **`orch_env` must declare it.** An orchestrator can only dispatch to environments in
+   its `depends_on`, or the run dies at submit with `MissingEnvironment:
+   'acestep-diffrhythm' not found in image cache`.
+2. **Guard the empty-Dir download at EVERY call site.** It fetches its own checkpoints
+   (`self_downloads=True`), so `_weights_for` hands it an empty Dir, and
+   `Dir.download()` on an empty Dir raises `DownloadQueueEmpty`. This trap was already
+   documented in `_to_results` and still bit a second, newer call site.
+3. **A subprocess adapter must leave the parent CUDA-free**, including
+   `reset_peak_memory` / `peak_memory_gb`, which create a context via
+   `torch.cuda.is_available()`.
+4. **Do not leak your CUDA tuning into a child process.**
+   `subprocess.run(env={**os.environ})` hands them `PYTORCH_CUDA_ALLOC_CONF` and
+   `CUDA_MODULE_LOADING=EAGER`, which we chose for our in-process models and they never
+   asked for. `_generate_diffrhythm` strips all of it.
+5. **transformers pinned to 4.47.1** for this image only. It imports `StaticCache` from
+   `transformers.models.llama.modeling_llama`, which moved to `cache_utils` in 5.x.
+   Pinning is free because the image is isolated; the other seven stay on 5.14.1.
+6. **`pyopenjtalk` is not optional.** Their `CNENTokenizer` imports the whole g2p chain
+   eagerly, so `g2p/g2p/japanese.py` loads even for English-only lyrics. It compiles on
+   aarch64 in ~36s given `cmake` + `build-essential`, both already in the image.
+7. **Memory pressure was the real "OOM".** The failure everyone would read as a model
+   being too big was a leaky neighbour: with rustfs holding ~19GB, the child saw
+   `free_gb 24.9` of a 128.5GB pool and `cfm.to(device)` failed at the driver with no
+   allocation size. `kubectl rollout restart deploy/rustfs -n flyte` took it to 74.8GB
+   free and the OOM vanished. **Clear the leak before big runs.**
 
-A cautionary note on method: the pin was initially dismissed because `CFM`, `DiT` and
-`LlamaConfig` all *import* on 5.x. Imports prove imports, not call signatures. It binds
-at inference.
+That last one cost four wrong attempts (transformers pins, parent CUDA context, env
+stripping) because a driver-level OOM with no "Tried to allocate" size looks like a code
+problem. The escalating-allocation probe in `_generate_diffrhythm` is kept permanently
+for exactly this: it reports total, free, the cgroup ceiling and the child's real
+allocation ceiling before every render, so the next mystery starts with data.
 
-Next things to try, in order: `ASLP-lab/DiffRhythm2` (newer, `decoder.bin` format, may
-not drive Llama the same way); an intermediate transformers (4.51-4.52) that might clear
-both; or `CUDA_LOG_FILE=stderr` in the child to get the driver's own reason for a
-`cudaMalloc` failure that PyTorch reports without a size.
+**Why v2 and not v1.** v1 (`ASLP-lab/DiffRhythm`, 2.3k stars) drives transformers'
+`LlamaDecoderLayer` directly and never sets `num_attention_heads`, so on any modern
+transformers its attention and rotary embedding disagree about `head_dim` and the first
+forward pass dies in `apply_rotary_pos_emb`. A `head_dim=dim // 32` source patch fixes
+that, and then a second, unrelated failure sits behind it. v2 generates through its own
+DiT and touches Llama only for a cache class.
+
+**Known unfairness:** DiffRhythm wants **timed** lyrics (`[mm:ss.xx]line`); ACE-Step
+wants **structural** ones (`[verse]`/`[chorus]`). `lyrics_to_lrc` drops the tags and
+spreads lines evenly, which is less information than ACE-Step gets from the same brief.
+A fair head-to-head would supply real timings.
 
 ---
 
@@ -529,10 +548,49 @@ it means a naive report prints "cfg 7.0" under a track that ran at 1.0.
 
 ## Licensing
 
-ACE-Step weights are **MIT**. The bundled Qwen3-Embedding-0.6B text encoder is
-**Apache-2.0**. Both commercial-safe, which is not something you can say about every
-model here: MusicGen ships under CC BY-NC and its *outputs* are non-commercial. Worth a
-minute on the stream.
+The most practical difference between these models, and the one least visible from a
+listening test. Two of the eight let you ship what you generate; three do not.
+
+| model | weights licence | commercial output? | verified how |
+|---|---|---|---|
+| ACE-Step 1.5 XL (all 3) | **MIT** | **yes** | model card |
+| DiffRhythm 2 | **Apache-2.0** | **yes** | model card + GitHub |
+| Stable Audio Open | Stability AI Community License | **read the card** | could not verify (gated) |
+| MusicGen large / melody | **CC-BY-NC-4.0** | **no** | model card |
+| AudioLDM 2 music | **CC-BY-NC-SA-4.0** | **no** | model card |
+
+### What each actually means for you
+
+**ACE-Step (MIT)** and **DiffRhythm 2 (Apache-2.0)** are the two you can build a product
+on. Both permissive, both cover the weights, neither restricts the output. Apache-2.0
+additionally carries an express patent grant, which MIT does not; for most people that
+is the only practical difference between them. ACE-Step's bundled Qwen3-Embedding-0.6B
+text encoder is Apache-2.0, redistributed under Qwen's terms, so the whole pipeline is
+commercial-safe.
+
+**MusicGen (CC-BY-NC-4.0)** is the one people most often get wrong. The non-commercial
+term covers the **weights AND what you generate with them**. It is the best-known open
+music model and the default reference in a lot of writing, which makes it the most
+likely to end up in a product it cannot legally be in.
+
+**AudioLDM 2 (CC-BY-NC-SA-4.0)** is non-commercial *and* share-alike, so it is the most
+restrictive here.
+
+**Stable Audio Open** is the interesting case and the one I could not fully check: the
+model card is **gated**, so it is unreadable without accepting the terms, and I did not
+verify its licence text from here. What is publicly documented in the diffusers docs is
+its **training data**: ~48k recordings from Freesound and the Free Music Archive, all
+CC0, CC BY or CC Sampling+. It is the only model in this registry trained exclusively on
+licensed audio, which is a different and arguably more interesting claim than the output
+licence. **Read the card before shipping anything from it.**
+
+### The point worth making on stream
+
+Training-data provenance and output licensing are separate questions, and only one model
+here answers both cleanly in the affirmative. Stable Audio Open has the cleanest
+*inputs*; ACE-Step and DiffRhythm 2 have the cleanest *outputs*. Nothing in the audio
+tells you which is which, which is exactly why the licence is on every report card and
+in this table rather than left as folklore.
 
 ---
 
