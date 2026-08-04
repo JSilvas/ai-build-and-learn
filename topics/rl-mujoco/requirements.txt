@@ -1,0 +1,32 @@
+# Local/devbox deps. The Flyte task images build their own list from config.MJX_SPEC;
+# keep the two in sync when you change one.
+#
+# jax[cuda13], NOT cuda12: the GB10's driver is CUDA 13.0. jax-cuda13-plugin publishes
+# manylinux_2_27_aarch64 wheels, so this installs clean on the Spark.
+#
+# CAPPED AT 0.9.x, and this is load-bearing. brax 0.14.2 (the current release) still
+# calls `jax.device_put_replicated` in ppo/train.py:756. jax REMOVED it in 0.10, so an
+# unpinned install resolves to 0.10.2 and every training run dies with:
+#     AttributeError: jax.device_put_replicated is deprecated; use jax.device_put
+# 0.9.2 still ships it (as a DeprecationWarning) and the cuda13 plugin at that version
+# still enumerates the GB10. Lift this pin only once brax stops using the old pmap API.
+jax[cuda13]==0.9.2
+mujoco
+mujoco-mjx
+brax
+# MuJoCo Playground. The PyPI name is `playground`; it imports as `mujoco_playground`.
+# There is no `mujoco-playground` package (404).
+playground
+numpy
+Pillow
+matplotlib
+mediapy
+# PyAV encodes the replay mp4. aarch64 wheels exist; imageio-ffmpeg's do not reliably.
+av
+imageio
+flyte==2.2.1
+# 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
+connectrpc==0.10.*
+gradio==5.42.0
+kubernetes
+python-dotenv
