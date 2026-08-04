@@ -597,12 +597,186 @@ def generate(pipe, spec, prompt: str, lyrics: str = "",
     return _generate_acestep(pipe, spec, prompt, lyrics, settings)
 
 
-# DiffRhythm accepts exactly 95s, or any value in [96, 285]. Anything else is rejected
-# rather than clamped by their CLI, so snap before we ask.
-def _snap_diffrhythm_duration(seconds: float) -> float:
-    if seconds <= 95.0:
-        return 95.0
-    return float(min(285, max(96, round(seconds))))
+# MusicGen's EnCodec runs at 50 frames/sec, so this converts seconds of audio into the
+# `max_new_tokens` the generate call actually wants.
+MUSICGEN_TOKENS_PER_SEC = 50
+
+
+def _generate_musicgen(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-music through MusicGen.
+
+    Ignores lyrics entirely, because the model has no vocal path at all: feeding it
+    lyrics would silently treat them as style text and muddy the prompt. `compare`
+    passes them anyway (every model gets the same brief), so dropping them here is the
+    right place to do it, and `intended_for` on the card explains why the vocal briefs
+    come back instrumental.
+    """
+    import torch
+
+    model, processor = pipe
+    st = (settings or GenSettings()).resolve(spec)
+
+    inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
+    tokens = int(st.duration * MUSICGEN_TOKENS_PER_SEC)
+
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = model.generate(**inputs, do_sample=True, guidance_scale=float(st.guidance),
+                             max_new_tokens=tokens)
+    seconds = time.perf_counter() - t0
+
+    audio = out[0].detach().to(torch.float32).cpu().numpy()   # (channels, samples)
+    sr = int(model.config.audio_encoder.sampling_rate)
+    return audio, sr, seconds, st
+
+
+# AudioLDM2's own docs recommend a negative prompt; without one the output skews toward
+# the low-fidelity, noisy end of what it was trained on. This is the string from the
+# model card, applied by default so the comparison uses the model the way its authors
+# intend rather than a deliberately hobbled version of it.
+AUDIOLDM2_NEGATIVE = "Low quality, average quality, noisy"
+
+
+def _generate_audioldm2(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-audio through AudioLDM 2.
+
+    Like MusicGen it has no vocal path, so lyrics are dropped; `intended_for` on the
+    card explains why a vocal brief comes back instrumental.
+    """
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    t0 = time.perf_counter()
+    out = pipe(
+        prompt=prompt,
+        negative_prompt=AUDIOLDM2_NEGATIVE,
+        audio_length_in_s=float(st.duration),
+        num_inference_steps=int(st.steps),
+        guidance_scale=float(st.guidance),
+        generator=gen,
+        output_type="np",
+    )
+    seconds = time.perf_counter() - t0
+
+    audio = np.asarray(out.audios[0], dtype=np.float32)      # (samples,), mono
+    sr = int(pipe.vocoder.config.sampling_rate)              # 16000
+    return audio, sr, seconds, st
+
+
+# The diffusers docs are explicit that a negative prompt "can significantly improve the
+# quality of the generated audio" for this model, and name this exact string. Applying
+# it by default means the comparison uses the model the way its authors intend.
+STABLE_AUDIO_NEGATIVE = "Low quality, average quality"
+
+
+def _widen_brownian_interval() -> None:
+    """Make the SDE noise sampler's Brownian tree span the sigmas it will be asked for.
+
+    THE root cause of Stable Audio's `RecursionError`, found by instrumenting rather
+    than guessing. Measured on the box:
+
+        interval = [0.3, 500]        (scheduler config sigma_min / sigma_max)
+        sigmas   = 500.00006 ... 0.323, 0.3, 0.0      (101 values)
+        outside  = index 0 (500.00006) and index 100 (0.0)
+
+    `CosineDPMSolverMultistepScheduler` builds ONE `BrownianInterval` over
+    [sigma_min, sigma_max], then queries it with consecutive pairs of `sigmas`. The
+    schedule ends at exactly 0.0, which is below sigma_min, so on the final step
+    torchsde bisects toward a point outside its own domain and never converges. That is
+    why it survived a 50,000-frame recursion limit: the recursion is infinite, not deep.
+
+    Ruled out first, so nobody repeats them: torchsde 0.2.5 vs 0.2.6 (identical), and
+    bf16 / fp16 / fp32 (identical). None of them could matter: the domain is wrong in
+    every dtype.
+
+    The patch widens the domain to [0, sigma_max * 1.001] so both out-of-range endpoints
+    fall inside. It does NOT touch the sigma schedule, so the sampling path is unchanged
+    and only the noise tree's bounds move. Patched at the class, because the scheduler
+    constructs the sampler lazily on its first step and there is no earlier hook.
+    """
+    try:
+        import diffusers.schedulers.scheduling_dpmsolver_sde as sde_mod
+    except Exception:
+        log.exception("could not import the SDE scheduler module to widen its interval")
+        return
+    cls = sde_mod.BrownianTreeNoiseSampler
+    if getattr(cls, "_interval_widened", False):
+        return
+    original = cls.__init__
+
+    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda v: v):
+        hi = float(sigma_max) * 1.001      # covers the 500.00006 rounding overshoot
+        original(self, x, 0.0, hi, seed, transform)
+
+    cls.__init__ = __init__
+    cls._interval_widened = True
+    log.info("widened BrownianTreeNoiseSampler domain to [0, sigma_max*1.001]; the "
+             "schedule's final sigma of 0.0 was outside it")
+
+
+def _generate_stableaudio(pipe, spec, prompt: str, settings: GenSettings | None):
+    """Text-to-audio through Stable Audio Open. No vocal path, so lyrics are dropped."""
+    import sys
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    _widen_brownian_interval()
+    prev_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(prev_limit, 50_000))
+    t0 = time.perf_counter()
+    try:
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=STABLE_AUDIO_NEGATIVE,
+            audio_end_in_s=float(st.duration),
+            num_inference_steps=int(st.steps),
+            guidance_scale=float(st.guidance),
+            generator=gen,
+        )
+    finally:
+        sys.setrecursionlimit(prev_limit)
+    seconds = time.perf_counter() - t0
+
+    # .audios is (batch, channels, samples) as a torch tensor; the docs' own example
+    # transposes audios[0] before writing, which confirms the channels-first layout.
+    audio = out.audios[0].detach().to(torch.float32).cpu().numpy()
+    sr = int(pipe.vae.sampling_rate)
+    return audio, sr, seconds, st
+
+
+def _generate_acestep(pipe, spec, prompt: str, lyrics: str = "",
+                      settings: GenSettings | None = None):
+    """Render one track through ACE-Step."""
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
+
+    t0 = time.perf_counter()
+    out = pipe(
+        prompt=prompt,
+        lyrics=lyrics or "",
+        audio_duration=float(st.duration),
+        vocal_language=st.language or "en",
+        num_inference_steps=int(st.steps),
+        guidance_scale=float(st.guidance),
+        shift=float(st.shift),
+        generator=gen,
+        # None is the pipeline's "estimate it yourself" for all three; the sentinels
+        # only exist to survive the CLI, they must not reach the model.
+        bpm=st.bpm or None,
+        keyscale=st.keyscale or None,
+        timesignature=st.timesignature or None,
+    )
+    seconds = time.perf_counter() - t0
+
+    audio = out.audios[0]                       # (channels, samples), float32 on device
+    audio = audio.detach().to(torch.float32).cpu().numpy()
+    return audio, int(pipe.sample_rate), seconds, st
 
 
 def lyrics_to_lrc(lyrics: str, seconds: float) -> str:
