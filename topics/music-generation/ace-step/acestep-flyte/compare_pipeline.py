@@ -57,7 +57,7 @@ import flyte.report
 import soundfile as sf
 
 import music_core
-from config import cpu_env, gpu_env, orch_env
+from config import cpu_env, diffrhythm_env, gpu_env, orch_env
 from models import DEFAULT_MODELS, get_sweep, get_spec, resolve_models
 from music_core import Block, GenSettings, TrackResult
 from prompts import Brief, DEFAULT_BRIEF, get_brief, get_suite
@@ -167,6 +167,12 @@ async def fetch_weights(model_key: str) -> flyte.io.Dir:
 
 @gpu_env.task(report=True, retries=1)
 async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> ModelRun:
+    """The default renderer: every model whose image is the shared one."""
+    return await _render_jobs(model_key, weights, jobs)
+
+
+async def _render_jobs(model_key: str, weights: flyte.io.Dir,
+                       jobs: list[GenJob]) -> ModelRun:
     """Load one checkpoint once, render every job, live-update the report.
 
     The report is replaced after each track rather than at the end, so a long run is
@@ -175,7 +181,11 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
     is minutes, not seconds.
     """
     spec = get_spec(model_key)
-    local = await weights.download()
+    # Do NOT download for models that fetch their own checkpoints: `_weights_for` hands
+    # those an EMPTY Dir, and `Dir.download()` on an empty Dir raises
+    # DownloadQueueEmpty. The same trap is already documented in `_to_results`; it bit
+    # again here because this is a second, independent call site.
+    local = "" if getattr(spec, "self_downloads", False) else await weights.download()
 
     out_dir = Path(tempfile.mkdtemp(prefix=f"acestep_{model_key}_"))
     items: list[TrackItem] = []
@@ -184,23 +194,34 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
 
     pipe = None
     try:
-        cap = music_core.prepare_gpu()
-        avail_gb, total_gb = music_core.gpu_pool_gb()
+        # Adapters that shell out (DiffRhythm) render in a CHILD process, so the parent
+        # must NOT touch CUDA: `prepare_gpu` would create a context here and cap this
+        # process at ~90% of a unified pool the child then has to allocate from. The
+        # child died with `CUDA error: out of memory` moving a 2.2GB model onto a GPU
+        # with 90GB+ free, which is what that contention looks like from the inside.
+        subprocess_adapter = spec.adapter in music_core.SUBPROCESS_ADAPTERS
+        cap = 0.0 if subprocess_adapter else music_core.prepare_gpu()
+        avail_gb, total_gb = (0.0, 0.0) if subprocess_adapter else music_core.gpu_pool_gb()
         # Log the ceiling BEFORE loading. On this box a long render can die as a bare
         # SIGSEGV with no Python traceback, and when that happens the only useful
         # forensic question is "how much memory did it actually have?". This line is
         # also what caught the cap regression: it read "capped at 3GB" out loud.
-        log.info(f"[{model_key}] pool {avail_gb:.0f}/{total_gb:.0f}GB available, "
-                 f"capped at {cap:.0f}GB; loading {spec.repo}")
+        if subprocess_adapter:
+            log.info(f"[{model_key}] subprocess adapter: leaving CUDA untouched in the "
+                     f"parent so the child owns the GPU; loading {spec.repo}")
+        else:
+            log.info(f"[{model_key}] pool {avail_gb:.0f}/{total_gb:.0f}GB available, "
+                     f"capped at {cap:.0f}GB; loading {spec.repo}")
         pipe = music_core.load_pipeline(spec, local_dir=local)
         log.info(f"[{model_key}] loaded; peak {music_core.peak_memory_gb():.1f}GB")
 
         for i, job in enumerate(jobs):
             try:
-                music_core.reset_peak_memory()
+                if not subprocess_adapter:
+                    music_core.reset_peak_memory()
                 audio, sr, secs, resolved = music_core.generate(
                     pipe, spec, job.prompt, job.lyrics, job.settings)
-                peak = music_core.peak_memory_gb()
+                peak = 0.0 if subprocess_adapter else music_core.peak_memory_gb()
 
                 fn = f"{model_key}__{i:02d}.wav"
                 music_core.write_wav(audio, sr, out_dir / fn)
@@ -238,6 +259,28 @@ async def render(model_key: str, weights: flyte.io.Dir, jobs: list[GenJob]) -> M
 
     tracks = await flyte.io.Dir.from_local(str(out_dir))
     return ModelRun(model_key=model_key, items=items, tracks=tracks)
+
+
+@diffrhythm_env.task(report=True, retries=1)
+async def render_diffrhythm(model_key: str, weights: flyte.io.Dir,
+                            jobs: list[GenJob]) -> ModelRun:
+    """Identical body to `render`, different ENV, and that is the only difference.
+
+    DiffRhythm is the one model with its own image (no PyPI package, no packaging
+    metadata, a git clone on PYTHONPATH), so it needs its own TaskEnvironment. The work
+    is shared through `_render_jobs`; the TTS demo next door does the same thing seven
+    times over for seven mutually hostile packages.
+    """
+    return await _render_jobs(model_key, weights, jobs)
+
+
+# adapter -> which task (hence which image) renders it.
+RENDER_TASKS = {"diffrhythm": render_diffrhythm}
+
+
+def render_task_for(spec):
+    """The render task whose image can actually load this model."""
+    return RENDER_TASKS.get(spec.adapter, render)
 
 
 # ── Re-derive report objects from a run's wavs, in the parent ────────────────────
@@ -309,6 +352,19 @@ def _settings_for(brief: Brief, *, seed: int, duration: float) -> GenSettings:
                        keyscale=brief.keyscale, language=brief.language)
 
 
+@cpu_env.task
+async def empty_dir() -> flyte.io.Dir:
+    """An empty Dir, for models that fetch their own weights at render time."""
+    return await flyte.io.Dir.from_local(tempfile.mkdtemp(prefix="noweights_"))
+
+
+async def _weights_for(spec) -> flyte.io.Dir:
+    """Pre-staged weights, or an empty Dir for models that download their own."""
+    if getattr(spec, "self_downloads", False):
+        return await empty_dir.override(short_name=f"skip fetch {spec.key}")()
+    return await fetch_weights.override(short_name=f"fetch {spec.key}")(spec.key)
+
+
 # ── compare: checkpoints side by side ────────────────────────────────────────────
 
 @orch_env.task(report=True)
@@ -341,6 +397,11 @@ async def compare(
     weights: dict[str, flyte.io.Dir] = {}
     fetch_errors: dict[str, str] = {}
     for s in specs:
+        if getattr(s, "self_downloads", False):
+            # Its own code calls hf_hub_download at render time, so there is nothing
+            # useful for us to pre-stage. An empty Dir keeps the task signature uniform.
+            weights[s.key] = await empty_dir.override(short_name=f"skip fetch {s.key}")()
+            continue
         try:
             weights[s.key] = await fetch_weights.override(short_name=f"fetch {s.key}")(s.key)
         except Exception as e:
@@ -357,7 +418,8 @@ async def compare(
         for s in launched
     }
     raw = await asyncio.gather(*[
-        render.override(short_name=f"render {s.key}")(s.key, weights[s.key], jobs_by_model[s.key])
+        render_task_for(s).override(short_name=f"render {s.key}")(
+            s.key, weights[s.key], jobs_by_model[s.key])
         for s in launched
     ], return_exceptions=True)
 
@@ -457,7 +519,7 @@ async def sweep(
         f"all {len(vals)} against one loaded pipeline.{warn}"))
     await flyte.report.flush.aio()
 
-    w = await fetch_weights.override(short_name=f"fetch {model_key}")(model_key)
+    w = await _weights_for(spec)
 
     jobs = []
     for v in vals:
@@ -467,7 +529,8 @@ async def sweep(
         jobs.append(GenJob(label=f"{ax.label} = {ax.fmt.format(v)}",
                            prompt=b.prompt, lyrics=b.lyrics, badges=badges, settings=st))
 
-    run = await render.override(short_name=f"sweep {axis}")(model_key, w, jobs)
+    run = await render_task_for(spec).override(short_name=f"sweep {axis}")(
+        model_key, w, jobs)
     cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}",
                               spec=spec, jobs=jobs, brief=brief)
 
@@ -517,8 +580,9 @@ async def generate_one(
 
     jobs = [GenJob(label=model_key, prompt=the_prompt, lyrics=the_lyrics,
                    badges=[spec.params], settings=st)]
-    w = await fetch_weights.override(short_name=f"fetch {model_key}")(model_key)
-    run = await render.override(short_name=f"render {model_key}")(model_key, w, jobs)
+    w = await _weights_for(spec)
+    run = await render_task_for(spec).override(short_name=f"render {model_key}")(
+        model_key, w, jobs)
 
     # `brief` only names the card honestly when the brief actually supplied the text;
     # a caller-supplied --prompt overrides it, and claiming otherwise would emit a
@@ -542,3 +606,30 @@ if __name__ == "__main__":
     run = flyte.run(compare, suite="quick", models=DEFAULT_MODELS)
     print(f"Compare run: {run.name}")
     print(f"  {run.url}")
+
+
+# ── DiffRhythm smoke test ────────────────────────────────────────────────────────
+#
+# Deliberately separate from `render`: DiffRhythm is the one model with its own image,
+# so before writing an adapter against a repo that has no packaging and no Python API,
+# prove the image builds and its modules import on aarch64. The build itself already
+# runs an import check; this confirms the same thing inside a real GPU pod, with CUDA.
+@diffrhythm_env.task
+async def diffrhythm_smoke() -> str:
+    import sys
+
+    import torch
+
+    from config import DIFFRHYTHM_DIR
+
+    sys.path.insert(0, DIFFRHYTHM_DIR)
+    from model import CFM, DiT           # noqa: F401  (the CFM + DiT stack)
+    from muq import MuQMuLan            # noqa: F401  (the style encoder)
+
+    import transformers
+    from transformers.models.llama import LlamaConfig  # noqa: F401  dit.py needs this
+
+    out = (f"torch={torch.__version__} cuda={torch.cuda.is_available()} "
+           f"transformers={transformers.__version__} imports=OK")
+    log.info(f"[diffrhythm] {out}")
+    return out

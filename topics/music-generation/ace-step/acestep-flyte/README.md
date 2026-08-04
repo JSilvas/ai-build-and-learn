@@ -183,10 +183,49 @@ Write a `_load_<adapter>` and `_generate_<adapter>` in `music_core`, add an
 `ADAPTER_KNOBS` entry, and add a `MusicModelSpec` with `adapter`, `intended_for` and
 `max_duration`. No image change if it loads through diffusers or transformers.
 
-**DiffRhythm** (`ASLP-lab/DiffRhythm2`, 5.07GB, Apache-2.0) is the obvious next one and
-the only true ACE-Step rival found so far: full-length **lyrics-to-song with vocals**,
-also flow-matching, from November 2025. It would be the first model here to need its own
-image, since it ships a custom package rather than loading through either library.
+### DiffRhythm: wired up, not yet rendering (WIP)
+
+`ASLP-lab/DiffRhythm-full`, Apache-2.0, the only true ACE-Step rival found so far:
+full-length **lyrics-to-song with vocals**, also flow-matching. It is fully plumbed and
+**does not yet produce audio**. Recording exactly where it stands, because most of the
+hard parts are done and the remaining blocker is narrow.
+
+**Working and verified on the box:**
+
+- Its own image builds on aarch64 (`config.diffrhythm_image`). No PyPI package and no
+  packaging metadata at all, so it is a git clone on `PYTHONPATH`.
+- `model/__init__.py` imports the trainer, which drags in wandb / pylance / pandas. One
+  `sed` deleting that import removes the entire training dependency tree; inference only
+  needs `CFM` and `DiT`.
+- `CFM`, `DiT` and MuQ-MuLan import cleanly in a GPU pod: `torch=2.13.0+cu130 cuda=True`.
+- Two-image dispatch: `render_task_for(spec)` routes it to `render_diffrhythm` in its own
+  env while the other seven stay on the shared `render`. Both share `_render_jobs`.
+- `orch_env` must list `diffrhythm_env` in `depends_on`, or the run dies at submit with
+  `MissingEnvironment: 'acestep-diffrhythm' not found in image cache`.
+- `self_downloads=True`: its code calls `hf_hub_download` itself, so `_weights_for` hands
+  it an empty Dir and **both** download call sites skip it (`Dir.download()` on an empty
+  Dir raises `DownloadQueueEmpty`).
+- Subprocess adapters must leave the parent CUDA-free, including `reset_peak_memory` /
+  `peak_memory_gb`, which create a context via `torch.cuda.is_available()`.
+- Stripping our inherited `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` from the
+  child moved the failure from model load to the forward pass. Imposing our allocator
+  tuning on someone else's process was our bug.
+
+**The remaining blocker, and it is a genuine bind:**
+
+| transformers | what happens |
+|---|---|
+| 5.14.1 (shared) | imports fine, **fails in the forward pass** inside `LlamaDecoderLayer` -> `self.self_attn(...)`; Llama's attention signature changed in 5.x and `dit.py` drives that class directly |
+| 4.49.0 (their pin) | **driver-level `CUDA error: out of memory`** at `cfm.to(device)`, moving a 2.2GB model onto a GPU with 90GB+ free, with no "Tried to allocate" detail |
+
+A cautionary note on method: the pin was initially dismissed because `CFM`, `DiT` and
+`LlamaConfig` all *import* on 5.x. Imports prove imports, not call signatures. It binds
+at inference.
+
+Next things to try, in order: `ASLP-lab/DiffRhythm2` (newer, `decoder.bin` format, may
+not drive Llama the same way); an intermediate transformers (4.51-4.52) that might clear
+both; or `CUDA_LOG_FILE=stderr` in the child to get the driver's own reason for a
+`cudaMalloc` failure that PyTorch reports without a size.
 
 ---
 

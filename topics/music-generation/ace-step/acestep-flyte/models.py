@@ -76,6 +76,12 @@ class MusicModelSpec:
 
     distilled: bool = False   # guidance-distilled: guidance_scale > 1 is ignored
     gated: bool = False       # HF repo needs terms accepted on the HF_TOKEN account
+
+    # True when the model's own code fetches its checkpoints at runtime rather than
+    # loading from a path we hand it. DiffRhythm calls hf_hub_download internally, so
+    # our fetch_weights step has nothing useful to pre-stage and the orchestrator skips
+    # it; HF_HOME still points somewhere sane so the download is cached per pod.
+    self_downloads: bool = False
     dtype: str = "bfloat16"   # GB10 (Blackwell) is happiest in bf16
     notes: str = ""
 
@@ -237,6 +243,45 @@ MODELS: dict[str, MusicModelSpec] = {
               "beat and synths') beat bare genre tags ('techno').",
     ),
 
+    # ── DiffRhythm (ASLP-lab / NWPU) ─────────────────────────────────────────────
+    #
+    # The only genuine ACE-Step RIVAL in this registry rather than a baseline: it is the
+    # one other model here that writes full-length songs WITH SUNG VOCALS from lyrics,
+    # and it is also flow-matching. Everything else added alongside it (MusicGen,
+    # AudioLDM 2, Stable Audio) is instrumental-only, which is why they read as era
+    # context and this one reads as a comparison.
+    #
+    # March 2025, Apache-2.0, and the busiest repo of the lot (2.3k stars, still being
+    # updated). Two-part: a DiT/CFM song model plus MuQ-MuLan as the style encoder.
+    #
+    # THE ONE MODEL WITH ITS OWN IMAGE. No PyPI package, no packaging metadata at all,
+    # so it is a git clone on PYTHONPATH (see config.diffrhythm_image). Its pinned
+    # torchaudio==2.6.0 / transformers==4.49.0 turned out NOT to bind: verified in a GPU
+    # pod importing fine on torch 2.13+cu130 and transformers 5.14.1.
+    #
+    # Lyrics are TIMED (.lrc, `[mm:ss.xx]line`), not structural like ACE-Step's
+    # [verse]/[chorus]. music_core converts, and the card says so, because a lossy
+    # format conversion that goes unmentioned would quietly disadvantage this model on a
+    # shared brief.
+    "diffrhythm": MusicModelSpec(
+        key="diffrhythm",
+        repo="ASLP-lab/DiffRhythm2",
+        family="DiffRhythm 2 · block flow matching DiT + BigVGAN",
+        license="Apache-2.0",
+        params="~1.1B + MuQ-MuLan",
+        download_gb=5.1,
+        sample_rate=44100,
+        adapter="diffrhythm",
+        intended_for="Full-length songs with SUNG VOCALS from timed lyrics, 44.1kHz "
+                     "stereo. The only model here besides ACE-Step that sings.",
+        max_duration=210.0,   # inference.py --max-secs default
+        steps=16, guidance=2.0,   # v2 CLI defaults
+        self_downloads=True,
+        notes="Style comes from a text prompt through MuQ-MuLan rather than a caption "
+              "encoder, so it reads prompts differently from ACE-Step. Durations are "
+              "quantised: 95 exactly, or 96 to 285.",
+    ),
+
     "musicgen-melody": MusicModelSpec(
         key="musicgen-melody",
         repo="facebook/musicgen-melody",
@@ -259,6 +304,13 @@ MODELS: dict[str, MusicModelSpec] = {
 # 11GB pull and a third 50-step pass is a lot to spend on a question most runs are
 # not asking.
 DEFAULT_MODELS = ["xl-turbo", "xl-sft"]
+
+# The models that can actually SING. Handing a vocal brief to the instrumental-only
+# models is safe (they drop the lyric and their card says so), but a vocal comparison
+# reads better without three cards explaining why they came back instrumental:
+#   flyte run compare_pipeline.py compare --briefs '["indie-vocal"]' \
+#       --models '["xl-turbo","diffrhythm"]'
+VOCAL_MODELS = ["xl-turbo", "diffrhythm"]
 
 
 def get_spec(key: str) -> MusicModelSpec:

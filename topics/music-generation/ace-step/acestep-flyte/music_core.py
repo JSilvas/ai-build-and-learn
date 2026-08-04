@@ -35,6 +35,7 @@ import html
 import io
 import json
 import logging
+import os
 import shlex
 import time
 from dataclasses import dataclass, field
@@ -104,7 +105,14 @@ ADAPTER_KNOBS: dict[str, set[str]] = {
     "musicgen": {"guidance"},
     "audioldm2": {"steps", "guidance"},
     "stableaudio": {"steps", "guidance"},
+    "diffrhythm": {"steps", "guidance", "lyrics"},
 }
+
+
+# Adapters that render by spawning a child process rather than in-process. The parent
+# must leave CUDA alone for these: any context or memory cap it creates only competes
+# with the child for the same unified pool.
+SUBPROCESS_ADAPTERS = {"diffrhythm"}
 
 
 def knobs_for(adapter: str) -> set[str]:
@@ -408,6 +416,8 @@ def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
         return _load_audioldm2(spec, local_dir)
     if spec.adapter == "stableaudio":
         return _load_stableaudio(spec, local_dir)
+    if spec.adapter == "diffrhythm":
+        return None      # a subprocess per render; nothing to hold resident
     return _load_acestep(spec, local_dir, tile)
 
 
@@ -582,233 +592,158 @@ def generate(pipe, spec, prompt: str, lyrics: str = "",
         return _generate_audioldm2(pipe, spec, prompt, settings)
     if spec.adapter == "stableaudio":
         return _generate_stableaudio(pipe, spec, prompt, settings)
+    if spec.adapter == "diffrhythm":
+        return _generate_diffrhythm(spec, prompt, lyrics, settings)
     return _generate_acestep(pipe, spec, prompt, lyrics, settings)
 
 
-# The diffusers docs are explicit that a negative prompt "can significantly improve the
-# quality of the generated audio" for this model, and name this exact string. Applying
-# it by default means the comparison uses the model the way its authors intend.
-STABLE_AUDIO_NEGATIVE = "Low quality, average quality"
+# DiffRhythm accepts exactly 95s, or any value in [96, 285]. Anything else is rejected
+# rather than clamped by their CLI, so snap before we ask.
+def _snap_diffrhythm_duration(seconds: float) -> float:
+    if seconds <= 95.0:
+        return 95.0
+    return float(min(285, max(96, round(seconds))))
 
 
-def _widen_brownian_interval() -> None:
-    """Make the SDE noise sampler's Brownian tree span the sigmas it will be asked for.
+def lyrics_to_lrc(lyrics: str, seconds: float) -> str:
+    """Convert ACE-Step's STRUCTURAL lyrics into DiffRhythm's TIMED .lrc format.
 
-    THE root cause of Stable Audio's `RecursionError`, found by instrumenting rather
-    than guessing. Measured on the box:
+    The two models want different things and this conversion is lossy, which is why the
+    report card says it happened rather than passing it off as equivalent:
 
-        interval = [0.3, 500]        (scheduler config sigma_min / sigma_max)
-        sigmas   = 500.00006 ... 0.323, 0.3, 0.0      (101 values)
-        outside  = index 0 (500.00006) and index 100 (0.0)
+      ACE-Step  : `[verse]` / `[chorus]` structure tags. WHAT part of the song a line
+                  belongs to; the model decides when it lands.
+      DiffRhythm: `[mm:ss.xx]line`. WHEN each line is sung; there is no notion of
+                  section at all.
 
-    `CosineDPMSolverMultistepScheduler` builds ONE `BrownianInterval` over
-    [sigma_min, sigma_max], then queries it with consecutive pairs of `sigmas`. The
-    schedule ends at exactly 0.0, which is below sigma_min, so on the final step
-    torchsde bisects toward a point outside its own domain and never converges. That is
-    why it survived a 50,000-frame recursion limit: the recursion is infinite, not deep.
-
-    Ruled out first, so nobody repeats them: torchsde 0.2.5 vs 0.2.6 (identical), and
-    bf16 / fp16 / fp32 (identical). None of them could matter: the domain is wrong in
-    every dtype.
-
-    The patch widens the domain to [0, sigma_max * 1.001] so both out-of-range endpoints
-    fall inside. It does NOT touch the sigma schedule, so the sampling path is unchanged
-    and only the noise tree's bounds move. Patched at the class, because the scheduler
-    constructs the sampler lazily on its first step and there is no earlier hook.
+    There is no faithful mapping. Structure tags are dropped (they are not lyrics and
+    would be sung), and the remaining lines are spread evenly across the track with a
+    short instrumental head and tail. Even spacing is a real handicap for a model built
+    to follow a supplied vocal rhythm, so a DiffRhythm card on a shared brief is being
+    judged on a lyric it was handed less information about than ACE-Step got.
     """
-    try:
-        import diffusers.schedulers.scheduling_dpmsolver_sde as sde_mod
-    except Exception:
-        log.exception("could not import the SDE scheduler module to widen its interval")
-        return
-    cls = sde_mod.BrownianTreeNoiseSampler
-    if getattr(cls, "_interval_widened", False):
-        return
-    original = cls.__init__
-
-    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda v: v):
-        hi = float(sigma_max) * 1.001      # covers the 500.00006 rounding overshoot
-        original(self, x, 0.0, hi, seed, transform)
-
-    cls.__init__ = __init__
-    cls._interval_widened = True
-    log.info("widened BrownianTreeNoiseSampler domain to [0, sigma_max*1.001]; the "
-             "schedule's final sigma of 0.0 was outside it")
+    lines = [l.strip() for l in (lyrics or "").splitlines()
+             if l.strip() and not l.strip().startswith("[")]
+    if not lines:
+        return ""
+    head, tail = 6.0, 4.0                       # intro / outro breathing room
+    span = max(seconds - head - tail, 1.0)
+    step = span / len(lines)
+    out = []
+    for i, line in enumerate(lines):
+        t = head + i * step
+        out.append(f"[{int(t // 60):02d}:{t % 60:05.2f}]{line}")
+    return "\n".join(out)
 
 
-def _generate_stableaudio(pipe, spec, prompt: str, settings: GenSettings | None):
-    """Text-to-audio through Stable Audio Open. No vocal path, so lyrics are dropped.
+def _generate_diffrhythm(spec, prompt: str, lyrics: str, settings: GenSettings | None):
+    """Render through DiffRhythm 2's CLI.
 
-    ── The recursion limit is not superstition ──────────────────────────────────────
-    This model's scheduler (CosineDPMSolverMultistepScheduler) draws stochastic noise
-    from a torchsde `BrownianInterval`, and locating a sub-interval runs a recursive
-    binary search in `BrownianInterval._loc`. torchsde routes that through the
-    `trampoline` package specifically to survive deep searches, but the depth here
-    still blows Python's default 1000-frame limit:
+    A subprocess, not an import: the repo ships no packaging and no Python entry point,
+    only `inference.py` behind argparse. Calling the script is the honest interface, it
+    keeps their globals out of our process, and it means we are not coupled to a module
+    layout with no stability promise.
 
-        RecursionError: maximum recursion depth exceeded
-          ...torchsde/_brownian/brownian_interval.py:261 in _loc
-             trampoline.trampoline(self._loc_inner(ta, tb, out))
+    v2 rather than v1, and the reason is structural: v1's `dit.py` drives transformers'
+    `LlamaDecoderLayer` directly and never sets `num_attention_heads`, so on any modern
+    transformers its attention and rotary embedding disagree about head_dim and the
+    first forward pass dies. v2 ships its own DiT and a BigVGAN vocoder and never
+    imports Llama at all.
 
-    The depth scales with the ratio between the full sigma range and the queried
-    sub-interval, and a cosine schedule has a very wide range, so this is a property of
-    THIS model's schedule rather than a bug in either library. Two things I tried first
-    and which did NOT help, recorded so nobody repeats them: pinning torchsde back to
-    0.2.5 (the recursion is identical, and the pin drags librosa's numba to a release
-    that will not install on Python 3.12), and looking for a deterministic
-    `algorithm_type` to sidestep the noise sampler (there is none; the scheduler builds
-    a BrownianTreeNoiseSampler unconditionally).
-
-    Raised only around this call and restored afterwards, so one awkward model does not
-    change the stack behaviour of everything else in the process.
+    Input is a JSONL, one song per line:
+        {"song_name": ..., "style_prompt": "<text or a wav path>", "lyrics": "<.lrc>"}
     """
+    import json as _json
+    import subprocess
     import sys
-    import torch
+    import tempfile
 
     st = (settings or GenSettings()).resolve(spec)
-    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
 
-    # ── Diagnostic: what does the Brownian sampler actually get handed? ──────────
-    # Four dtype/version hypotheses failed before this. The sampler builds ONE
-    # BrownianInterval over [config.sigma_min, config.sigma_max] and then queries it
-    # with consecutive entries of `scheduler.sigmas`; if a queried sigma falls OUTSIDE
-    # that interval the search has nothing to bisect toward. Log both so the next
-    # person reads data instead of guessing.
-    try:
-        sch = pipe.scheduler
-        sch.set_timesteps(int(st.steps), device="cuda")
-        sg = sch.sigmas.detach().float().cpu()
-        lo = float(getattr(sch.config, "sigma_min", float("nan")))
-        hi = float(getattr(sch.config, "sigma_max", float("nan")))
-        outside = [(i, float(v)) for i, v in enumerate(sg) if not (lo <= float(v) <= hi)]
-        log.info(f"[stable-audio] interval=[{lo:g}, {hi:g}] sigmas: n={len(sg)} "
-                 f"min={sg.min():g} max={sg.max():g} first3={[f'{v:g}' for v in sg[:3]]} "
-                 f"last3={[f'{v:g}' for v in sg[-3:]]}")
-        log.info(f"[stable-audio] sigmas OUTSIDE the interval: {len(outside)} "
-                 f"{outside[:4]}{' ...' if len(outside) > 4 else ''}")
-    except Exception:
-        log.exception("[stable-audio] could not inspect the sigma schedule")
+    work = Path(tempfile.mkdtemp(prefix="diffrhythm_"))
+    out_dir = work / "out"
+    out_dir.mkdir()
+    lrc = work / "lyrics.lrc"
+    lrc.write_text(lyrics_to_lrc(lyrics, st.duration))
+    jsonl = work / "input.jsonl"
+    jsonl.write_text(_json.dumps({
+        "song_name": "track",
+        "style_prompt": prompt,     # free text; a .wav path would also be accepted
+        "lyrics": str(lrc),
+    }) + "\n")
 
-    _widen_brownian_interval()
-    prev_limit = sys.getrecursionlimit()
-    sys.setrecursionlimit(max(prev_limit, 50_000))
-    t0 = time.perf_counter()
-    try:
-        out = pipe(
-            prompt=prompt,
-            negative_prompt=STABLE_AUDIO_NEGATIVE,
-            audio_end_in_s=float(st.duration),
-            num_inference_steps=int(st.steps),
-            guidance_scale=float(st.guidance),
-            generator=gen,
-        )
-    finally:
-        sys.setrecursionlimit(prev_limit)
-    seconds = time.perf_counter() - t0
+    root = os.environ.get("DIFFRHYTHM_DIR", "/opt/diffrhythm2")
 
-    # .audios is (batch, channels, samples) as a torch tensor; the docs' own example
-    # transposes audios[0] before writing, which confirms the channels-first layout.
-    audio = out.audios[0].detach().to(torch.float32).cpu().numpy()
-    sr = int(pipe.vae.sampling_rate)
-    return audio, sr, seconds, st
-
-
-# AudioLDM2's own docs recommend a negative prompt; without one the output skews toward
-# the low-fidelity, noisy end of what it was trained on. This is the string from the
-# model card, applied by default so the comparison uses the model the way its authors
-# intend rather than a deliberately hobbled version of it.
-AUDIOLDM2_NEGATIVE = "Low quality, average quality, noisy"
-
-
-def _generate_audioldm2(pipe, spec, prompt: str, settings: GenSettings | None):
-    """Text-to-audio through AudioLDM 2.
-
-    Like MusicGen it has no vocal path, so lyrics are dropped; `intended_for` on the
-    card explains why a vocal brief comes back instrumental.
-    """
-    import torch
-
-    st = (settings or GenSettings()).resolve(spec)
-    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
-
-    t0 = time.perf_counter()
-    out = pipe(
-        prompt=prompt,
-        negative_prompt=AUDIOLDM2_NEGATIVE,
-        audio_length_in_s=float(st.duration),
-        num_inference_steps=int(st.steps),
-        guidance_scale=float(st.guidance),
-        generator=gen,
-        output_type="np",
+    # Hand the child a CLEAN allocator config. Our pod sets
+    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True for the in-process models and a
+    # subprocess inherits it silently. DiffRhythm never asked for that allocator, and
+    # leaving it in place produced a bare driver-level `CUDA error: out of memory` from
+    # `.to(device)` with no "Tried to allocate" size, on a GPU where a child probe
+    # allocated happily. Imposing our tuning on someone else's process is our bug.
+    # Strip ALL of it, not just the PyTorch allocator knobs. `CUDA_MODULE_LOADING=EAGER`
+    # is the dangerous one: it forces every kernel in every loaded CUDA library into
+    # memory when the context is created, and this child loads torch + muq + BigVGAN. On
+    # a unified-memory box that is a large upfront allocation, and a driver-level
+    # `cudaMalloc` failure with no "Tried to allocate" size is what it looks like when it
+    # does not fit. Stripping only the two PyTorch vars was not enough: both DiffRhythm
+    # v1 and v2 still OOMed identically, which is what pointed at the env rather than at
+    # either codebase.
+    _OURS = ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_ALLOC_CONF",
+             "CUDA_MODULE_LOADING", "CUDA_CACHE_MAXSIZE")
+    child_env = {k: v for k, v in os.environ.items() if k not in _OURS}
+    child_env["PYTHONPATH"] = root
+    # Measure the child's ACTUAL allocation ceiling instead of theorising about it.
+    # Every env-based hypothesis has now failed, so the question is empirical: how much
+    # CAN this child allocate, and what does the driver say when it stops?
+    probe_src = (
+        "import torch\n"
+        "p=torch.cuda.get_device_properties(0)\n"
+        "print('total_gb',round(p.total_memory/1e9,1))\n"
+        "try:\n"
+        "  f,t=torch.cuda.mem_get_info(); print('free_gb',round(f/1e9,1))\n"
+        "except Exception as e: print('mem_get_info_RAISED',type(e).__name__)\n"
+        "try: print('cgroup',open('/sys/fs/cgroup/memory.max').read().strip())\n"
+        "except Exception: print('cgroup_unreadable')\n"
+        "ok=0\n"
+        "for gb in (0.25,1,2,4,8,16,32):\n"
+        "  try:\n"
+        "    x=torch.zeros(int(gb*1e9),dtype=torch.uint8,device='cuda'); ok=gb; del x\n"
+        "  except Exception as e:\n"
+        "    print('FAILED_at_gb',gb,type(e).__name__); break\n"
+        "print('max_alloc_gb',ok)\n"
     )
-    seconds = time.perf_counter() - t0
-
-    audio = np.asarray(out.audios[0], dtype=np.float32)      # (samples,), mono
-    sr = int(pipe.vocoder.config.sampling_rate)              # 16000
-    return audio, sr, seconds, st
-
-
-# MusicGen's EnCodec runs at 50 frames/sec, so this converts seconds of audio into the
-# `max_new_tokens` the generate call actually wants.
-MUSICGEN_TOKENS_PER_SEC = 50
+    probe = subprocess.run([sys.executable, "-c", probe_src],
+                           capture_output=True, text=True, env=child_env)
+    log.info(f"[diffrhythm] child probe rc={probe.returncode} | "
+             f"{' '.join((probe.stdout or '').split())} | "
+             f"err={(probe.stderr or '').strip()[-160:]}")
 
 
-def _generate_musicgen(pipe, spec, prompt: str, settings: GenSettings | None):
-    """Text-to-music through MusicGen.
-
-    Ignores lyrics entirely, because the model has no vocal path at all: feeding it
-    lyrics would silently treat them as style text and muddy the prompt. `compare`
-    passes them anyway (every model gets the same brief), so dropping them here is the
-    right place to do it, and `intended_for` on the card explains why the vocal briefs
-    come back instrumental.
-    """
-    import torch
-
-    model, processor = pipe
-    st = (settings or GenSettings()).resolve(spec)
-
-    inputs = processor(text=[prompt], padding=True, return_tensors="pt").to(model.device)
-    tokens = int(st.duration * MUSICGEN_TOKENS_PER_SEC)
+    cmd = [sys.executable, f"{root}/inference.py",
+           "--repo-id", spec.repo,
+           "--input-jsonl", str(jsonl),
+           "--output-dir", str(out_dir),
+           "--steps", str(int(st.steps)),
+           "--cfg-strength", str(float(st.guidance)),
+           "--max-secs", str(float(st.duration))]
+    log.info(f"[diffrhythm] inference.py steps={int(st.steps)} "
+             f"cfg={st.guidance:g} max-secs={st.duration:g}")
 
     t0 = time.perf_counter()
-    with torch.no_grad():
-        out = model.generate(**inputs, do_sample=True, guidance_scale=float(st.guidance),
-                             max_new_tokens=tokens)
+    proc = subprocess.run(cmd, cwd=root, capture_output=True, text=True,
+                          env={**child_env, "CUDA_LOG_FILE": "stderr"})
     seconds = time.perf_counter() - t0
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "")[-1800:]
+        raise RuntimeError(f"diffrhythm inference.py exited {proc.returncode}:\n{tail}")
 
-    audio = out[0].detach().to(torch.float32).cpu().numpy()   # (channels, samples)
-    sr = int(model.config.audio_encoder.sampling_rate)
-    return audio, sr, seconds, st
-
-
-def _generate_acestep(pipe, spec, prompt: str, lyrics: str = "",
-                      settings: GenSettings | None = None):
-    import torch
-
-    st = (settings or GenSettings()).resolve(spec)
-    gen = torch.Generator(device="cuda").manual_seed(int(st.seed))
-
-    t0 = time.perf_counter()
-    out = pipe(
-        prompt=prompt,
-        lyrics=lyrics or "",
-        audio_duration=float(st.duration),
-        vocal_language=st.language or "en",
-        num_inference_steps=int(st.steps),
-        guidance_scale=float(st.guidance),
-        shift=float(st.shift),
-        generator=gen,
-        # None is the pipeline's "estimate it yourself" for all three; the sentinels
-        # only exist to survive the CLI, they must not reach the model.
-        bpm=st.bpm or None,
-        keyscale=st.keyscale or None,
-        timesignature=st.timesignature or None,
-    )
-    seconds = time.perf_counter() - t0
-
-    audio = out.audios[0]                       # (channels, samples), float32 on device
-    audio = audio.detach().to(torch.float32).cpu().numpy()
-    return audio, int(pipe.sample_rate), seconds, st
+    made = sorted(out_dir.rglob("*.wav")) + sorted(out_dir.rglob("*.mp3")) \
+        + sorted(out_dir.rglob("*.flac"))
+    if not made:
+        raise RuntimeError(f"diffrhythm produced no audio in {out_dir}; stdout tail:\n"
+                           f"{(proc.stdout or '')[-800:]}")
+    audio, sr = sf.read(str(made[0]), dtype="float32", always_2d=True)
+    return audio.T, int(sr), seconds, st
 
 
 # ── Audio utilities ──────────────────────────────────────────────────────────────

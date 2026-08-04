@@ -192,13 +192,98 @@ gpu_env = flyte.TaskEnvironment(
     env_vars=_GPU_ENV_VARS,
 )
 
+# ── DiffRhythm 2: the first model here that needs its OWN image ────────────────────
+#
+# Everything else in this demo shares one image because it loads through diffusers or
+# transformers. DiffRhythm does neither: there is no PyPI package and no packaging
+# metadata in the repo at all, so it is a git clone plus PYTHONPATH, and its
+# requirements.txt hard-pins `torchaudio==2.6.0` / `transformers==4.49.0` / `numpy` in
+# ways that would drag the whole registry backwards. Same call the TTS demo makes for
+# Chatterbox: isolate it.
+#
+# Three things this build does that are not obvious:
+#
+#  1. NO requirements.txt. Installing it would pull torchaudio 2.6, which has no cu130
+#     aarch64 wheel, and would fight the Spark's torch. We install the inference deps
+#     by hand on top of the cu130 torch already in the base.
+#  2. The trainer import is DELETED. `model/__init__.py` does
+#     `from model.trainer import Trainer`, and trainer.py imports wandb, accelerate and
+#     `dataset.dataset` (pylance, pyarrow, pandas). Inference needs only CFM and DiT, so
+#     one sed removes an entire training dependency tree.
+#  3. espeak-ng is apt-level and load-bearing: phonemizer shells out to it for the
+#     lyric g2p, and a missing espeak-ng is a RUNTIME failure, not an import one.
+#
+# Deps below are exactly what `infer/infer.py` + `infer_utils.py` + `model/` reach for:
+# muq (the MuQ-MuLan style encoder), x-transformers / torchdiffeq / einops (the CFM+DiT
+# stack), mutagen + librosa (audio IO), and the g2p chain for lyrics.
+DIFFRHYTHM_REPO = "https://github.com/ASLP-lab/DiffRhythm2"
+DIFFRHYTHM_DIR = "/opt/diffrhythm2"
+
+diffrhythm_image = (
+    flyte.Image.from_debian_base(
+        name="acestep-diffrhythm", registry=REGISTRY, platform=PLATFORM
+    )
+    .with_apt_packages("git", "ffmpeg", "espeak-ng", "cmake", "build-essential")
+    .with_pip_packages("torch", "torchaudio", index_url=TORCH_INDEX)
+    .with_pip_packages(*_COMMON)
+    .with_pip_packages(
+        # What inference.py + diffrhythm2/ + bigvgan/ actually reach for. NOT their
+        # requirements.txt, which pins torch==2.7 (no cu130 aarch64 wheel) and
+        # transformers==4.47.1.
+        # transformers PINNED to their requirement. v2 imports `StaticCache` from
+        # `transformers.models.llama.modeling_llama`, which moved to `cache_utils` in
+        # transformers 5, so a modern version fails at import:
+        #   ImportError: cannot import name 'StaticCache' ... Did you mean 'DynamicCache'?
+        # (I had assumed v2 avoided transformers' Llama entirely because its own DiT and
+        # BigVGAN do the generation. It does not: the cache class comes from there.)
+        # Pinning is free here because this image is isolated from the other seven models.
+        "einops", "torchdiffeq", "transformers==4.47.1", "muq", "pedalboard", "tqdm",
+        "librosa", "mutagen", "accelerate", "onnxruntime",
+        # the lyric g2p chain
+        "phonemizer", "pypinyin", "jieba", "cn2an", "pykakasi",
+        "unidecode", "inflect", "py3langid",
+        # pyopenjtalk is NOT optional despite English-only lyrics: their CNENTokenizer
+        # imports the whole g2p chain eagerly, and `g2p/g2p/japanese.py` pulls it in at
+        # module level. Skipped it initially as a Japanese-only dep and a risky native
+        # build on aarch64; it is neither optional nor avoidable. cmake and
+        # build-essential are already in this image for exactly this.
+        "pyopenjtalk",
+        "numba>=0.60", "llvmlite>=0.43",
+    )
+    .with_commands([
+        f"git clone --depth 1 {DIFFRHYTHM_REPO} {DIFFRHYTHM_DIR}",
+        # Prove the model modules import at BUILD time rather than discovering it in a
+        # GPU pod. v2 ships its own DiT and BigVGAN vocoder and never touches
+        # transformers' Llama, which is precisely why it avoids the rotary-embedding
+        # dimension bug that blocks v1 on any modern transformers.
+        f"cd {DIFFRHYTHM_DIR} && PYTHONPATH={DIFFRHYTHM_DIR} python -c \""
+        f"from diffrhythm2.cfm import CFM; from diffrhythm2.backbones.dit import DiT; "
+        f"from bigvgan.model import Generator; from muq import MuQMuLan; "
+        f"print('diffrhythm2 imports OK')\"",
+    ])
+)
+
+
+diffrhythm_env = flyte.TaskEnvironment(
+    name="acestep-diffrhythm",
+    image=diffrhythm_image,
+    resources=flyte.Resources(cpu="8", memory="96Gi", gpu=1, disk="80Gi"),
+    secrets=[HF_SECRET],
+    env_vars={**_GPU_ENV_VARS, "PYTHONPATH": DIFFRHYTHM_DIR},
+)
+
+
 orch_env = flyte.TaskEnvironment(
     name="acestep-orch",
     image=fetch_image,
     resources=flyte.Resources(cpu="2", memory="8Gi", disk="40Gi"),
     secrets=[HF_SECRET],
     env_vars=_ENV_VARS,
-    depends_on=[cpu_env, gpu_env],
+    # diffrhythm_env is in here because DiffRhythm runs in its OWN image, and an
+    # orchestrator can only dispatch to environments it declares. Without it the run
+    # dies at submit with `MissingEnvironment: 'acestep-diffrhythm' not found in image
+    # cache`, which is a clear error but only if you already know to expect it.
+    depends_on=[cpu_env, gpu_env, diffrhythm_env],
 )
 
 
