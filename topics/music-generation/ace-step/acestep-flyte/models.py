@@ -278,8 +278,10 @@ MODELS: dict[str, MusicModelSpec] = {
         steps=16, guidance=2.0,   # v2 CLI defaults
         self_downloads=True,
         notes="Style comes from a text prompt through MuQ-MuLan rather than a caption "
-              "encoder, so it reads prompts differently from ACE-Step. Durations are "
-              "quantised: 95 exactly, or 96 to 285.",
+              "encoder, so it reads prompts differently from ACE-Step. `--max-secs` is "
+              "a CEILING, not a target: asked for 95 it produced 96s of song, because "
+              "it lays out the whole lyric and stops. Short asks are therefore not a "
+              "reliable way to get short songs from it.",
     ),
 
     "musicgen-melody": MusicModelSpec(
