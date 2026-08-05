@@ -105,6 +105,19 @@ privileged_state  (216,)   what the VALUE net sees   ground-truth sim state
 
 The critic gets contact forces and true body velocities that a real robot could never measure, which makes the value function much easier to learn, while the policy stays deployable. This is why `train.py` passes `policy_obs_key="state"` and `value_obs_key="privileged_state"`; swap them and you either cripple the critic or train a policy that cannot run on hardware.
 
+## Terrain
+
+Two Playground envs, same code path, same tuned PPO config, same observation and action shapes. They differ only in the scene:
+
+| `--terrain` | Scene | Notes |
+|---|---|---|
+| `rough` (default) | `scene_mjx_feetonly_rough_terrain.xml` | 10x10m heightfield, 0.05m relief, rocky texture |
+| `flat` | `scene_mjx_feetonly_flat_terrain.xml` | a bare plane |
+
+`rough` is the better default on both counts: it's a genuinely harder problem, and it doesn't look like the robot is walking on nothing. The terrain is stored in the checkpoint, and `render.py` reads it from there rather than from a default — replaying a rough-terrain policy on flat ground would silently compare two different problems.
+
+Known cosmetic wart: the rough scene ships no skybox, so its background renders black where flat's is grey. Affects the replay's looks, not the physics.
+
 ## Reward presets
 
 Each preset is a small diff on top of DeepMind's scales, not a rewrite. Only the named keys change.
@@ -163,6 +176,16 @@ AttributeError: jax.device_put_replicated is deprecated; use jax.device_put inst
 Nothing in the install warns you; it fails after the env has already built and compiled. 0.9.2 still ships the function (as a `DeprecationWarning`) and its cuda13 plugin still enumerates the GB10. Lift the pin when brax moves off the old pmap API.
 
 **MJX runs on Warp now.** MuJoCo 3.11's MJX uses `mujoco_warp` (`impl="warp"`), not pure JAX/XLA. It reports `CUDA Toolkit 12.9, Driver 13.0`, sees the GB10 as `sm_121, 120 GiB, mempool enabled`, and JIT-compiles a long list of kernels on first use (~40s). That is a one-off, but it is why the first iteration looks hung.
+
+**`mujoco_menagerie` must be baked into Playground's own package directory.** `MENAGERIE_PATH` is `<site-packages>/mujoco_playground/external_deps/mujoco_menagerie`, hardcoded relative to the module file, with no env var to redirect it. An earlier version of `config.py` cloned it to `/opt/mujoco_menagerie` and that did nothing whatsoever: every task pod still printed `mujoco_menagerie not found. Downloading...` and re-cloned at runtime, costing minutes per task and putting a network dependency inside a job that should have none. The fix is to call Playground's own installer at image build time:
+
+```python
+.with_commands([
+    "python -c 'from mujoco_playground._src import mjx_env; mjx_env.ensure_menagerie_exists()'",
+])
+```
+
+That also inherits its pinned `MENAGERIE_COMMIT_SHA`, so the robot XMLs can't drift from the version the env code expects.
 
 **Rendering is CPU, and a different backend.** MJX's fast path needs the GPU and MJX has no renderer. The replay rebuilds the same env with `impl="jax"` (loads in 0.5s on CPU) and draws through headless EGL. So the policy is *trained* on Warp and *replayed* on JAX. Those are two implementations of one model and should agree closely, but they are not bit-identical: if a replay disagrees badly with the eval reward, suspect this first.
 

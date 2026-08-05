@@ -30,7 +30,7 @@ import flyte.app
 import flyte.remote as remote
 
 from config import APP_NAME, APP_PORT, studio_app_image
-from envs import DEFAULT_PRESET, PRESETS
+from envs import DEFAULT_PRESET, DEFAULT_TERRAIN, PRESETS, TERRAINS
 
 PROJECT = os.environ.get("FLYTE_PROJECT", "physical-ai")
 DOMAIN = os.environ.get("FLYTE_DOMAIN", "development")
@@ -135,6 +135,11 @@ def create_demo():
                 info="Throughput scales close to linearly. 8192 is what the tuned "
                      "config uses; it also needs the most memory.",
             )
+            w_terrain = gr.Radio(
+                choices=list(TERRAINS), value=DEFAULT_TERRAIN, label="Terrain",
+                info="rough is a 10x10m heightfield with a rocky texture: harder, and "
+                     "it does not look like the robot is walking on nothing.",
+            )
             with gr.Row():
                 w_dr = gr.Checkbox(
                     value=True, label="Domain randomization",
@@ -147,17 +152,17 @@ def create_demo():
             w_link = gr.HTML()
 
             w_go.click(
-                lambda p, s, n, dr, sd: (
+                lambda p, s, n, t, dr, sd: (
                     yield from _launch(
                         "walk",
-                        f"Training **{key_of[p]}** for {int(s):,} steps across "
-                        f"{int(n):,} envs. Rough estimate: {_eta(int(s))}. Watch the "
-                        f"reward curve in the Report tab.",
+                        f"Training **{key_of[p]}** on **{t}** terrain for {int(s):,} "
+                        f"steps across {int(n):,} envs. Rough estimate: {_eta(int(s))}. "
+                        f"Watch the reward curve in the Report tab.",
                         preset=key_of[p], num_timesteps=int(s), num_envs=int(n),
-                        domain_randomization=bool(dr), seed=int(sd),
+                        terrain=t, domain_randomization=bool(dr), seed=int(sd),
                     )
                 ),
-                [w_preset, w_steps, w_envs, w_dr, w_seed],
+                [w_preset, w_steps, w_envs, w_terrain, w_dr, w_seed],
                 [w_status, w_link],
             )
 

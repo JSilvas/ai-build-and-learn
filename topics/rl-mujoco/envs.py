@@ -34,10 +34,39 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-# The Playground registry name. The rough-terrain sibling
-# ("G1JoystickRoughTerrain") is the same code path and the same PPO config; swap the
-# string to train on uneven ground once flat works.
-ENV_NAME = "G1JoystickFlatTerrain"
+# ── Terrain ─────────────────────────────────────────────────────────────────────
+#
+# Two Playground envs, same code path, same tuned PPO config, and the same
+# observation/action shapes. They differ in the scene XML:
+#
+#   flat   scene_mjx_feetonly_flat_terrain.xml    a plane
+#   rough  scene_mjx_feetonly_rough_terrain.xml   a 10x10m heightfield (hfield.png,
+#                                                 0.05m relief) with a rocky texture
+#
+# Rough is the better demo on both counts. It is a genuinely harder problem, so the
+# gait has to cope with ground that is not level, and it does not look like the robot
+# is walking on nothing. Verified loading and rendering on this box 2026-08-04.
+#
+# Known cosmetic wart: the rough scene ships no skybox, so the background renders
+# black where flat's is grey. Only affects the replay's looks, not the physics.
+TERRAINS: dict[str, str] = {
+    "flat": "G1JoystickFlatTerrain",
+    "rough": "G1JoystickRoughTerrain",
+}
+DEFAULT_TERRAIN = "rough"
+
+# Kept for callers that just want "the env": the flat one, which is what the first
+# runs on this box trained against.
+ENV_NAME = TERRAINS["flat"]
+
+
+def env_name(terrain: str = DEFAULT_TERRAIN) -> str:
+    try:
+        return TERRAINS[terrain]
+    except KeyError:
+        raise ValueError(
+            f"Unknown terrain {terrain!r}. Known: {', '.join(TERRAINS)}"
+        ) from None
 
 # Measured, not guessed. Asserted at env-build time so a Playground upgrade that
 # changes the observation layout fails loudly here instead of silently training a
@@ -110,6 +139,21 @@ PRESETS: dict[str, RewardPreset] = {
         notes="Penalise jerk and energy. Slower, cleaner gait.",
     ),
 
+    # Measured weakness of the 300M baseline run (2026-08-04): forward and backward
+    # tracking are good (commanded +1.0 -> +0.88 m/s body-frame, commanded -0.5 ->
+    # -0.43), but TURNING is essentially absent (commanded +1.0 rad/s yaw -> -0.06)
+    # and strafing only half lands (+0.4 -> +0.22).
+    #
+    # The likely reason is that it is cheap to ignore: tracking_ang_vel is scaled 0.75
+    # against tracking_lin_vel's 1.0 and a large pile of other terms, so a policy that
+    # nails forward speed and ignores yaw still scores well. This preset roughly
+    # doubles the turning term and lifts lateral tracking with it.
+    "turner": RewardPreset(
+        key="turner",
+        scales={"tracking_ang_vel": 1.5, "tracking_lin_vel": 1.25},
+        notes="Push yaw tracking, which the baseline barely learns.",
+    ),
+
     # Easy mode, for the "does the harness work end to end" run and for the first
     # half of the stream. No random pushes and no sensor noise means the policy has a
     # much simpler problem, so it shows visible progress far sooner. It will NOT be
@@ -144,12 +188,16 @@ def _set_nested(cfg, dotted: str, value) -> None:
     setattr(node, parts[-1], value)
 
 
-def build_env_config(preset_key: str = DEFAULT_PRESET, episode_length: int | None = None):
+def build_env_config(
+    preset_key: str = DEFAULT_PRESET,
+    episode_length: int | None = None,
+    terrain: str = DEFAULT_TERRAIN,
+):
     """Playground's default G1 config, plus the njmax fix and one preset's diff."""
     from mujoco_playground import registry
 
     preset = get_preset(preset_key)
-    cfg = registry.get_default_config(ENV_NAME)
+    cfg = registry.get_default_config(env_name(terrain))
 
     cfg.njmax = NJMAX
 
@@ -171,16 +219,21 @@ def build_env_config(preset_key: str = DEFAULT_PRESET, episode_length: int | Non
     return cfg
 
 
-def build_env(preset_key: str = DEFAULT_PRESET, episode_length: int | None = None):
+def build_env(
+    preset_key: str = DEFAULT_PRESET,
+    episode_length: int | None = None,
+    terrain: str = DEFAULT_TERRAIN,
+):
     """Load the G1 env with a preset applied, and verify its shapes are what we expect."""
     from mujoco_playground import registry
 
-    cfg = build_env_config(preset_key, episode_length)
-    env = registry.load(ENV_NAME, config=cfg)
+    name = env_name(terrain)
+    cfg = build_env_config(preset_key, episode_length, terrain)
+    env = registry.load(name, config=cfg)
 
     if env.action_size != EXPECTED_ACTION_SIZE:
         raise RuntimeError(
-            f"{ENV_NAME} action_size is {env.action_size}, expected "
+            f"{name} action_size is {env.action_size}, expected "
             f"{EXPECTED_ACTION_SIZE}. Playground changed the model; re-check the "
             f"network config in train.py before trusting a run."
         )
@@ -201,7 +254,7 @@ def build_env(preset_key: str = DEFAULT_PRESET, episode_length: int | None = Non
     return env, cfg
 
 
-def get_randomizer():
+def get_randomizer(terrain: str = DEFAULT_TERRAIN):
     """Playground's domain randomizer for the G1, or None if it has none.
 
     Domain randomization (per-env friction, mass, motor gains) is what makes the
@@ -210,4 +263,4 @@ def get_randomizer():
     """
     from mujoco_playground import registry
 
-    return registry.get_domain_randomizer(ENV_NAME)
+    return registry.get_domain_randomizer(env_name(terrain))

@@ -49,6 +49,7 @@ async def walk(
     domain_randomization: bool = True,
     replay_steps: int = 500,
     snapshot_every_pct: float = 15.0,
+    terrain: str = envs.DEFAULT_TERRAIN,
 ) -> str:
     """Train one G1 policy, then replay it into the report.
 
@@ -59,11 +60,12 @@ async def walk(
     """
     import asyncio
 
-    envs.get_preset(preset)  # fail fast on a typo, before burning an hour of GPU
+    envs.get_preset(preset)   # fail fast on a typo, before burning an hour of GPU
+    envs.env_name(terrain)    # same, for terrain
 
     await flyte.report.replace.aio(
         "<h2>Unitree G1 - learning to walk (MJX + Brax PPO)</h2>"
-        f"<p>Training preset <b>{preset}</b> for {num_timesteps:,} steps "
+        f"<p>Training preset <b>{preset}</b> on <b>{terrain}</b> terrain for {num_timesteps:,} steps "
         f"across {num_envs:,} parallel environments...</p>"
     )
     await flyte.report.flush.aio()
@@ -76,6 +78,7 @@ async def walk(
         seed=seed,
         domain_randomization=domain_randomization,
         snapshot_every_pct=snapshot_every_pct,
+        terrain=terrain,
     )
 
     # Two clips, not one. The trained policy on its own is unevaluable: "is that good

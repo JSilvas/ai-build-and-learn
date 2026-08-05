@@ -134,11 +134,23 @@ def _mjx_image(name: str) -> flyte.Image:
         .with_apt_packages("git", "ffmpeg", *_GL_APT)
         .with_pip_packages(*MJX_SPEC)
         # Playground fetches the robot XMLs (mujoco_menagerie) on first use, which
-        # would mean a network call inside every task pod. Bake it into the image
-        # instead: one clone at build time, no surprise at run time.
+        # would otherwise be a git clone inside EVERY task pod, on every run.
+        #
+        # ⚠️ It must land in Playground's OWN package directory. MENAGERIE_PATH is
+        # `<site-packages>/mujoco_playground/external_deps/mujoco_menagerie`, hardcoded
+        # relative to the module file, with no env var to redirect it. An earlier
+        # version of this file cloned to /opt/mujoco_menagerie and it did nothing at
+        # all: every pod still printed "mujoco_menagerie not found. Downloading..."
+        # and re-cloned, which is minutes of wall clock per task and a network
+        # dependency in a job that should have none.
+        #
+        # Calling Playground's own `ensure_menagerie_exists()` rather than doing the
+        # clone by hand means we also inherit its pinned commit
+        # (MENAGERIE_COMMIT_SHA), so the robot XMLs cannot drift from the version the
+        # env code expects.
         .with_commands([
-            "git clone --depth 1 https://github.com/google-deepmind/mujoco_menagerie.git "
-            "/opt/mujoco_menagerie",
+            "python -c 'from mujoco_playground._src import mjx_env; "
+            "mjx_env.ensure_menagerie_exists()'",
         ])
     )
 
@@ -170,13 +182,16 @@ studio_app_image = (
 # Cross-env calls need the caller to `depends_on` the callee's env or `flyte run` won't
 # build the callee's image ("Environment '…' not found in image cache").
 
-# memory=64Gi: MJX's memory is dominated by num_envs x the per-env state, and the
-# whole rollout buffer is resident. 64Gi leaves the render task and the OS room in the
-# shared 119.7GiB pool. If a pod goes Unschedulable, this is the knob to turn down.
+# memory=96Gi: MJX's memory is dominated by num_envs x the per-env state, and the whole
+# rollout buffer is resident. 64Gi was enough for 4096 envs (verified) but 8192 is the
+# value DeepMind's config actually uses, and env state scales with it. The node reports
+# 125.5GiB allocatable with under 1GiB reserved by anything else, so 96Gi schedules
+# fine and still leaves the OS and the render task room in the shared pool.
+# If a pod goes Unschedulable, this is the knob to turn down.
 gpu_env = flyte.TaskEnvironment(
     name="g1-train",
     image=image,
-    resources=flyte.Resources(cpu="8", memory="64Gi", gpu=1, disk="50Gi"),
+    resources=flyte.Resources(cpu="8", memory="96Gi", gpu=1, disk="50Gi"),
     env_vars={**_SPARK_ENV, **_RENDER_ENV},
 )
 

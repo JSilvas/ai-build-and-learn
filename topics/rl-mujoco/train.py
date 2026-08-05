@@ -114,11 +114,15 @@ def _wait_for_gpu(timeout_s: int = 900, poll_s: int = 20) -> None:
         time.sleep(poll_s)
 
 
-def _ppo_params(num_timesteps: int, num_envs: int, num_evals: int):
-    """Playground's tuned G1 PPO config, with the three knobs we expose overridden."""
+def _ppo_params(num_timesteps: int, num_envs: int, num_evals: int, terrain: str):
+    """Playground's tuned G1 PPO config, with the knobs we expose overridden.
+
+    Flat and rough share one tuned config in Playground, but we read it per-terrain
+    rather than hardcoding flat, so a future divergence upstream carries through.
+    """
     from mujoco_playground.config import locomotion_params
 
-    params = locomotion_params.brax_ppo_config(envs.ENV_NAME)
+    params = locomotion_params.brax_ppo_config(envs.env_name(terrain))
     params.num_timesteps = num_timesteps
     params.num_envs = num_envs
     params.num_evals = num_evals
@@ -141,6 +145,7 @@ async def train_policy(
     domain_randomization: bool = True,
     snapshot_every_pct: float = 15.0,
     snapshot_steps: int = 250,
+    terrain: str = envs.DEFAULT_TERRAIN,
 ) -> File:
     """Train one G1 walking policy and return its checkpoint.
 
@@ -169,10 +174,11 @@ async def train_policy(
     log.info(f"device: {jax.devices()}")
     log.info(f"preset: {spec.key} -- {spec.notes}")
 
-    env, cfg = envs.build_env(preset)
+    env, cfg = envs.build_env(preset, terrain=terrain)
+    log.info(f"terrain: {terrain} ({envs.env_name(terrain)})")
     log.info(f"env: action_size={env.action_size} obs={env.observation_size} njmax={cfg.njmax}")
 
-    params = _ppo_params(num_timesteps, num_envs, num_evals)
+    params = _ppo_params(num_timesteps, num_envs, num_evals, terrain)
 
     # The asymmetric actor-critic wiring. See the envs.py docstring: the policy is
     # restricted to onboard-sensor-shaped observations, the critic gets ground truth.
@@ -183,7 +189,7 @@ async def train_policy(
     assert net_cfg["value_obs_key"] == envs.VALUE_OBS_KEY, net_cfg
     network_factory = functools.partial(ppo_networks.make_ppo_networks, **net_cfg)
 
-    randomizer = envs.get_randomizer() if domain_randomization else None
+    randomizer = envs.get_randomizer(terrain) if domain_randomization else None
     log.info(f"domain randomization: {'on' if randomizer else 'off'}")
 
     # Progress is streamed into the Flyte report as it arrives rather than dumped at
@@ -327,7 +333,8 @@ async def train_policy(
                 "params": jax.device_get(trained_params),
                 "history": history,
                 "preset": spec.key,
-                "env_name": envs.ENV_NAME,
+                "env_name": envs.env_name(terrain),
+                "terrain": terrain,
                 "network_factory": net_cfg,
                 "num_timesteps": num_timesteps,
                 "num_envs": num_envs,

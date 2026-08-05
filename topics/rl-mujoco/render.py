@@ -131,12 +131,16 @@ async def render_replay(
         raise ValueError(f"policy must be 'trained' or 'random', got {policy!r}")
 
     preset = ckpt.get("preset", envs.DEFAULT_PRESET)
-    log.info(f"replaying policy={policy} preset={preset} ({ckpt.get('num_timesteps', 0):,} steps trained)")
+    # Read the terrain off the CHECKPOINT, never a default: replaying a
+    # rough-terrain policy on flat ground (or vice versa) silently compares two
+    # different problems. Older checkpoints predate the field, hence the fallback.
+    terrain = ckpt.get("terrain", "flat")
+    log.info(f"replaying policy={policy} preset={preset} terrain={terrain} ({ckpt.get('num_timesteps', 0):,} steps trained)")
 
     # Same env, CPU backend. See the module docstring on why this is impl="jax".
-    cfg = envs.build_env_config(preset)
+    cfg = envs.build_env_config(preset, terrain=terrain)
     cfg.impl = "jax"
-    env = registry.load(envs.ENV_NAME, config=cfg)
+    env = registry.load(envs.env_name(terrain), config=cfg)
 
     if policy == "trained":
         # Rebuild the exact network the checkpoint was trained with.
@@ -195,7 +199,7 @@ async def render_replay(
 
     label = "Trained policy" if policy == "trained" else "Random policy (before training)"
     caption = (
-        f"{label} | preset={preset} | "
+        f"{label} | preset={preset} | terrain={terrain} | "
         f"command=({command[0]:.1f}, {command[1]:.1f}, {command[2]:.1f}) | "
         f"{walked}/{steps} steps survived | reward {total_reward:.1f}"
     )
@@ -228,6 +232,7 @@ async def render_replay(
                 "policy": policy,
                 "label": label,
                 "preset": preset,
+                "terrain": terrain,
                 "steps": walked,
                 "reward": total_reward,
                 "fell": walked < steps,
