@@ -317,7 +317,7 @@ async def scale(
     large: str = VITG,
     clip: str = "bowling",
     frames: int = 32,
-    block: int = 5,
+    block: int = 8,
     seed: int = 0,
 ) -> dict:
     """Does a bigger self-supervised encoder carry more? Same clips, same masks, same probe.
