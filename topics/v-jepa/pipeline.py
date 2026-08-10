@@ -127,14 +127,15 @@ async def inpaint(
         heat_frames = viz.heat_video(shown, field)
         pair = viz.side_by_side_video(masked_frames, heat_frames)
         mp4 = viz.encode_mp4(pair, fps=12)
-        log.info("%s: %s | %s", name, scored, viz.probe(mp4))
+        probed = viz.probe(mp4)  # decodes the clip; do it once, not once per use
+        log.info("%s: %s | %s", name, scored, probed)
 
         share = float(mask3d.float().mean())
         cells.append((
             name,
             viz.video_html(mp4, f"left: what the encoder saw ({share:.0%} of tokens hidden). "
                                 f"right: per-patch prediction quality, grey = not masked.")
-            + reports.note(viz.probe(mp4))
+            + reports.note(probed)
             + reports.score_table(
                 [("predictor", scored), ("context mean (no model)", ctx),
                  ("shuffled pairing (chance)", floor)],

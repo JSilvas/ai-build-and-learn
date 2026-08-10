@@ -33,13 +33,17 @@ vjepa (orchestrator, CPU)
 .venv/bin/flyte run pipeline.py inpaint     # ~30s after the image is built
 .venv/bin/flyte run pipeline.py inpaint --clip archery --context 0.75
 .venv/bin/flyte run pipeline.py probe       # ~3 min
-.venv/bin/flyte run pipeline.py scale       # ~8 min, two encoders
-.venv/bin/flyte run pipeline.py vjepa       # all three
+.venv/bin/flyte run pipeline.py scale       # ~6 min, two encoders
+.venv/bin/flyte run pipeline.py vjepa       # all three in sequence, ~10 min
 ```
 
 Runs to the `world-models` Flyte project, alongside [topics/cosmos](../cosmos) and [topics/dreamerv3](../dreamerv3). The three are the same question asked three ways: Cosmos predicts the future in pixels, Dreamer learns a latent world model of one environment from its own experience, V-JEPA 2 predicts representations learned self-supervised from internet video.
 
 Data is [`nateraw/kinetics-mini`](https://huggingface.co/datasets/nateraw/kinetics-mini): 100 clips, 5 classes, ungated, under 200 MB, and already the dataset the transformers V-JEPA 2 docs use.
+
+Verified end to end on the devbox on 2026-08-10: all four tasks green, including the full `vjepa` orchestrator (run `rrzl29rg57rpt2l85h6x`). Every number in this README comes from one of those runs.
+
+> If a report renders blank in the Flyte console, that is not a bug in the demo: forward port **30002** (rustfs) in VSCode so the browser can reach the object store the report assets live in.
 
 ## The finding: this checkpoint inpaints, it does not forecast
 
@@ -86,6 +90,17 @@ The pixel baseline is the one that matters. "78% on 5-way action recognition" is
 The second result is a trap worth knowing about. **V-JEPA 2's token cloud sits in a narrow cone.** The mean cosine between two random patch tokens of the same clip is 0.28 at the last layer and 0.92 at layer 8: raw cosine is dominated by a component every token shares and tells you almost nothing. Subtract the per-clip mean token first and random pairs drop to ~0.00, while adjacent patches sit at 0.33 and distant patches at 0.08.
 
 That is not cosmetic, and the demo puts a number on it rather than asserting it: the *same* retrieval scores **82% centred and 76% raw**. Every similarity in this repo is computed on centred features for that reason.
+
+## Does a bigger encoder fix the forecasting? No
+
+`scale` runs both measurements on two encoder sizes, same clips, same masks, same probe. Run `rzcfj6hrb2z9b65fsxnj`, 32 frames, masks matched at 48% / 50%:
+
+| encoder | params | linear probe | 1-NN retrieval | tube, time localised | future, time localised |
+|---|---|---|---|---|---|
+| ViT-L/16 | 326M | 78% | **82%** | 1.00 (dt 0, chance 5) | 0.00 (dt 3, chance 2) |
+| ViT-g/16 | 1035M | **82%** | 79% | 1.00 (dt 0, chance 5) | 0.00 (dt 2, chance 2) |
+
+Three separate things worth noticing. Tripling the parameters buys **4 points of probe accuracy** and, on this small a benchmark, slightly *worse* retrieval, so the two ways of asking "are the features good?" do not agree. Both models already saturate the in-distribution mask. And neither one can extrapolate forward in time at all: **scaling the encoder does not turn an inpainter into a forecaster**, which is what you would expect if the limit is the pretraining objective rather than capacity.
 
 ## What did not work, and is therefore not in the demo
 
