@@ -1,0 +1,43 @@
+# NVIDIA Cosmos 3 on a DGX Spark (GB10 Blackwell, aarch64, CUDA 13.0).
+#
+# Cosmos 3 ships two serving surfaces. This demo takes the DIFFUSERS one, not the
+# `cosmos-framework` / `uv sync` path from NVIDIA's own cookbook. The reason is
+# architecture: the framework path pulls natten and a handful of other CUDA
+# extensions that build from source on aarch64, and the diffusers path needs none
+# of them (transformer_cosmos3.py routes attention through diffusers'
+# `dispatch_attention_fn`, so plain torch SDPA is enough).
+#
+# torch is NOT pinned here: it comes from https://download.pytorch.org/whl/cu130
+# via setup.sh, because the aarch64+CUDA build only exists on that index. The
+# plain-PyPI aarch64 wheel is CPU-only and will silently give you a box with no GPU.
+
+# Cosmos3OmniPipeline, Cosmos3OmniTransformer, Cosmos3AVAEAudioTokenizer and
+# CosmosActionCondition all landed in 0.39.0. This is a hard floor: on 0.38 the
+# import simply does not exist, and several blog posts telling you to install
+# diffusers from git are stale.
+diffusers>=0.39.0
+
+# Cosmos 3's vision tower is Qwen3VLVisionModel and its tokenizer is
+# Qwen2TokenizerFast (see the checkpoint's model_index.json). Qwen3-VL support
+# starts at transformers 5.11.
+transformers>=5.11
+accelerate>=1.10
+safetensors
+sentencepiece
+protobuf
+pillow
+numpy
+
+huggingface_hub
+hf_transfer
+
+# Media. PyAV encodes the report mp4 and is what diffusers.utils.encode_video needs
+# to mux Cosmos 3's generated audio track. aarch64 wheels exist for it; the same
+# is not reliably true of imageio-ffmpeg, which is the conclusion the
+# video-generation and Isaac Sim demos both reached independently.
+av
+imageio
+
+# Deliberately NOT installed: cosmos_guardrail. It is a separate model download that
+# pulls a gated Llama Guard checkpoint, and every task here constructs the pipeline
+# with enable_safety_checker=False. See the note in config.py before changing that.
