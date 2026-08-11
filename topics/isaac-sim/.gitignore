@@ -1,0 +1,10 @@
+# The Isaac trees live in $ISAAC_ROOT (~/isaac), never here. This is belt and
+# braces in case someone sets ISAAC_ROOT=. and wonders why git wants 50 GB.
+IsaacSim/
+IsaacLab/
+_build/
+_isaac_sim
+__pycache__/
+*.pyc
+outputs/
+logs/
