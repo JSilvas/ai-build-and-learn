@@ -315,6 +315,43 @@ DEFAULT_MODELS = ["xl-turbo", "xl-sft"]
 VOCAL_MODELS = ["xl-turbo", "diffrhythm"]
 
 
+@dataclass
+class Variant:
+    """One take of the same song, with its own knobs. The studio's unit of work.
+
+    Lives HERE rather than next to the task that consumes it because the Gradio app
+    builds these, and the app image is deliberately slim: it has no torch, no
+    diffusers, no matplotlib. `compare_pipeline` imports `music_core`, so importing
+    Variant from there would drag the whole render stack into a launcher pod whose
+    entire job is to submit a run. This module imports `dataclasses` and nothing else,
+    which is what keeps that honest.
+
+    Every other entry point fixes WHICH knob varies: `sweep` moves one, `grid` crosses
+    two, `takes` moves length. That is right for an experiment, where the value of the
+    design is that nothing else can explain the difference. It is wrong for actually
+    making music, where you want two seeds, and one of them longer, and one of them on
+    the other checkpoint, in the same report, and you do not care that the design is
+    unbalanced.
+
+    Sentinels mean "inherit", matching GenSettings, with one addition: `duration = 0`
+    means DERIVE it from the lyric, because the studio's point is that you paste words
+    and get something sensible without having done the density homework first.
+    """
+    label: str = ""              # "" -> auto-labelled from what differs
+    model_key: str = "xl-sft"
+    seed: int = 42
+    duration: float = 0.0        # 0 -> derived from the lyric
+    steps: int = 0               # 0 -> checkpoint default
+    guidance: float = -1.0       # <0 -> checkpoint default
+    shift: float = -1.0
+    bpm: int = 0
+    keyscale: str = ""
+    timesignature: str = ""
+    cfg_interval_start: float = 0.0
+    cfg_interval_end: float = 1.0
+    language: str = "en"
+
+
 def get_spec(key: str) -> MusicModelSpec:
     if key not in MODELS:
         raise ValueError(f"unknown model {key!r}; known: {', '.join(MODELS)}")

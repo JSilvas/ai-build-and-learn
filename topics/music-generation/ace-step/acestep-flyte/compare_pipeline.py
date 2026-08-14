@@ -59,7 +59,7 @@ import soundfile as sf
 import music_core
 import prompts
 from config import cpu_env, diffrhythm_env, gpu_env, orch_env
-from models import DEFAULT_MODELS, get_sweep, get_spec, resolve_models
+from models import DEFAULT_MODELS, Variant, get_sweep, get_spec, resolve_models
 from music_core import Block, GenSettings, TrackResult
 from prompts import Brief, DEFAULT_BRIEF, get_brief, get_suite
 
@@ -769,38 +769,7 @@ async def density(
 
 # ── variants: the studio's entry point ───────────────────────────────────────────
 
-@dataclass
-class Variant:
-    """One take of the same song, with its own knobs.
-
-    Every other entry point here fixes WHICH knob varies: `sweep` moves one, `grid`
-    crosses two, `takes` moves length. That is right for an experiment, where the
-    question is known in advance and the value of the design is that nothing else can
-    explain the difference. It is wrong for actually making music, where you want two
-    seeds, and one of them longer, and one of them on the other checkpoint, all in the
-    same report, and you do not care that the design is unbalanced.
-
-    So a Variant is a free-form override set. Sentinels mean "inherit", matching
-    GenSettings, with one addition: `duration = 0` means DERIVE it from the lyric via
-    `prompts.suggest_durations`, because the studio's whole point is that you paste
-    words and get something sensible without having done the density homework.
-    """
-    label: str = ""              # "" -> auto-labelled from what differs
-    model_key: str = "xl-sft"
-    seed: int = 42
-    duration: float = 0.0        # 0 -> derived from the lyric
-    steps: int = 0               # 0 -> checkpoint default
-    guidance: float = -1.0       # <0 -> checkpoint default
-    shift: float = -1.0
-    bpm: int = 0
-    keyscale: str = ""
-    timesignature: str = ""
-    cfg_interval_start: float = 0.0
-    cfg_interval_end: float = 1.0
-    language: str = "en"
-
-
-def _auto_label(v: "Variant", base: "Variant", i: int) -> str:
+def _auto_label(v: Variant, base: Variant, i: int) -> str:
     """Name a card by what makes it DIFFERENT, falling back to its position.
 
     A row of cards all reading "xl-sft" is useless, and a row reading the full settings
@@ -1145,6 +1114,7 @@ async def generate_one(
     shift: float = -1.0,
     bpm: int = 0,
     keyscale: str = "",
+    timesignature: str = "",
     language: str = "en",
 ) -> ModelRun:
     """Render a single track. The cheapest 'does this even load on the box' check.
@@ -1160,6 +1130,7 @@ async def generate_one(
     st = GenSettings(seed=seed, steps=steps, guidance=guidance, shift=shift,
                      duration=duration, bpm=bpm or (0 if prompt else b.bpm),
                      keyscale=keyscale or ("" if prompt else b.keyscale),
+                     timesignature=timesignature,
                      language=language)
 
     jobs = [GenJob(label=model_key, prompt=the_prompt, lyrics=the_lyrics,
