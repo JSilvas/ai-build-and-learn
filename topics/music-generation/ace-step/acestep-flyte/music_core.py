@@ -101,7 +101,7 @@ GPU_MIN_FRACTION = 0.30         # ~36GB of a 120GB pool: never cap tighter than 
 # A binary "is it diffusion" test was not enough: AudioLDM2 has steps but no shift.
 ADAPTER_KNOBS: dict[str, set[str]] = {
     "acestep": {"steps", "guidance", "shift", "bpm", "keyscale", "timesignature",
-                "language", "lyrics"},
+                "language", "lyrics", "cfg_interval"},
     "musicgen": {"guidance"},
     "audioldm2": {"steps", "guidance"},
     "stableaudio": {"steps", "guidance"},
@@ -312,6 +312,22 @@ class GenSettings:
     timesignature: str = ""    # "" -> let the model estimate
     language: str = "en"
 
+    # WHERE on the denoising schedule CFG is applied, as a fraction. The pipeline's own
+    # defaults are the full range, and unlike the knobs above these are real values
+    # rather than sentinels: 0.0 is a meaningful start, so there is no spare value to
+    # mean "inherit".
+    #
+    # Worth having because guidance has two effects that arrive at different times. Its
+    # useful effect is early, where the schedule is deciding form, groove and
+    # arrangement and being pushed toward the prompt actually helps. Its damage is late,
+    # where the remaining work is texture and detail, and pushing hard there is what
+    # makes a high CFG sound harsh, brittle and over-saturated. Restricting CFG to the
+    # first part of the schedule is therefore the standard way to ask for adherence
+    # WITHOUT the artifacts, and it is the reason a plain guidance sweep can leave you
+    # choosing between "drifts" and "harsh" with nothing in between.
+    cfg_interval_start: float = 0.0
+    cfg_interval_end: float = 1.0
+
     def resolve(self, spec) -> "GenSettings":
         """Concrete settings for `spec`, with the checkpoint's defaults filled in."""
         out = GenSettings(**vars(self))
@@ -358,6 +374,12 @@ class GenSettings:
             bits.append(f"cfg {self.guidance:g}")
         if "shift" in has:
             bits.append(f"shift {self.shift:g}")
+        # Only shown when it is not the full range, because "cfg 0-1" on every card is
+        # noise; a restricted interval is the notable thing and deserves to stand out.
+        if "cfg_interval" in has and (self.cfg_interval_start > 0.0
+                                      or self.cfg_interval_end < 1.0):
+            bits.append(f"cfg over {self.cfg_interval_start:g}-"
+                        f"{self.cfg_interval_end:g}")
         bits.append(f"{self.duration:g}s")
         if self.bpm:
             bits.append(f"{self.bpm} bpm")
@@ -771,6 +793,8 @@ def _generate_acestep(pipe, spec, prompt: str, lyrics: str = "",
         bpm=st.bpm or None,
         keyscale=st.keyscale or None,
         timesignature=st.timesignature or None,
+        cfg_interval_start=float(st.cfg_interval_start),
+        cfg_interval_end=float(st.cfg_interval_end),
     )
     seconds = time.perf_counter() - t0
 
@@ -984,6 +1008,106 @@ def encode_audio(data: np.ndarray, sr: int, fmt: str, sub: str) -> bytes:
     return buf.getvalue()
 
 
+def analyze_audio(audio, sr: int) -> dict:
+    """Objective measurements of a rendered track. NOT a quality score.
+
+    Nothing here says whether a track is good; every one of these is a named physical
+    property, and they earn their place because several of the complaints this demo
+    chases are physical rather than aesthetic:
+
+      dynamics    Loud-to-quiet spread, p95 minus p10 of short-term RMS in dB. This is
+                  the "everything is huge all the time" measurement. A maximalist,
+                  brickwalled render leaves the ear no variation to read as human
+                  performance, and it shows up here as a small number. It is the direct
+                  test of the production-language A/B: `BALLAD_PROMPT_DRY` explicitly
+                  asks for quiet verses and loud choruses, so if that caption works at
+                  all this number must rise.
+      crest       Peak-to-RMS in dB. The same idea instant by instant rather than
+                  section by section, and the classic over-compression tell.
+      clipped     Fraction of samples pinned at full scale. High guidance pushing the
+                  output into the rails is a real failure mode and an invisible one.
+      centroid    Spectral centre of mass in Hz, i.e. brightness. The harshness proxy:
+                  a high CFG that has gone glassy moves energy upward.
+      hf_ratio    Share of energy above 8kHz. Same question, aimed at the band where
+                  "brittle" and "sizzly" actually live.
+      width       1 minus the L/R correlation. 0 is mono, larger is wider. The README
+                  claims low step counts narrow the stereo image; this is how you check
+                  that by measurement instead of by assertion.
+      onset       Mean onset strength. Transient sharpness, which is the first thing to
+                  blur when steps drop, so it is the numeric form of "smeared".
+
+    Read them as DIFFERENTIALS across a sweep, never as absolutes. Every experiment in
+    this repo already varies one knob with everything else fixed, which is exactly the
+    setup that makes a row of these numbers meaningful; a single number on a single
+    track tells you almost nothing.
+    """
+    out: dict[str, float] = {}
+    try:
+        a = np.asarray(audio, dtype=np.float32)
+        if a.ndim == 1:
+            a = a[None, :]
+        if a.shape[0] > a.shape[1]:          # (samples, channels) -> (channels, samples)
+            a = a.T
+        mono = a.mean(axis=0)
+        if mono.size < sr // 4:
+            return out
+
+        peak = float(np.abs(mono).max())
+        rms = float(np.sqrt(np.mean(mono ** 2)))
+        if rms > 0:
+            out["crest"] = round(20 * np.log10(peak / rms), 1)
+
+        # Short-term loudness, 100ms hops. The spread matters, not the level.
+        hop = max(sr // 10, 1)
+        n = (mono.size // hop) * hop
+        if n >= hop * 8:
+            frames = mono[:n].reshape(-1, hop)
+            fr = np.sqrt((frames ** 2).mean(axis=1)) + 1e-9
+            db = 20 * np.log10(fr)
+            # Drop near-silence so an intro or a fade does not masquerade as dynamics.
+            db = db[db > db.max() - 60]
+            if db.size > 8:
+                out["dynamics"] = round(float(np.percentile(db, 95)
+                                              - np.percentile(db, 10)), 1)
+
+        out["clipped"] = round(float(np.mean(np.abs(mono) >= 0.99)), 5)
+
+        spec = np.abs(np.fft.rfft(mono[:sr * 30] * np.hanning(min(mono.size, sr * 30))))
+        freqs = np.fft.rfftfreq(min(mono.size, sr * 30), 1 / sr)
+        tot = spec.sum()
+        if tot > 0:
+            out["centroid"] = round(float((freqs * spec).sum() / tot))
+            out["hf_ratio"] = round(float(spec[freqs > 8000].sum() / tot), 4)
+
+        if a.shape[0] == 2:
+            l, r = a[0], a[1]
+            if l.std() > 0 and r.std() > 0:
+                out["width"] = round(1.0 - float(np.corrcoef(l, r)[0, 1]), 3)
+
+        # Onset strength without librosa: positive spectral flux over a coarse STFT.
+        win = 2048
+        m = mono[:sr * 30]
+        n2 = (m.size // win) * win
+        if n2 >= win * 4:
+            mags = np.abs(np.fft.rfft(m[:n2].reshape(-1, win) * np.hanning(win), axis=1))
+            flux = np.diff(mags, axis=0)
+            out["onset"] = round(float(np.maximum(flux, 0).sum(axis=1).mean()), 1)
+    except Exception:
+        log.exception("analyze_audio failed; card will simply omit the metrics")
+    return out
+
+
+_METRIC_HELP = {
+    "dynamics": "loud-to-quiet spread in dB; small = compressed",
+    "crest": "peak-to-RMS in dB; small = compressed",
+    "clipped": "fraction of samples at full scale",
+    "centroid": "spectral centre of mass in Hz; brightness",
+    "hf_ratio": "share of energy above 8kHz; harshness band",
+    "width": "1 - L/R correlation; 0 = mono",
+    "onset": "mean onset strength; transient sharpness",
+}
+
+
 def audio_data_uri(audio, sr: int, budget: int = MAX_EMBED_BYTES) -> tuple[str, str]:
     """(data_uri, note). An empty uri plus a note means 'too big, spectrogram only'.
 
@@ -1169,6 +1293,7 @@ class TrackResult:
     error: str = ""
     intended_for: str = ""       # what this model is FOR (cross-family fairness)
     repro: Repro | None = None   # how to make this card again
+    metrics: dict = field(default_factory=dict)   # analyze_audio(); measurements only
 
     @property
     def speedup(self) -> float:
@@ -1191,6 +1316,9 @@ def build_track_result(label: str, audio, sr: int, seconds: float, *,
         spec_uri=waveform_spectrogram_png(a, sr),
         peak_gb=peak_gb, badges=list(badges or []), embed_note=note, repro=repro,
         intended_for=intended_for,
+        # Measured here rather than at each call site so every report gets them: the
+        # sweeps, the grids, `takes` and `run_local` all funnel through this function.
+        metrics=analyze_audio(a, sr),
     )
 
 
@@ -1202,6 +1330,13 @@ class Block:
     prompt: str = ""        # the style caption used, shown verbatim
     lyrics: str = ""        # shown collapsed; "" renders as "instrumental"
     results: list[TrackResult] = field(default_factory=list)
+
+    # What the collapsed lyric fold is called. It exists because a report whose rows
+    # deliberately SHARE one lyric (the genre swap) renders the same ten lines under
+    # every row, and a reader who does not already know that reads it as a bug: "it
+    # printed the same lyrics for every genre". The fold looked identical whether the
+    # sameness was the experiment or a broken loop. Naming it is the whole fix.
+    lyrics_label: str = "lyrics"
 
 
 # ── Rendering ────────────────────────────────────────────────────────────────────
@@ -1217,6 +1352,11 @@ REPORT_CSS = """
   .mg-title { font-weight: 600; font-size: 15px; }
   .mg-note { color: #4b5563; font-size: 13px; line-height: 1.5; margin-top: 5px; }
   .mg-prompt { color: #374151; font-size: 12.5px; margin-top: 8px; font-style: italic; }
+  .mg-mets { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 4px 6px; }
+  .mg-met { font-size: 10.5px; color: #4b5563; background: #f3f4f6;
+            border: 1px solid #e5e7eb; border-radius: 4px; padding: 1px 5px;
+            font-variant-numeric: tabular-nums; cursor: help; }
+  .mg-met b { color: #111827; font-weight: 600; }
   .mg-lyr { margin-top: 8px; font-size: 12.5px; color: #374151; }
   .mg-lyr pre { white-space: pre-wrap; font-size: 12px; line-height: 1.45;
                 background: #fff; border: 1px solid #e5e7eb; border-radius: 6px;
@@ -1307,8 +1447,18 @@ def _cell(r: TrackResult) -> str:
     # 30s instrumental model losing a "sing me a chorus" prompt is not a quality result.
     intended = (f'<div class="mg-for">{html.escape(r.intended_for)}</div>'
                 if r.intended_for else "")
+    # Measurements, not a score. Rendered as a plain row with the units in the tooltip,
+    # and deliberately NOT colour-coded or ranked: the moment one of these gets a green
+    # tick the report is claiming to know which track is better, which it does not.
+    met = ""
+    if r.metrics:
+        bits = "".join(
+            f'<span class="mg-met" title="{html.escape(_METRIC_HELP.get(k, k))}">'
+            f'{html.escape(k)} <b>{v:g}</b></span>'
+            for k, v in r.metrics.items())
+        met = f'<div class="mg-mets">{bits}</div>'
     cap = (f'<div class="mg-cap"><div class="mg-model">{html.escape(r.label)}</div>'
-           f'{tags}{fast}{settings}{sub}{sublabel}{intended}</div>')
+           f'{tags}{fast}{settings}{sub}{sublabel}{met}{intended}</div>')
     return f'<div class="mg-cell">{img}{_player(r)}{note}{cap}{_repro(r)}</div>'
 
 
@@ -1330,7 +1480,8 @@ def _block(b: Block) -> str:
     prompt = (f'<div class="mg-prompt">🎛️ {html.escape(b.prompt)}</div>'
               if b.prompt else "")
     if b.lyrics.strip():
-        lyr = (f'<details class="mg-lyr"><summary>lyrics</summary>'
+        lyr = (f'<details class="mg-lyr">'
+               f'<summary>{html.escape(b.lyrics_label)}</summary>'
                f'<pre>{html.escape(b.lyrics.strip())}</pre></details>')
     elif b.prompt:
         lyr = '<div class="mg-lyr">🎹 instrumental (no lyrics)</div>'

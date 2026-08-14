@@ -419,6 +419,48 @@ SWEEPS: dict[str, SweepAxis] = {
                    "'minor = sad' falls apart, because dorian is a minor scale that "
                    "does not sound sad.",
     ),
+    "cfg_end": SweepAxis(
+        field="cfg_interval_end",
+        values=(0.25, 0.5, 0.75, 1.0),
+        label="CFG cutoff (guidance applied from the start until X)",
+        listen_for="Guidance does two different things at two different times, and this "
+                   "separates them. EARLY on the schedule it is deciding form, groove "
+                   "and arrangement, and pushing toward the prompt genuinely helps. "
+                   "LATE it is rendering texture and detail, and pushing hard there is "
+                   "what makes a high CFG sound harsh, brittle and over-saturated. So "
+                   "1.0 is the usual full-range behaviour and the smaller values switch "
+                   "guidance off partway through. Run this WITH a high --guidance: the "
+                   "question is whether 0.5 gives you the adherence of a strong CFG "
+                   "without its glassy sheen, which is the thing a plain guidance sweep "
+                   "cannot offer you because there every option is all-or-nothing.",
+        fmt="{:g}",
+        turbo_ok=False,
+    ),
+    "cfg_start": SweepAxis(
+        field="cfg_interval_start",
+        values=(0.0, 0.25, 0.5),
+        label="CFG onset (guidance applied from X onward)",
+        listen_for="The mirror of `cfg_end`, and the one that should be WORSE if the "
+                   "reasoning behind it is right. Here guidance is off while the "
+                   "arrangement is being decided and only switches on later, for the "
+                   "detail pass. Expect prompt adherence to fall away (the model "
+                   "chose the shape unguided) while the harshness stays, since that is "
+                   "the half of the schedule where it comes from. A control, in other "
+                   "words: if these sound fine, the early/late story is wrong.",
+        fmt="{:g}",
+        turbo_ok=False,
+    ),
+    "timesignature": SweepAxis(
+        field="timesignature",
+        values=("4", "3", "6"),
+        label="time signature metadata",
+        listen_for="The last unexercised item in the structured-metadata block, "
+                   "alongside bpm and keyscale. 4 is common time, 3 is a waltz, 6 is "
+                   "compound. Count along. The interesting case is a caption whose "
+                   "genre strongly implies 4/4 (a rock ballad, say) asked for 3: does "
+                   "the metadata win, does the genre prior win, or do you get something "
+                   "that lurches between them?",
+    ),
     "duration": SweepAxis(
         field="duration",
         values=(20.0, 40.0, 80.0),
