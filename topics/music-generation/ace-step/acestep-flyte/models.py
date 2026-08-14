@@ -284,6 +284,59 @@ MODELS: dict[str, MusicModelSpec] = {
               "reliable way to get short songs from it.",
     ),
 
+    # ── MiniMax-Music3 (MiniMaxAI) ───────────────────────────────────────────────
+    #
+    # The THIRD model here that sings, and the newest by a wide margin: released
+    # August 2026, wired the day it dropped. That makes it the most interesting
+    # comparison in the registry right now, because ACE-Step 1.5 XL (April 2026) and
+    # DiffRhythm 2 (November 2025) are the current open state of the art at this job
+    # and this arrived after both.
+    #
+    # It takes ACE-Step's lyric format almost exactly: `[verse]` / `[chorus]` structure
+    # tags on their own lines. That is worth more than it sounds. DiffRhythm needs
+    # TIMED `.lrc` lyrics, so `lyrics_to_lrc` throws away the structure and spreads
+    # lines evenly, which handicaps it on any shared brief and the card has to say so.
+    # MiniMax needs no conversion at all, so a head-to-head against ACE-Step is the
+    # first genuinely apples-to-apples vocal comparison in this demo.
+    #
+    # 32kHz stereo against ACE-Step's 48kHz, which the report's full-Nyquist
+    # spectrogram will show as a hard ceiling at 16kHz. Not a flaw, just a different
+    # choice, and exactly the kind of thing the plot exists to make visible.
+    #
+    # LICENSE IS THE CATCH and it is not open source despite living on the Hub. The
+    # MiniMax-Music3 Community License permits commercial use but attaches conditions
+    # the MIT/Apache models here do not: you must prominently display "MiniMax-Music3"
+    # in a commercial product, you need separate written authorization above $20M
+    # yearly revenue, and its acceptable-use policy REQUIRES disclosing that output is
+    # machine-generated when publishing anywhere public. It is also silent on who owns
+    # the generated audio, where ACE-Step (MIT) and DiffRhythm (Apache-2.0) are not.
+    #
+    # 57GB is by far the largest fetch in the registry, and most of it is language
+    # model: an 18.5GB `qwen_7B/` sits alongside a separate 17.2GB `language_model/`.
+    "minimax-music3": MusicModelSpec(
+        key="minimax-music3",
+        repo="MiniMaxAI/MiniMax-Music3",
+        family="MiniMax-Music3 · flow-matching over a Qwen3 LM",
+        license="MiniMax-Music3 Community License (NOT open source: attribution "
+                "required, AI disclosure required, $20M revenue gate, silent on "
+                "output ownership)",
+        params="2B DiT + Qwen3-8B",
+        download_gb=57.4,
+        # 44100, NOT the 32000 the model card blurb states. The vocoder config is the
+        # authority (`vocoder/config.json`: sampling_rate 44100) and the adapter
+        # re-checks it at run time. Tagged at 32000 the audio played 27% slow and
+        # nothing failed: the only symptom was a voice that sounded slowed down.
+        sample_rate=44100,
+        adapter="minimax",
+        intended_for="Full songs with SUNG VOCALS from structured lyrics, up to ~6 "
+                     "minutes, 44.1kHz stereo. The third model here that sings.",
+        max_duration=360.0,   # ~9000 frames at 25fps
+        notes="Released August 2026 and wired the same day. Uses ACE-Step's structure "
+              "tags verbatim, so unlike DiffRhythm it needs no lossy lyric conversion "
+              "and the head-to-head is genuinely fair. Its own image: it needs "
+              "diffusers from an unreleased PR commit for ModularPipeline support.",
+    ),
+
     "musicgen-melody": MusicModelSpec(
         key="musicgen-melody",
         repo="facebook/musicgen-melody",
@@ -312,7 +365,48 @@ DEFAULT_MODELS = ["xl-turbo", "xl-sft"]
 # reads better without three cards explaining why they came back instrumental:
 #   flyte run compare_pipeline.py compare --briefs '["indie-vocal"]' \
 #       --models '["xl-turbo","diffrhythm"]'
-VOCAL_MODELS = ["xl-turbo", "diffrhythm"]
+# Three FAMILIES now, not two, and `xl-sft` rather than `xl-turbo` because the turbo
+# checkpoint's 8-step distillation is audibly smeared on vocals and this list exists to
+# compare singing. MiniMax needs no lyric conversion (same structure tags), DiffRhythm
+# does, so the card says so for one of the three and not the others.
+VOCAL_MODELS = ["xl-sft", "diffrhythm", "minimax-music3"]
+
+
+@dataclass
+class Variant:
+    """One take of the same song, with its own knobs. The studio's unit of work.
+
+    Lives HERE rather than next to the task that consumes it because the Gradio app
+    builds these, and the app image is deliberately slim: it has no torch, no
+    diffusers, no matplotlib. `compare_pipeline` imports `music_core`, so importing
+    Variant from there would drag the whole render stack into a launcher pod whose
+    entire job is to submit a run. This module imports `dataclasses` and nothing else,
+    which is what keeps that honest.
+
+    Every other entry point fixes WHICH knob varies: `sweep` moves one, `grid` crosses
+    two, `takes` moves length. That is right for an experiment, where the value of the
+    design is that nothing else can explain the difference. It is wrong for actually
+    making music, where you want two seeds, and one of them longer, and one of them on
+    the other checkpoint, in the same report, and you do not care that the design is
+    unbalanced.
+
+    Sentinels mean "inherit", matching GenSettings, with one addition: `duration = 0`
+    means DERIVE it from the lyric, because the studio's point is that you paste words
+    and get something sensible without having done the density homework first.
+    """
+    label: str = ""              # "" -> auto-labelled from what differs
+    model_key: str = "xl-sft"
+    seed: int = 42
+    duration: float = 0.0        # 0 -> derived from the lyric
+    steps: int = 0               # 0 -> checkpoint default
+    guidance: float = -1.0       # <0 -> checkpoint default
+    shift: float = -1.0
+    bpm: int = 0
+    keyscale: str = ""
+    timesignature: str = ""
+    cfg_interval_start: float = 0.0
+    cfg_interval_end: float = 1.0
+    language: str = "en"
 
 
 def get_spec(key: str) -> MusicModelSpec:
@@ -418,6 +512,48 @@ SWEEPS: dict[str, SweepAxis] = {
                    "unusual key and a modal scale are where a model that memorized "
                    "'minor = sad' falls apart, because dorian is a minor scale that "
                    "does not sound sad.",
+    ),
+    "cfg_end": SweepAxis(
+        field="cfg_interval_end",
+        values=(0.25, 0.5, 0.75, 1.0),
+        label="CFG cutoff (guidance applied from the start until X)",
+        listen_for="Guidance does two different things at two different times, and this "
+                   "separates them. EARLY on the schedule it is deciding form, groove "
+                   "and arrangement, and pushing toward the prompt genuinely helps. "
+                   "LATE it is rendering texture and detail, and pushing hard there is "
+                   "what makes a high CFG sound harsh, brittle and over-saturated. So "
+                   "1.0 is the usual full-range behaviour and the smaller values switch "
+                   "guidance off partway through. Run this WITH a high --guidance: the "
+                   "question is whether 0.5 gives you the adherence of a strong CFG "
+                   "without its glassy sheen, which is the thing a plain guidance sweep "
+                   "cannot offer you because there every option is all-or-nothing.",
+        fmt="{:g}",
+        turbo_ok=False,
+    ),
+    "cfg_start": SweepAxis(
+        field="cfg_interval_start",
+        values=(0.0, 0.25, 0.5),
+        label="CFG onset (guidance applied from X onward)",
+        listen_for="The mirror of `cfg_end`, and the one that should be WORSE if the "
+                   "reasoning behind it is right. Here guidance is off while the "
+                   "arrangement is being decided and only switches on later, for the "
+                   "detail pass. Expect prompt adherence to fall away (the model "
+                   "chose the shape unguided) while the harshness stays, since that is "
+                   "the half of the schedule where it comes from. A control, in other "
+                   "words: if these sound fine, the early/late story is wrong.",
+        fmt="{:g}",
+        turbo_ok=False,
+    ),
+    "timesignature": SweepAxis(
+        field="timesignature",
+        values=("4", "3", "6"),
+        label="time signature metadata",
+        listen_for="The last unexercised item in the structured-metadata block, "
+                   "alongside bpm and keyscale. 4 is common time, 3 is a waltz, 6 is "
+                   "compound. Count along. The interesting case is a caption whose "
+                   "genre strongly implies 4/4 (a rock ballad, say) asked for 3: does "
+                   "the metadata win, does the genre prior win, or do you get something "
+                   "that lurches between them?",
     ),
     "duration": SweepAxis(
         field="duration",

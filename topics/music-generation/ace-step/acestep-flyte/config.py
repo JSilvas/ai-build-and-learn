@@ -273,6 +273,56 @@ diffrhythm_env = flyte.TaskEnvironment(
 )
 
 
+# ── MiniMax-Music3 ───────────────────────────────────────────────────────────────
+#
+# The SECOND model here with its own image, and for the same class of reason as
+# DiffRhythm: it needs a `diffusers` the rest of the registry must not have.
+#
+# MiniMax-Music3 loads through `ModularPipeline`, and support for it landed in a
+# diffusers PR that has not shipped in a release. So this image installs diffusers from
+# that exact commit. Putting an unreleased diffusers into the shared `gen_image` would
+# put five working models (ACE-Step x3, AudioLDM 2, Stable Audio) on an unreleased
+# dependency to gain one, which is the wrong trade; isolating it costs a build and
+# risks nothing.
+#
+# Pinned to the COMMIT, not to a branch. A branch would silently change under us and
+# turn a reproducible image into a moving target, and the failure would look like the
+# model breaking rather than the dependency moving.
+MINIMAX_DIFFUSERS_COMMIT = "dafe3733fcfdbf3c48915fe77be3aef65b5d6a2d"
+
+minimax_image = (
+    flyte.Image.from_debian_base(
+        name="acestep-minimax", registry=REGISTRY, platform=PLATFORM
+    )
+    .with_apt_packages("git", "ffmpeg")
+    .with_pip_packages("torch", "torchaudio", index_url=TORCH_INDEX)
+    .with_pip_packages(*_COMMON)
+    .with_pip_packages(
+        f"diffusers @ git+https://github.com/huggingface/diffusers.git"
+        f"@{MINIMAX_DIFFUSERS_COMMIT}",
+        "transformers", "accelerate", "sentencepiece", "librosa",
+    )
+    # Check the import at BUILD time, not in a GPU pod eleven minutes into a 57GB
+    # download. This is the lesson DiffRhythm taught twice: a build-time
+    # `RUN python -c "import ..."` catches a broken dependency tree in seconds, where
+    # the same failure at run time costs a pod, a queue slot and the download.
+    .with_commands([
+        'python -c "from diffusers import ModularPipeline; '
+        'print(\'ModularPipeline import OK\')"',
+    ])
+)
+
+minimax_env = flyte.TaskEnvironment(
+    name="acestep-minimax",
+    image=minimax_image,
+    resources=flyte.Resources(cpu="8", memory="96Gi", gpu=1, disk="120Gi"),
+    secrets=[HF_SECRET],
+    # 120Gi of disk, not the usual 80: the repo is ~57GB and the pod needs room for the
+    # downloaded Dir plus whatever it unpacks alongside it.
+    env_vars=_GPU_ENV_VARS,
+)
+
+
 orch_env = flyte.TaskEnvironment(
     name="acestep-orch",
     image=fetch_image,
@@ -283,7 +333,7 @@ orch_env = flyte.TaskEnvironment(
     # orchestrator can only dispatch to environments it declares. Without it the run
     # dies at submit with `MissingEnvironment: 'acestep-diffrhythm' not found in image
     # cache`, which is a clear error but only if you already know to expect it.
-    depends_on=[cpu_env, gpu_env, diffrhythm_env],
+    depends_on=[cpu_env, gpu_env, diffrhythm_env, minimax_env],
 )
 
 

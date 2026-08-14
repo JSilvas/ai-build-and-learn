@@ -1,0 +1,50 @@
+# DreamerV3 on a DGX Spark (GB10 Blackwell, aarch64, CUDA 13.0).
+#
+# This list deliberately does NOT match upstream's requirements.txt, and the two
+# differences are the whole reason this file exists.
+#
+# 1. jax[cuda13], NOT the upstream jax[cuda12]==0.4.33. The GB10 is Blackwell,
+#    compute capability sm_121. CUDA 12 builds of that vintage have no kernels for
+#    it, so the pinned stack cannot use this GPU at all. jax-cuda13-plugin publishes
+#    manylinux aarch64 wheels, and 0.9.2 is the version the MuJoCo demo next door
+#    (topics/rl-mujoco) already proved on this box.
+#
+#    The cost of moving forward five minor versions is that jax made everything after
+#    `fun` keyword-only in jax.jit, which upstream still calls positionally. That is
+#    what patches/0001-jax-jit-keyword-only.patch fixes: six call sites, no behaviour
+#    change. Verified: the agent initialises, XLA compiles, and training runs.
+#
+# 2. No numpy<2 cap. Upstream caps numpy below 2, and its own comment says why:
+#    "DMLab: <2, MineRLv1.0: <1.24". We run DMC (dm_control on MuJoCo), neither of
+#    those, and jax 0.9.2 requires numpy>=2.0, so the cap is both unnecessary and
+#    unsatisfiable here.
+#
+# Not installed on purpose: ale_py, autorom, and the Minecraft/DMLab extras. They are
+# large, they pull ROM licence prompts, and none of them are DMC.
+jax[cuda13]==0.9.2
+
+# The agent itself. ninjax is Danijar's module system, elements/embodied/portal/scope
+# /granular are his supporting libraries, and dreamerv3 imports all of them.
+ninjax
+elements
+portal
+scope
+granular
+optax
+einops
+chex
+jaxtyping
+colored_traceback
+ruamel.yaml
+tqdm
+
+# The environment. dm_control is the DeepMind Control Suite, which runs on MuJoCo, so
+# this is the same physics engine as topics/rl-mujoco and the comparison is honest.
+dm_control
+mujoco
+
+# Media. PyAV encodes the replay mp4; aarch64 wheels exist for it, imageio-ffmpeg's do
+# not reliably (the same conclusion the video-generation and Isaac Sim demos reached).
+av
+imageio
+numpy

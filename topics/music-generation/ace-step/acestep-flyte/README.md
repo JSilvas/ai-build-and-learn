@@ -10,6 +10,8 @@ Two questions, two entry points:
 |---|---|---|
 | `compare` | which **checkpoint**? | `flyte run compare_pipeline.py compare --suite quick` |
 | `sweep` | what does this **knob** do? | `flyte run compare_pipeline.py sweep --axis seed` |
+| `takes` | which **length** is right for this song? | `flyte run compare_pipeline.py takes --brief indie-vocal` |
+| `density` | how much room does a lyric line need? | `flyte run compare_pipeline.py density` |
 
 `compare` puts turbo, sft and base side by side on the same brief. `sweep` holds
 everything fixed and moves exactly one parameter across a row you play left to right.
@@ -248,6 +250,276 @@ A fair head-to-head would supply real timings.
 
 ---
 
+## Making a song: render several lengths, then choose
+
+```bash
+flyte run compare_pipeline.py takes --brief indie-vocal
+flyte run compare_pipeline.py takes --brief indie-vocal --seeds '["42","7"]'
+flyte run compare_pipeline.py takes --brief ballad-flyte-callouts --durations '["120","144","180"]'
+```
+
+`sweep --axis duration` and this render similar things for different reasons. A sweep
+moves one knob to **explain** it. `takes` is the working surface for actually making a
+song, where length is not a parameter you reason about but a judgement you make by ear
+once the options are next to each other.
+
+That is why the lengths are **derived from the lyric** rather than fixed.
+`prompts.suggest_durations()` counts the sung lines and brackets the estimated
+seconds-per-line target by roughly 3x, so the ladder contains the right answer even
+while the target itself is provisional:
+
+| brief | sung lines | ladder |
+|---|---|---|
+| `bossa-pt` | 4 | 14s, 24s, 41s |
+| `indie-vocal` | 8 | 29s, 48s, 82s |
+| `ballad-flyte-callouts` | 21 | 76s, 126s, 214s |
+| `synthwave-vocal` | 22 | 79s, 132s, 224s |
+| instrumental (no lyric) | 0 | 30s, 60s, 120s |
+
+A fixed 20/40/80 gets this wrong at both ends: it crams a 22-line lyric and wastes a
+4-line hook. The instrumental ladder is fixed because density is undefined without
+words, and for an instrumental the length is a compositional choice rather than a
+constraint.
+
+**Length is not a crop.** It is fed to the model up front, so the rungs are different
+*arrangements* of the same song rather than longer and shorter cuts of one take. Every
+card carries its own reproduce command, so choosing is: listen, copy the handle off the
+winner, render that one again at a higher step count or another seed.
+
+`SECONDS_PER_LINE = 6.0` currently, and the comment on it says exactly what it is: one
+listening pass on the `density` grid, on a cell that is still confounded. Nothing
+depends on it being right, because it is the centre of a bracket rather than a setting.
+
+**It is probably too low, and the evidence keeps pointing the same way.** Three
+independent listening reactions so far: short tracks sound compressed; 144s was the
+best cell in the grid; and the 21-line ballad wanted 240s, which is **11.4s per line**.
+That is above the top rung of the current ladder (10.2s/line), meaning the bracket is
+mis-centred rather than merely uncertain. The clean test already exists as two runs of
+the identical ballad at 144s and 240s, same seed, nothing else changed. If the long one
+wins, `SECONDS_PER_LINE` roughly doubles and every ladder re-centres with it, which is
+a one-line change and the reason the constant is in one place.
+
+---
+
+## Does the model take direction?
+
+```bash
+flyte run compare_pipeline.py compare --suite callouts --models '["xl-turbo"]' --duration 144
+```
+
+ACE-Step documents five structure tags as real conditioning: `[intro]`, `[verse]`,
+`[chorus]`, `[bridge]`, `[outro]`. It documents **nothing** about performance
+directions, the things a producer scribbles in a margin: `[belted]`, `[whispered]`,
+`[breakdown]`, `[guitar solo]`, `[half-time]`. Three outcomes are plausible and only
+rendering both tells you which:
+
+1. **They condition.** The chorus is visibly bigger than the verse, the breakdown
+   actually drops the drums, and you have found an undocumented control surface.
+2. **They are ignored.** The pair differs about as much as two seeds would.
+3. **They get sung.** This README already warns that writing "instrumental" in the
+   lyrics field makes the model sing the word. A singer solemnly delivering the words
+   "guitar solo" is the funniest result and the most informative.
+
+**The plain lyric is derived, not written twice.** `strip_callouts()` removes the
+undocumented tags and keeps the structure tags, so the two takes are word-for-word
+identical by construction. Two hand-written versions would differ by a word somewhere
+and that word would be indistinguishable from the effect. Callouts sit on their own
+lines so `sung_lines` counts 21 in both variants; an inline `[belted] I am durable`
+would start with a bracket and silently drop out of the count.
+
+### The two ballads
+
+The same song in two registers, verse for verse, 21 sung lines each:
+
+| brief | what it is |
+|---|---|
+| `ballad-flyte-plain` / `-callouts` | A power ballad about durable execution, played completely straight. The comedy is in treating a retry policy as heartbreak, which only lands if the singer means it. |
+| `ballad-serious-plain` / `-callouts` | The same skeleton with every literal term turned back into the human thing it was borrowed from. |
+
+The joke version and the sincere version are structurally the same song, which is
+either a point about metaphor or a point about infrastructure. `--suite
+ballad-registers` plays them against each other with the callouts held constant.
+
+Suites: `callouts` (all four), `callouts-flyte`, `callouts-serious`,
+`ballad-registers`.
+
+---
+
+## How much room does a lyric line need?
+
+```bash
+flyte run compare_pipeline.py density
+```
+
+Short tracks sound more compressed and more obviously synthetic. This entry point is
+the experiment behind that observation, and it exists because the rule of thumb further
+down this README ("budget roughly 4 seconds of track per sung line") was folklore that
+nobody had measured.
+
+ACE-Step paces the **whole** lyric to fit `audio_duration` rather than truncating it,
+so a long lyric in a short render is not cut off, it is compressed: syllables shorten,
+breaths vanish, and the model spends its capacity fitting words in rather than singing
+them. That predicts the variable is neither duration nor line count but the **ratio**.
+
+So the grid is driven by density and **duration is derived** (`duration = lines x
+seconds-per-line`). Driving it by duration instead would sample every row at a
+different density and leave no column to compare down.
+
+|  sung lines | 1.5s/line | 2.5s/line | 4.0s/line | 6.0s/line |
+|---|---|---|---|---|
+| 4 | 10s (clamped) | 10s | 16s | 24s |
+| 8 | 12s | 20s | 32s | 48s |
+| 16 | 24s | 40s | 64s | 96s |
+| 24 | 36s | 60s | 96s | 144s |
+| instrumental | 12s | 20s | 32s | 48s |
+
+**Read it two ways.** Across a row is the same words with more and more room, which is
+the effect you noticed. Down a column is constant density at wildly different absolute
+durations, which tests the competing explanation: if short tracks sound worse *there*,
+where every line has identical room to breathe, then duration is doing something on its
+own. The instrumental row settles it, since a wordless 12s clip has nothing to cram.
+
+Two details that keep the experiment honest:
+
+- **The four lyrics are nested.** Each is the previous one plus another section of the
+  same song, in a real form (v c v c b c). Four different lyrics would confound length
+  with content, and `_check_density()` asserts the nesting at import.
+- **Cells that collide are rendered once.** 4 lines at 1.5s and at 2.5s both clamp to
+  the 10s floor, and printing that render twice would look like a bug rather than a
+  constraint. The card says it was clamped and what density it actually ran at.
+
+19 tracks, 844s of audio, **47s of GPU**. Override with `--lines` and `--per_line`, or
+drop the control with `--no-instrumental_control`.
+
+### Duration mode, because the first grid could not answer its own question
+
+First listening result: **24 lines at 144s (6.0s/line) sounded the most natural.** That
+is the corner cell, which makes it two findings tangled together. It is the roomiest
+cell *and* the longest track, and it sits at the edge of the grid, so nothing bounds
+the knee from above.
+
+Hence a second mode. `--durations` fixes the **track length** down each column and
+derives density instead, so the lyric gets longer while the track does not:
+
+```bash
+# same 144s track, a quarter to all of the words: roomy, or just long?
+flyte run compare_pipeline.py density --durations '["144"]' --no-instrumental_control
+
+# does it keep improving past 6s/line, or is that the knee?
+flyte run compare_pipeline.py density --lines '["24"]' --per_line '["6","8","10"]' \
+    --no-instrumental_control
+```
+
+| | 4 lines | 8 lines | 16 lines | 24 lines |
+|---|---|---|---|---|
+| all at 144s | 36.0s/line | 18.0s/line | 9.0s/line | **6.0s/line** |
+
+If all four sound equally natural, length was the variable and density barely matters
+above some floor. If the 24-line one still wins, density and duration interact and the
+rule of thumb needs both terms. The extension row (144s, 192s, 240s at a constant 24
+lines) answers the other half: whether 6.0 is a knee or just the end of the ruler.
+
+Kept as two runs rather than one grid on purpose. Both reports stay light, and each
+answers exactly one question.
+
+The verdict is by ear. What comes out of it is one number, the seconds-per-line knee,
+and that number is the whole point: it is what a studio UI would need to suggest a
+sensible length from a pasted lyric. `prompts.sung_lines()` is the helper that counts
+the denominator.
+
+---
+
+## The quality knobs, ranked
+
+Everything that moves output quality, ordered by measured or expected effect. This
+doubles as the **spec for the studio**: the ranking is the order the controls should
+appear in, and the status column says which ones are safe to expose as a default versus
+which are still a question.
+
+### 1. Checkpoint — CONFIRMED, the biggest lever by far
+
+| | 240s track | peak | steps | CFG |
+|---|---|---|---|---|
+| `xl-turbo` | **23.0s** (10.4x realtime) | 11.1GB | 8 | inert, distilled to 1.0 |
+| `xl-sft` | **211.5s** (1.1x realtime) | 11.5GB | 50 | live, 7.0 |
+
+`xl-sft` is a clear improvement, most audibly **on the voice**, for 9x the cost. Turbo
+is guidance-distilled: 8 denoising steps and CFG folded into the weights. Low-step flow
+matching does not sound broken, it sounds *smeared*, and smeared is most of what reads
+as "AI-ish".
+
+**The single most important consequence:** every knob below behaved differently, or not
+at all, on turbo. Guidance in particular was **completely inert** in every run before
+this point, because the pipeline coerces it to 1.0 and warns. Tune on the checkpoint
+you intend to ship.
+
+### 2. Guidance / CFG — sft only
+
+`7.0` is the checkpoint's recipe. Low drifts and sounds generic; high over-obeys and
+turns harsh, brittle and fatiguing, which is its own flavour of synthetic. This is the
+knob most directly aimed at the complaint, and it has only just become testable.
+
+### 3. Steps
+
+50 is the shipped sft recipe, not a ceiling anyone measured. Transients (kick attack,
+hi-hat, consonants) blur first as steps drop, and the stereo image narrows. Cost is
+close to linear, so this is the straightforward quality-for-time trade.
+
+### 4. Production language in the caption
+
+The caption is a knob, not a label. `BALLAD_PROMPT` is maximalist (huge, gated, wide,
+anthemic) and every term in it asks for more processing, which is what a generative
+model fakes least convincingly: reverb tails go metallic and brickwalled loudness
+leaves no dynamics for the ear to read as human. `BALLAD_PROMPT_DRY` describes a
+**recording** instead of a sound (the room, the mic placement, the tape, explicit quiet
+verses and loud choruses, "no compression on the vocal"). `--suite production-ab` runs
+both with the lyric, callouts and bpm held fixed.
+
+### 4b. Time signature — CONFIRMED audible
+
+The last of the three structured-metadata fields that nobody had tested, and it works:
+asking a 1980s arena power ballad for `3` audibly changes it. So `bpm`, `keyscale` and
+`timesignature` are all real control surfaces rather than decoration, and they reach
+the model through a `# Metas` block the text encoder was trained on rather than as
+words in your caption, which is why they behave like controls and not like prompt
+wording. Free, like guidance and shift: 212.3s / 209.2s / 209.4s for 4, 3 and 6.
+
+### 5. Shift
+
+Where the flow-matching schedule spends its budget: high front-loads the noisy end
+where form and groove are decided, low spends more on the clean end, which is detail
+and texture. If what is left to fix is textural rather than structural, this is the
+specific knob for it. 3.0 is the shipped recommendation.
+
+### 6. Length
+
+Covered above. Not a crop: it is fed to the model up front and changes the
+arrangement. Every listening reaction so far has wanted **more** room per line.
+
+### 7. Seed
+
+The cheap lottery, and free information: how much the arrangement moves between seeds
+tells you how underspecified the caption is. A tight caption should visibly shrink the
+spread.
+
+### Not yet wired, and the reason the next one matters
+
+`AceStepPipeline` supports **audio-to-audio** and this repo does not expose it:
+`task_type` (`repaint`, `cover`, `extract`, `lego`, `complete`), `src_audio`,
+`repainting_start`/`_end`, `reference_audio` for timbre, `audio_cover_strength`.
+
+That is the honest implementation of **draft cheap, finish expensive**. Rendering the
+same brief and seed on turbo and then on sft does *not* give you the same take at two
+qualities: different weights, different step count and a live CFG pass mean a different
+trajectory, so turbo previews the *brief*, not the *render*. To actually carry a take
+across you need `cover` with the turbo output as `src_audio`, and **`xl-sft` is
+specifically the checkpoint that can**: it ships the audio tokenizer pair that the
+turbo repo omits. Wiring `refine` therefore turns the reports from a leaderboard into a
+working surface, and lets you regenerate the one bad fifteen seconds instead of
+re-rolling a four-minute track.
+
+---
+
 ## Parameters
 
 Everything below is a real knob on `AceStepPipeline`. The **CLI** column is the flag on
@@ -293,7 +565,7 @@ Leave any of them unset and the model estimates it.
 |---|---|---|
 | `bpm` | `--bpm` | Target tempo. Tap along to check how obedient it actually is; a ballad caption at 160 is where it gets interesting. |
 | `keyscale` | `--keyscale` | `"C major"`, `"A minor"`, `"D dorian"`. Major/minor is unmissable; a modal scale is where a model that memorized "minor = sad" falls apart. |
-| `timesignature` | - | `"4"` for 4/4, `"3"` for 3/4. |
+| `timesignature` | `sweep --axis timesignature` | `"4"` for 4/4, `"3"` for 3/4, `"6"` for compound. **Confirmed audible.** It was the last of the three metadata fields nobody had tested, and asking a 1980s arena power ballad for 3 changes it. So all three of `bpm` / `keyscale` / `timesignature` are real control surfaces, not decoration. |
 
 The assembled prompt looks like this:
 
@@ -358,8 +630,14 @@ asserting every preset round-trips its own type.
 
 ## The briefs
 
-Seven, in `prompts.py`, each aimed at a different failure mode. Named suites: `full`,
-`quick`, `instrumental`, `vocal`, `vocal-ab`.
+Seventeen, in `prompts.py`, in two blocks that ask opposite questions. `CORE` is seven
+capability briefs, each aimed at a different failure mode. `GENRE_SWAP` is ten briefs
+that share one lyric and change nothing but the world around it.
+
+Named suites: `full`, `quick`, `instrumental`, `vocal`, `vocal-ab`, `genre-swap`,
+`genre-swap-quick`.
+
+### CORE: seven failure modes
 
 | key | what it tests |
 |---|---|
@@ -370,6 +648,113 @@ Seven, in `prompts.py`, each aimed at a different failure mode. Named suites: `f
 | `odd-instruments` | Prompt adherence. 7/8, three unusual acoustic instruments by name, one explicit exclusion. Pair with `--axis guidance`. |
 | `bossa-pt` | The 50+ languages claim, in Portuguese. |
 | `arc` | Structure over time. At 20s a loop; at 180s it has to make an argument. Pair with `--axis duration`. |
+
+### GENRE_SWAP: one lyric, twenty-four worlds
+
+```bash
+flyte run compare_pipeline.py compare --suite genre-swap-all --models '["xl-turbo"]' --duration 60
+```
+
+Twenty-four briefs sharing a single lyric (`GENRE_SWAP_LYRIC`), deliberately plain: no
+proper nouns, no decade, no place. Anything specific in it would do half the model's
+work and quietly rig the test. Only the style caption changes.
+
+The question is not "what does it sound like as metal". It is whether the model has
+learned genre as a set of **timbres** or a set of **conventions**. Timbres give you the
+same tune ten times in different clothes: same melody, same phrasing, same places to
+breathe, guitars swapped for a pedal steel. Conventions rewrite the melody, move the
+stresses onto different syllables, and change where the line ends. Play any two
+choruses back to back. If the tune survives the swap, you have your answer, and it is
+the less impressive one.
+
+| key | the world | the specific tell |
+|---|---|---|
+| `gs-outlaw` | 1970s outlaw country | Phrasing, not pedal steel. Does the voice sit behind the beat and turn at line ends? |
+| `gs-blackmetal` | Norwegian black metal | Gentle words, ugly delivery. Intelligibility should **collapse**; if you can still hear the words it declined the brief. |
+| `gs-chant` | sacred plainchant | Three exclusions and no metre. Unison or drifted into Western harmony? Any drum is a fail. |
+| `gs-funkbr` | baile funk | Tamborzão is a named rhythm, not a vibe. And is "blown out" real distortion? |
+| `gs-boyband` | late-90s boy band | Four parts that move independently, or one voice doubled and widened? |
+| `gs-delta` | 1930s delta blues | Asks for an **era**. The common failure is an excellent modern recording. |
+| `gs-bulgarian` | Bulgarian women's choir | Straight tone and grinding seconds. Models add vibrato and resolve to thirds. |
+| `gs-drill` | UK drill | Does the 808 actually glide? And does it stop singing, since drill is spoken-adjacent? |
+| `gs-shanty` | sea shanty | Several rough men, or one clean voice cloned and detuned? Stomp is the only percussion allowed. |
+| `gs-hyperpop` | hyperpop | Artifacts that sound **chosen**, not accidental. A tasteful hyperpop track is a failed one. |
+
+Four of the ten carry an explicit **exclusion** (`no instruments`, `no percussion`).
+Those are the interesting ones: a bare genre tag can be satisfied by vibes, but a
+negative constraint can only be satisfied by obeying it, and adding a drum kit to
+plainchant is the most common way a music model tells you it is pattern-matching
+rather than listening.
+
+### GENRE_SWAP_2: where the training data thins out
+
+Batch one is mostly Anglophone popular music plus two choral outliers, and a model
+trained on the internet is comfortable in nearly all of it. These fourteen are picked
+where it is not, and each is defined by something a timbre swap cannot fake.
+
+| key | the world | what cannot be faked |
+|---|---|---|
+| `gs-mariachi` | mariachi | Trumpets **answer** the singer in the gaps. Playing through means instruments without arrangement. |
+| `gs-qawwali` | qawwali | Melisma. Short English words have to be stretched over many notes, or it is a harmonium backing. |
+| `gs-afrobeats` | afrobeats | Percussion pulls **against** the pulse. Quantised, it is pop with a shaker. |
+| `gs-klezmer` | klezmer | The clarinet has to cry: bends, slides, a sob at the top of phrases. |
+| `gs-gospel` | southern gospel | Lead and choir must **answer** each other, not sing together. Best chance of real harmony in the grid. |
+| `gs-jungle` | 1990s jungle | Drums at double the bassline's tempo, so it feels fast and slow at once. |
+| `gs-flamenco` | flamenco | The voice must sound damaged. A pleasant Spanish-flavoured vocal is the failure. |
+| `gs-bollywood` | 1970s filmi | Rapid ornaments around each note, plus a genuinely 1970s recording. |
+| `gs-doowop` | 1950s doo-wop | A **bass singer**: a human voice on the bottom, a role nothing else here asks for. |
+| `gs-enka` | Japanese enka | Kobushi, not vibrato. Also the quiet language test: does the style survive English? |
+| `gs-polka` | Bavarian polka | Oompah is trivially simple, so a clean check on rendering vs approximating a named rhythm. |
+| `gs-throat` | Tuvan throat singing | Two pitches from one voice. Almost nothing in the training data does this. |
+| `gs-highlife` | Ghanaian highlife | Two guitars **interlocking** into a pattern neither plays alone. |
+| `gs-vaporwave` | vaporwave | Genuine pitch-down artifacts. A clean lo-fi beat is the near miss. |
+
+`gs-throat` is expected to fail and is kept for that reason: it marks the edge of what
+is in the weights, which is more useful than another row the model finds easy.
+
+**Suites**: `genre-swap` (batch one, unchanged so the first report stays reproducible),
+`genre-swap-more` (batch two), `genre-swap-all` (all 24), and `genre-swap-quick`, four
+with the widest distance between them for a warm-up.
+
+**`genre-swap-all` is slow to OPEN, not slow to run.** Rendering all 24 costs 72s, but
+the report then carries two dozen inline base64 tracks plus a waveform and a
+spectrogram each, and the browser has to pull all of it before anything appears. It
+gets there, it just takes a while. If you are showing this to someone live, run
+`genre-swap` and `genre-swap-more` as two runs: same 24 tracks, two reports that open
+promptly, and the batch split is a real distinction rather than an arbitrary halving.
+
+### Why the report says "identical in every row"
+
+The lyric fold under each row is the same 24 times, which is the experiment and reads
+exactly like a bug. `compare` now **detects** a shared lyric (every brief has one and
+they are all the same) and, when it finds one, retitles the report *One lyric, every
+genre*, states the hypothesis in the meta line, and renames the fold to
+`lyrics (the control: identical in every row below)`.
+
+It is detected rather than passed in, so it stays true of any brief set assembled ad
+hoc with `--briefs`. Row headings now also name the world (`gs-klezmer: genre swap ·
+klezmer`), taken from the caption's first clause. That is enforced by `_check_swaps()`
+at import, and it is good prompting anyway: these models weight the head of the prompt
+most heavily, so burying the genre behind three instruments is a bad caption as well as
+a bad heading.
+
+**Measured**: all **24** at 60s on `xl-turbo` in a 4 minute run, of which **72s was
+rendering**. Every track after the first took 2.9s (20.5x realtime) with a variance of
+0.2s across two dozen wildly different genres, so cost here is a function of duration
+and nothing else. The rest of the wall clock is pod spin, the 11GB load and report
+encoding, which means the twenty-fifth genre costs three seconds.
+
+Run through both models that sing, `genre-swap-quick` at 60s:
+
+| | per track | notes |
+|---|---|---|
+| `xl-turbo` | 6.5s then **2.9s** | The first render carries warm-up; the rest are ~20x realtime. |
+| `diffrhythm` | 184.5s then **~53s** | ~1.1x realtime once warm, so ~18x more expensive per track. |
+
+DiffRhythm's first track came back **43.8s of audio for a 60s ask**, which is the
+`--max-secs`-is-a-ceiling behaviour in the open: it lays the lyric out and stops. The
+other three filled the full 60s. That alone makes it the wrong model for a fixed-length
+slot and the right one for "however long this song wants to be".
 
 ---
 
@@ -454,6 +839,12 @@ flyte run compare_pipeline.py generate_one --model_key xl-turbo --duration 20
 flyte run compare_pipeline.py compare --suite quick
 flyte run compare_pipeline.py sweep --axis seed
 flyte run compare_pipeline.py compare --suite vocal-ab --models '["xl-turbo"]' --duration 120
+
+# one lyric, twenty-four genres
+flyte run compare_pipeline.py compare --suite genre-swap-all --models '["xl-turbo"]' --duration 60
+# the same swap through both models that sing
+flyte run compare_pipeline.py compare --suite genre-swap-quick \
+    --models '["xl-turbo","diffrhythm"]' --duration 60
 ```
 
 Weights are cached by `fetch_weights` with `flyte.Cache`, so the 11GB pull happens once
@@ -531,6 +922,24 @@ for this. It reported "3GB free of 129GB" here because reclaimable page cache co
 used, which capped a process at 2.55GB and OOMed the model load instantly. Read
 `MemAvailable` from `/proc/meminfo` and floor the result.
 
+**Do not launch more than THREE runs at once: the orchestrators starve their own
+children.** Seven concurrent `flyte run`s deadlocked the box completely. Each `a0`
+orchestrator requests 8Gi and 2 CPU and holds them for its whole life while awaiting
+children; each GPU child wants **96Gi and 8 CPU**. Seven orchestrators is 56Gi and 14
+of the node's 20 CPU, so every child sat in `Pending` with `0/1 nodes are available:
+Insufficient cpu, Insufficient memory` while the pods waiting on them refused to exit.
+One had been queued 54 minutes. Nothing was broken and nothing would ever have
+progressed.
+
+The arithmetic is worth keeping: a 96Gi child needs the node's requests under ~27Gi
+before it fits, and each orchestrator is 8Gi, so **three concurrent runs is the hard
+ceiling and one is the safe number.** This is the same hazard the "orchestrator is
+CPU-only on purpose" note describes, generalised: it is not only the GPU an
+orchestrator must avoid holding, it is any resource its children need. Recovery is
+`flyte abort run <id>` on the surplus; the freed memory schedules a child within
+seconds. To queue a batch, drive them serially and wait for each to reach a terminal
+phase before submitting the next.
+
 **Reclaim leaked memory before a big run.** `kubectl rollout restart deploy/rustfs -n
 flyte` took this box from 90GB to 110GB available; rustfs had 19GB of leaked heap. On
 unified memory that is 19GB the renderer cannot have.
@@ -605,6 +1014,15 @@ seconds 40-55, keep the rest.
 **A Gradio studio.** `config.py` reserves the name, port 7865, and a GPU pod template.
 A thin CPU launcher that submits runs and links the report, holding no GPU and loading
 no model, plus a picker over past runs' tracks to use as reference audio.
+
+Its one genuinely useful feature, and the reason the `density` experiment exists:
+**suggest the length from the lyric**. Paste a lyric, and the duration field
+pre-fills with `sung_lines(lyrics) x KNEE`, rounded, with the seconds-per-line shown
+next to it so the number is explained rather than magic. Overrideable, always, because
+the suggestion is a default and not a rule; but a first-time user should not have to
+learn by ear that a 24-line lyric in a 30s render comes out crammed. `KNEE` is the one
+value `density` is measuring, so the studio waits on that result rather than shipping
+another guess.
 
 **Other models.** ACE-Step first because it is the best open option right now, but the
 topic is wider: YuE for long-form lyrics-to-song, MusicGen for melody conditioning,

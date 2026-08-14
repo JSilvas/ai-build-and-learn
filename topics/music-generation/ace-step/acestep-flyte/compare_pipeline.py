@@ -57,8 +57,9 @@ import flyte.report
 import soundfile as sf
 
 import music_core
-from config import cpu_env, diffrhythm_env, gpu_env, orch_env
-from models import DEFAULT_MODELS, get_sweep, get_spec, resolve_models
+import prompts
+from config import cpu_env, diffrhythm_env, gpu_env, minimax_env, orch_env
+from models import DEFAULT_MODELS, Variant, get_sweep, get_spec, resolve_models
 from music_core import Block, GenSettings, TrackResult
 from prompts import Brief, DEFAULT_BRIEF, get_brief, get_suite
 
@@ -152,10 +153,15 @@ async def fetch_weights(model_key: str) -> flyte.io.Dir:
         # duplicate .bin shards would double the pull on any repo that ships both.
         ignore_patterns=["*.pt", "*.bin", "*.msgpack", "*.onnx"],
     )
+    # Check the right one, and fail here with a directory listing rather than letting
+    # from_pretrained fail in a GPU pod later, after the whole download.
     # A diffusers pipeline announces itself with model_index.json; a plain transformers
-    # checkpoint (MusicGen) with config.json. Check the right one, and fail here with a
-    # directory listing rather than letting from_pretrained fail in a GPU pod later.
-    marker = "config.json" if spec.adapter == "musicgen" else "model_index.json"
+    # checkpoint (MusicGen) with config.json; a diffusers MODULAR pipeline (MiniMax)
+    # with modular_model_index.json, which is a different file and not a variant
+    # spelling. Getting this wrong fails in the GPU pod after the whole download.
+    marker = {"musicgen": "config.json",
+              "minimax": "modular_model_index.json"}.get(spec.adapter,
+                                                         "model_index.json")
     if not (dest / marker).exists():
         raise RuntimeError(
             f"{spec.repo} downloaded without a {marker}; not a {spec.adapter}-layout "
@@ -274,8 +280,21 @@ async def render_diffrhythm(model_key: str, weights: flyte.io.Dir,
     return await _render_jobs(model_key, weights, jobs)
 
 
+@minimax_env.task
+async def render_minimax(model_key: str, weights: flyte.io.Dir,
+                         jobs: list[GenJob]) -> ModelRun:
+    """Identical body to `render`, different ENV, same reason as DiffRhythm.
+
+    MiniMax-Music3 needs `diffusers` from an unreleased PR commit for its
+    ModularPipeline support, which the other five diffusers-based models must not be
+    put on. Isolating it into its own image costs a build; putting an unreleased
+    dependency under a working registry costs everything else.
+    """
+    return await _render_jobs(model_key, weights, jobs)
+
+
 # adapter -> which task (hence which image) renders it.
-RENDER_TASKS = {"diffrhythm": render_diffrhythm}
+RENDER_TASKS = {"diffrhythm": render_diffrhythm, "minimax": render_minimax}
 
 
 def render_task_for(spec):
@@ -322,11 +341,20 @@ async def _to_results(run: ModelRun, *, sublabel: str = "", spec=None,
             continue
         try:
             audio, sr = sf.read(str(local / it.filename), dtype="float32", always_2d=True)
-            out.append(music_core.build_track_result(
+            tr = music_core.build_track_result(
                 it.label, audio.T, sr, it.seconds, sublabel=sublabel,
                 settings=it.settings, peak_gb=it.peak_gb, badges=it.badges,
                 repro=_repro(i),
-                intended_for=getattr(spec, "intended_for", "") if spec else ""))
+                intended_for=getattr(spec, "intended_for", "") if spec else "")
+            # Log them as well as rendering them. The numbers are on the card, but a
+            # card is a thing you read one at a time with your eyes; a log line is
+            # greppable, diffable across runs, and survives the report being too heavy
+            # to open. Comparing a sweep is exactly the case where you want the whole
+            # row as text.
+            if tr.metrics:
+                log.info(f"[metrics] {it.label}: " + " ".join(
+                    f"{k}={v:g}" for k, v in tr.metrics.items()))
+            out.append(tr)
         except Exception as e:
             out.append(TrackResult(label=it.label,
                                    error=f"could not read {it.filename}: {e}"))
@@ -385,7 +413,7 @@ async def compare(
     the_briefs = [get_brief(k) for k in briefs] if briefs else get_suite(suite)
 
     await flyte.report.replace.aio(music_core.render_status(
-        "ACE-Step 1.5: checkpoints side by side",
+        "Same brief, every model",
         f"{len(specs)} checkpoints x {len(the_briefs)} briefs at {duration:g}s, seed "
         f"{seed}. Fetching weights (~{sum(s.download_gb for s in specs):.0f}GB total, "
         f"cached after the first run), then rendering. "
@@ -438,6 +466,17 @@ async def compare(
         per_model[s.key] = await _to_results(res, sublabel=s.family, spec=s,
                                              jobs=jobs_by_model[s.key])
 
+    # A run whose briefs all share one lyric is a GENRE SWAP: the words are the control
+    # and the style caption is the variable. Say so, because the alternative is a report
+    # that prints the same lyric fold under all ten rows and looks broken. This is
+    # detected rather than passed in so it stays true of any brief set someone builds,
+    # including one assembled ad hoc with --briefs.
+    lyric_set = {b.lyrics for b in the_briefs if b.lyrics.strip()}
+    shared_lyric = len(the_briefs) > 1 and len(lyric_set) == 1 and not [
+        b for b in the_briefs if not b.lyrics.strip()]
+    lyr_label = ("lyrics (the control: identical in every row below)" if shared_lyric
+                 else "lyrics")
+
     blocks = []
     for i, b in enumerate(the_briefs):
         cards = []
@@ -452,13 +491,23 @@ async def compare(
                     card.repro.brief = b.key
                 cards.append(card)
         blocks.append(Block(heading=f"{b.key}: {b.axis}", note=b.listen_for,
-                            prompt=b.prompt, lyrics=b.lyrics, results=cards))
+                            prompt=b.prompt, lyrics=b.lyrics, results=cards,
+                            lyrics_label=lyr_label))
 
-    meta = (f"{len(specs)} checkpoints · {len(the_briefs)} briefs · {duration:g}s each · "
-            f"seed {seed} · same prompt, each checkpoint's own sampling recipe · "
-            f"play a row left to right to compare")
+    if shared_lyric:
+        title = "One lyric, every genre"
+        meta = (f"{len(the_briefs)} genres · {len(specs)} model(s) · {duration:g}s each · "
+                f"seed {seed} · the LYRIC is held fixed and only the style caption "
+                f"changes, so the same words appear under every row on purpose · the "
+                f"question is whether the melody and phrasing change with the genre or "
+                f"whether one tune is wearing {len(the_briefs)} costumes")
+    else:
+        title = "Same brief, every model"
+        meta = (f"{len(specs)} checkpoints · {len(the_briefs)} briefs · {duration:g}s "
+                f"each · seed {seed} · same prompt, each checkpoint's own sampling "
+                f"recipe · play a row left to right to compare")
     await flyte.report.replace.aio(music_core.render_report(
-        blocks, title="ACE-Step 1.5: same brief, every checkpoint", meta=meta))
+        blocks, title=title, meta=meta))
     await flyte.report.flush.aio()
     return runs
 
@@ -490,13 +539,22 @@ async def sweep(
     values: list[str] | None = None,
     duration: float = 30.0,
     seed: int = 42,
+    steps: int = 0,
+    guidance: float = -1.0,
+    shift: float = -1.0,
 ) -> ModelRun:
     """Hold everything fixed, move ONE parameter, render the row side by side.
 
-    `axis` is a key from models.SWEEPS (seed, steps, guidance, shift, bpm, keyscale,
-    duration). `values` overrides the axis's preset list. Everything runs in a single
-    GPU task against one loaded pipeline, so the marginal cost of another column is
-    one render, not another 11GB load.
+    `axis` is a key from models.SWEEPS. `values` overrides the axis's preset list.
+    Everything runs in a single GPU task against one loaded pipeline, so the marginal
+    cost of another column is one render, not another 11GB load.
+
+    `steps` / `guidance` / `shift` pin the knobs the axis is NOT moving, instead of
+    leaving them at the checkpoint's defaults. Some axes are meaningless without this:
+    a `cfg_end` sweep asks whether restricting guidance to part of the schedule buys
+    you adherence without harshness, and at the default CFG of 7 there is not much
+    harshness to remove, so the row shows nothing. Run it at `--guidance 20` and the
+    question has teeth. The axis always wins over these if they name the same field.
     """
     ax = get_sweep(axis)
     spec = get_spec(model_key)
@@ -513,7 +571,7 @@ async def sweep(
             if inert else "")
 
     await flyte.report.replace.aio(music_core.render_status(
-        f"ACE-Step sweep: {ax.label}",
+        f"{model_key} sweep: {ax.label}",
         f"{model_key} · brief '{brief}' · {len(vals)} values: "
         f"{', '.join(ax.fmt.format(v) for v in vals)}. Fetching weights, then rendering "
         f"all {len(vals)} against one loaded pipeline.{warn}"))
@@ -524,6 +582,9 @@ async def sweep(
     jobs = []
     for v in vals:
         st = _settings_for(b, seed=seed, duration=duration)
+        # Pins first, axis second: if someone sweeps steps AND passes --steps, the axis
+        # is the thing they asked to vary and it has to win.
+        st.steps, st.guidance, st.shift = steps, guidance, shift
         setattr(st, ax.field, v)
         badges = [f"{ax.label}"] + (["inert on this checkpoint"] if inert else [])
         jobs.append(GenJob(label=f"{ax.label} = {ax.fmt.format(v)}",
@@ -541,7 +602,517 @@ async def sweep(
     meta = (f"{model_key} · everything fixed except {ax.label} · seed "
             f"{seed if ax.field != 'seed' else 'varied'} · {duration:g}s each")
     await flyte.report.replace.aio(music_core.render_report(
-        [block], title=f"ACE-Step 1.5: what does {ax.label} do?", meta=meta))
+        [block], title=f"{model_key}: what does {ax.label} do?", meta=meta))
+    await flyte.report.flush.aio()
+    return run
+
+
+# ── density: how many seconds does a line of lyric need? ─────────────────────────
+
+# ACE-Step's floor. Asking for less is rejected by the pipeline, so the shortest cells
+# in the grid get clamped up to it and the card says the density it ACTUALLY ran at.
+_MIN_DURATION = 10.0
+
+
+@orch_env.task(report=True)
+async def density(
+    model_key: str = "xl-turbo",
+    lines: list[str] | None = None,
+    per_line: list[str] | None = None,
+    durations: list[str] | None = None,
+    seed: int = 42,
+    instrumental_control: bool = True,
+) -> ModelRun:
+    """Cross lyric LENGTH against room-per-line, to find where singing gets crammed.
+
+    Two modes, because the two things you want to hold constant are different
+    experiments and the first one cannot answer the second's question.
+
+    DENSITY MODE (default, or `--per_line`). Columns are seconds per sung line and
+      duration is DERIVED (`lines x per_line`). Driving the grid by duration instead
+      would sample every row at a different density, leaving no column to compare down.
+        ACROSS a row: the same words with more and more room.
+        DOWN a column: constant density at very different absolute durations. If short
+          tracks sound worse here, duration is doing something on its own.
+
+    DURATION MODE (`--durations`). Columns are absolute track lengths and DENSITY is
+      derived, so a column holds the track length fixed while the lyric gets longer and
+      the words get more crammed. This is the mode that breaks the confound at the
+      roomy end of the grid, where the best-sounding cell is also the longest track:
+      render that same length with a quarter of the words and you find out which of the
+      two you were hearing.
+
+    `instrumental_control` adds a wordless row at the same durations as the 8-line row.
+    A wordless clip has nothing to cram, so if those still sound synthetic when short,
+    the penalty was never about lyric density.
+    """
+    spec = get_spec(model_key)
+    lens = [int(x) for x in lines] if lines else sorted(prompts.DENSITY_LYRICS)
+    by_duration = bool(durations)
+    fixed = [float(x) for x in durations] if durations else []
+    dens = [float(x) for x in per_line] if per_line else [1.5, 2.5, 4.0, 6.0]
+
+    unknown = [n for n in lens if n not in prompts.DENSITY_LYRICS]
+    if unknown:
+        raise ValueError(f"no lyric with {unknown} sung lines; have "
+                         f"{sorted(prompts.DENSITY_LYRICS)}")
+
+    def _cell(n_lines: int, col: float) -> tuple[float, float, bool]:
+        """(duration, seconds per line, was it clamped up to the model's floor).
+
+        `col` is a density in density mode and an absolute duration in duration mode;
+        one of the two is always derived from the other and the card shows BOTH, so a
+        cell means the same thing however the grid was driven.
+        """
+        want = col if by_duration else n_lines * col
+        got = max(want, _MIN_DURATION)
+        return got, got / n_lines, got > want
+
+    cols = fixed if by_duration else dens
+    await flyte.report.replace.aio(music_core.render_status(
+        f"{model_key}: how much room does a lyric line need?",
+        f"{model_key} · {len(lens)} lyric lengths x {len(cols)} "
+        f"{'durations' if by_duration else 'densities'}"
+        f"{' + an instrumental control row' if instrumental_control else ''} · seed "
+        f"{seed} · "
+        + (f"the TRACK LENGTH is held fixed down each column and the lyric gets "
+           f"longer, so density is derived and the words get more crammed as you read "
+           f"down. This is the mode that separates 'roomy' from 'long'."
+           if by_duration else
+           f"duration is DERIVED as lines x seconds-per-line, so a column is a "
+           f"constant density and a row is the same words with more and more room.")
+        + " Rendering all of it against one loaded pipeline."))
+    await flyte.report.flush.aio()
+
+    # One job list, one GPU task: the whole grid runs against a single loaded pipeline,
+    # so cell number twenty costs a render rather than another 11GB load.
+    jobs: list[GenJob] = []
+    layout: list[tuple[str, str, str, list[GenJob]]] = []   # heading, note, lyrics, jobs
+    for n in lens:
+        lyr = prompts.DENSITY_LYRICS[n]
+        row: list[GenJob] = []
+        seen_durations: set[float] = set()
+        for d in cols:
+            dur, real_d, clamped = _cell(n, d)
+            # Two requested densities can clamp to the same duration on a short lyric
+            # (4 lines at 1.5s and at 2.5s are both a 10s track). Rendering both would
+            # put two identical cards in a row, which is the same "why is this repeated"
+            # confusion the shared-lyric fold caused. Render it once.
+            if dur in seen_durations:
+                continue
+            seen_durations.add(dur)
+            badges = [f"{real_d:.1f}s per line", f"{dur:g}s track"]
+            if clamped:
+                badges.append(f"clamped up from {n * d:g}s (model floor is "
+                              f"{_MIN_DURATION:g}s)")
+            j = GenJob(label=f"{real_d:.1f}s/line · {dur:g}s",
+                       prompt=prompts.DENSITY_PROMPT, lyrics=lyr, badges=badges,
+                       settings=GenSettings(seed=seed, duration=dur,
+                                            bpm=prompts.DENSITY_BPM))
+            row.append(j)
+            jobs.append(j)
+        layout.append((
+            f"{n} sung lines",
+            (f"The same {n}-line lyric at {len(row)} fixed track lengths. Density is "
+             f"derived, so compare this row against the others AT THE SAME LENGTH: the "
+             f"track is equally long in every case and only the number of words "
+             f"changes."
+             if by_duration else
+             f"The same {n}-line lyric at {len(row)} densities. Left is crammed, right "
+             f"is roomy.")
+            + " Listen for syllables clipped short, breaths disappearing between "
+              "lines, and consonants softening into the backing: those go first, "
+              "before anything sounds obviously broken.",
+            lyr, row))
+
+    if instrumental_control:
+        # Same DURATIONS as the 8-line row, no words. Density is undefined without a
+        # lyric, which is the point: this row isolates whatever short renders do on
+        # their own. If these sound fine at 12s while the sung 12s cell does not, the
+        # penalty was cramming. If they degrade too, it is duration.
+        ref = lens[0] if 8 not in lens else 8
+        row = []
+        seen_durations = set()
+        for d in cols:
+            dur, _, _ = _cell(ref, d)
+            if dur in seen_durations:
+                continue
+            seen_durations.add(dur)
+            j = GenJob(label=f"instrumental · {dur:g}s",
+                       prompt=prompts.DENSITY_PROMPT.replace(
+                           "with a clear female lead vocal, ", "instrumental, "),
+                       lyrics="", badges=[f"{dur:g}s track", "no lyric"],
+                       settings=GenSettings(seed=seed, duration=dur,
+                                            bpm=prompts.DENSITY_BPM))
+            row.append(j)
+            jobs.append(j)
+        layout.append((
+            "instrumental control (no lyric)",
+            f"The same durations as the {ref}-line row with NO words, so there is "
+            f"nothing to cram. This row is the control for the competing explanation: "
+            f"if these short clips also sound synthetic, the problem is duration "
+            f"itself and not lyric density.",
+            "", row))
+
+    w = await _weights_for(spec)
+    run = await render_task_for(spec).override(short_name=f"density {model_key}")(
+        model_key, w, jobs)
+    cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}", spec=spec,
+                              jobs=jobs)
+
+    by_job = {id(j): i for i, j in enumerate(jobs)}
+    blocks = [Block(heading=heading, note=note, prompt=rjobs[0].prompt, lyrics=lyr,
+                    lyrics_label=f"lyrics ({prompts.sung_lines(lyr)} sung lines)"
+                                 if lyr else "lyrics",
+                    results=[_at(cards, by_job[id(j)], j.label) for j in rjobs])
+              for heading, note, lyr, rjobs in layout]
+
+    if by_duration:
+        meta = (f"{model_key} · {len(jobs)} tracks · seed {seed} · one caption, one "
+                f"nested lyric · columns are FIXED track lengths and density is "
+                f"derived · compare rows at the same length: same duration, more and "
+                f"more words crammed into it")
+        title = "Same length, more words: is it roomy or just long?"
+    else:
+        meta = (f"{model_key} · {len(jobs)} tracks · seed {seed} · one caption, one "
+                f"nested lyric · columns are seconds per sung line, duration is "
+                f"derived · read ACROSS for the effect, DOWN for whether short is bad "
+                f"on its own")
+        title = "How much room does a lyric line need?"
+    await flyte.report.replace.aio(music_core.render_report(
+        blocks, title=title, meta=meta))
+    await flyte.report.flush.aio()
+    return run
+
+
+# ── variants: the studio's entry point ───────────────────────────────────────────
+
+def _auto_label(v: Variant, base: Variant, i: int) -> str:
+    """Name a card by what makes it DIFFERENT, falling back to its position.
+
+    A row of cards all reading "xl-sft" is useless, and a row reading the full settings
+    twice over is unreadable. The useful label is the delta against the first variant,
+    which is exactly the thing the eye is looking for when scanning the row.
+    """
+    if v.label:
+        return v.label
+    bits = []
+    if v.model_key != base.model_key:
+        bits.append(v.model_key)
+    if v.seed != base.seed:
+        bits.append(f"seed {v.seed}")
+    if v.duration != base.duration:
+        bits.append(f"{v.duration:g}s" if v.duration else "auto length")
+    if v.steps != base.steps:
+        bits.append(f"{v.steps} steps")
+    if v.guidance != base.guidance:
+        bits.append(f"cfg {v.guidance:g}")
+    if v.shift != base.shift:
+        bits.append(f"shift {v.shift:g}")
+    if v.bpm != base.bpm:
+        bits.append(f"{v.bpm} bpm")
+    if v.keyscale != base.keyscale:
+        bits.append(v.keyscale)
+    if v.timesignature != base.timesignature:
+        bits.append(f"{v.timesignature}/4")
+    if (v.cfg_interval_start, v.cfg_interval_end) != (base.cfg_interval_start,
+                                                      base.cfg_interval_end):
+        bits.append(f"cfg over {v.cfg_interval_start:g}-{v.cfg_interval_end:g}")
+    if v.language != base.language:
+        bits.append(f"lang {v.language}")
+    return " · ".join(bits) if bits else (f"take {i + 1}" if i else "base")
+
+
+def _variant_covers_gensettings() -> None:
+    """Variant must expose every GenSettings knob, or the studio silently cannot reach one.
+
+    This drifted once already: `cfg_interval_start` and `language` were wired into
+    GenSettings and the pipeline but never added here, so no amount of clicking in the
+    studio could set them and nothing anywhere said so. A missing knob is invisible by
+    construction, which is exactly the kind of bug that needs an assertion rather than
+    a reviewer.
+    """
+    from dataclasses import fields as _f
+    gs = {f.name for f in _f(GenSettings())}
+    mine = {f.name for f in _f(Variant())} - {"label", "model_key"}
+    missing = gs - mine
+    assert not missing, f"Variant is missing GenSettings knobs: {sorted(missing)}"
+
+
+_variant_covers_gensettings()
+
+
+@orch_env.task(report=True)
+async def variants(
+    prompt: str,
+    lyrics: str = "",
+    takes: list[Variant] | None = None,
+    title: str = "",
+) -> list[ModelRun]:
+    """Render one song several ways and put the takes side by side.
+
+    This is what the studio submits. Variants are grouped by checkpoint so each one
+    loads once however many takes use it, which is the whole reason this is a single
+    entry point rather than the app firing N separate runs: N runs would mean N pods,
+    N 11GB loads, and (as this repo learned the hard way) N orchestrators competing for
+    the memory their own children need.
+    """
+    vs = list(takes or [Variant(seed=42), Variant(seed=7)])
+    base = vs[0]
+
+    # Derive any auto durations up front so the labels and the status line agree with
+    # what actually renders.
+    auto = prompts.suggest_durations(lyrics)
+    default_len = auto[len(auto) // 2] if auto else 30.0
+    for v in vs:
+        if v.duration <= 0:
+            v.duration = default_len
+
+    n_lines = prompts.sung_lines(lyrics)
+    await flyte.report.replace.aio(music_core.render_status(
+        title or "Studio",
+        f"{len(vs)} take(s) · "
+        + (f"{n_lines} sung lines, default length {default_len:g}s "
+           f"({default_len / n_lines:.1f}s per line)" if n_lines else "instrumental")
+        + f" · checkpoints: {', '.join(sorted({v.model_key for v in vs}))}. "
+          f"Rendering; the report is replaced as each checkpoint finishes."))
+    await flyte.report.flush.aio()
+
+    # Group by checkpoint, remembering each take's ORIGINAL position so the report can
+    # put the cards back in the order the user built them, not in load order.
+    by_model: dict[str, list[tuple[int, Variant]]] = {}
+    for i, v in enumerate(vs):
+        by_model.setdefault(v.model_key, []).append((i, v))
+
+    jobs_by_model: dict[str, list[GenJob]] = {}
+    for mk, items in by_model.items():
+        jobs_by_model[mk] = [
+            GenJob(label=_auto_label(v, base, i), prompt=prompt, lyrics=lyrics,
+                   badges=[mk],
+                   settings=GenSettings(
+                       seed=v.seed, steps=v.steps, guidance=v.guidance, shift=v.shift,
+                       duration=v.duration, bpm=v.bpm, keyscale=v.keyscale,
+                       timesignature=v.timesignature, language=v.language,
+                       cfg_interval_start=v.cfg_interval_start,
+                       cfg_interval_end=v.cfg_interval_end))
+            for i, v in items]
+
+    specs = {mk: get_spec(mk) for mk in by_model}
+    weights: dict[str, flyte.io.Dir] = {}
+    for mk, s in specs.items():
+        weights[mk] = await _weights_for(s)
+
+    raw = await asyncio.gather(*[
+        render_task_for(specs[mk]).override(short_name=f"take {mk}")(
+            mk, weights[mk], jobs_by_model[mk])
+        for mk in by_model
+    ], return_exceptions=True)
+
+    runs: list[ModelRun] = []
+    cards: dict[int, TrackResult] = {}
+    for mk, res in zip(by_model, raw):
+        items = by_model[mk]
+        if isinstance(res, Exception):
+            log.exception(f"[{mk}] render failed: {res}")
+            for pos, _ in items:
+                cards[pos] = TrackResult(label=mk, error=f"render failed: {res}")
+            continue
+        runs.append(res)
+        got = await _to_results(res, sublabel=specs[mk].family, spec=specs[mk],
+                                jobs=jobs_by_model[mk])
+        for k, (pos, _) in enumerate(items):
+            cards[pos] = _at(got, k, jobs_by_model[mk][k].label)
+
+    block = Block(
+        heading=title or "Takes",
+        note="Same words and same caption in every card; only the knobs differ, and "
+             "each card is labelled with what makes it different. The numbers under "
+             "each card are measurements, not scores.",
+        prompt=prompt, lyrics=lyrics,
+        lyrics_label=(f"lyrics ({n_lines} sung lines)" if n_lines else "lyrics"),
+        results=[cards[i] for i in sorted(cards)])
+    await flyte.report.replace.aio(music_core.render_report(
+        [block], title=title or "Studio",
+        meta=f"{len(vs)} takes · " + ", ".join(
+            f"{_auto_label(v, base, i)}" for i, v in enumerate(vs))))
+    await flyte.report.flush.aio()
+    return runs
+
+
+# ── grid: two knobs at once, because they may interact ───────────────────────────
+
+@orch_env.task(report=True)
+async def grid(
+    model_key: str = "xl-sft",
+    brief: str = "ballad-flyte-callouts",
+    steps: list[str] | None = None,
+    guidance: list[str] | None = None,
+    duration: float = 240.0,
+    seed: int = 42,
+) -> ModelRun:
+    """Cross STEPS against GUIDANCE and render every cell against one loaded pipeline.
+
+    `sweep` deliberately moves one knob so the cause of any difference is unambiguous,
+    and that is the right default. But it cannot answer whether two knobs INTERACT, and
+    these two plausibly do: guidance pushes each denoising step harder toward the
+    prompt, so the damage a high CFG does may depend on how many steps it gets to do it
+    over. More steps could refine away the harshness, or compound it. A pair of
+    one-knob sweeps cannot distinguish those.
+
+    Rows are step counts, columns are guidance values, so the diagonal is "both cranked"
+    and the corners bracket it. Defaults to `xl-sft` because on a distilled checkpoint
+    the guidance axis is inert and the whole grid collapses to one column.
+    """
+    spec = get_spec(model_key)
+    b = get_brief(brief)
+    step_vals = [int(float(x)) for x in steps] if steps else [50, 200]
+    cfg_vals = [float(x) for x in guidance] if guidance else [7.0, 20.0]
+
+    inert = spec.distilled
+    warn = (f" NOTE: {model_key} is guidance-distilled, so every column will be "
+            f"identical (the pipeline coerces guidance to 1.0). Use --model_key xl-sft."
+            if inert else "")
+
+    await flyte.report.replace.aio(music_core.render_status(
+        f"{model_key}: {len(step_vals)}x{len(cfg_vals)} steps x guidance",
+        f"{model_key} · brief '{brief}' · steps {step_vals} x guidance {cfg_vals} · "
+        f"{duration:g}s each · seed {seed}. Cost scales with steps, so the "
+        f"bottom-right cell is the expensive one.{warn}"))
+    await flyte.report.flush.aio()
+
+    jobs: list[GenJob] = []
+    rows: list[tuple[int, list[GenJob]]] = []
+    for st_val in step_vals:
+        row = []
+        for cfg in cfg_vals:
+            s = _settings_for(b, seed=seed, duration=duration)
+            s.steps, s.guidance = st_val, cfg
+            j = GenJob(label=f"{st_val} steps · cfg {cfg:g}",
+                       prompt=b.prompt, lyrics=b.lyrics,
+                       badges=[f"{st_val} steps", f"cfg {cfg:g}"], settings=s)
+            row.append(j)
+            jobs.append(j)
+        rows.append((st_val, row))
+
+    w = await _weights_for(spec)
+    run = await render_task_for(spec).override(short_name=f"grid {model_key}")(
+        model_key, w, jobs)
+    cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}", spec=spec,
+                              jobs=jobs, brief=brief)
+
+    idx = {id(j): i for i, j in enumerate(jobs)}
+    blocks = [Block(
+        heading=f"{st_val} denoising steps",
+        note=("Across this row, guidance rises at a fixed step count. Low drifts and "
+              "sounds generic; high obeys, then over-obeys, and turns harsh and "
+              "brittle with the instruments fighting. Compare the SAME guidance value "
+              "against the other rows: if a high CFG is harsh at a low step count but "
+              "not at a high one, the extra steps are refining the damage away and the "
+              "two knobs are not independent."),
+        prompt=b.prompt, lyrics=b.lyrics,
+        results=[_at(cards, idx[id(j)], j.label) for j in row])
+        for st_val, row in rows]
+
+    meta = (f"{model_key} · {len(jobs)} cells · {brief} · {duration:g}s · seed {seed} · "
+            f"rows are steps, columns are guidance")
+    await flyte.report.replace.aio(music_core.render_report(
+        blocks, title="Steps x guidance: do they interact?", meta=meta))
+    await flyte.report.flush.aio()
+    return run
+
+
+# ── takes: a menu of lengths to choose from ──────────────────────────────────────
+
+@orch_env.task(report=True)
+async def takes(
+    model_key: str = "xl-turbo",
+    brief: str = DEFAULT_BRIEF,
+    prompt: str = "",
+    lyrics: str = "",
+    durations: list[str] | None = None,
+    seeds: list[str] | None = None,
+) -> ModelRun:
+    """Render one song at several LENGTHS (and optionally several seeds), then pick.
+
+    Not the same job as `sweep --axis duration`, though they render similar things.
+    A sweep moves one knob to explain what it does; this is the working surface for
+    actually making a song, where length is not a parameter you reason about but a
+    judgement you make by ear once you have heard the options next to each other.
+
+    That distinction is why the lengths are DERIVED from the lyric by default rather
+    than fixed. `prompts.suggest_durations` brackets the estimated
+    seconds-per-line target by roughly 3x, so the ladder contains the right answer
+    even though the target itself is still provisional. A 4-line hook and a 24-line
+    ballad get very different ladders, which is exactly the thing a fixed 20/40/80
+    gets wrong.
+
+    Every card carries its own reproduce command, so choosing is: listen, then copy the
+    handle off the winner and render that one again at a higher step count or another
+    seed.
+    """
+    spec = get_spec(model_key)
+    b = get_brief(brief)
+    the_prompt = prompt or b.prompt
+    the_lyrics = lyrics if prompt else b.lyrics
+
+    durs = ([float(x) for x in durations] if durations
+            else prompts.suggest_durations(the_lyrics))
+    the_seeds = [int(x) for x in seeds] if seeds else [42]
+    n_lines = prompts.sung_lines(the_lyrics)
+
+    suggested = "" if durations else (
+        f" Lengths chosen for this lyric: {n_lines} sung lines x ~"
+        f"{prompts.SECONDS_PER_LINE:g}s, bracketed. Override with --durations."
+        if n_lines else " No lyric, so the ladder is the fixed instrumental one.")
+
+    await flyte.report.replace.aio(music_core.render_status(
+        f"{model_key}: {len(durs) * len(the_seeds)} takes of '{brief}'",
+        f"{model_key} · lengths {', '.join(f'{d:g}s' for d in durs)} · seeds "
+        f"{', '.join(map(str, the_seeds))}.{suggested} Rendering all of them against "
+        f"one loaded pipeline."))
+    await flyte.report.flush.aio()
+
+    jobs: list[GenJob] = []
+    rows: list[tuple[int, list[GenJob]]] = []
+    for s in the_seeds:
+        row = []
+        for d in durs:
+            st = _settings_for(b, seed=s, duration=d)
+            if prompt:                      # a hand-written prompt brings no metadata
+                st.bpm, st.keyscale = 0, ""
+            badges = [f"{d:g}s"] + ([f"{d / n_lines:.1f}s per line"] if n_lines else
+                                    ["instrumental"])
+            j = GenJob(label=f"{d:g}s", prompt=the_prompt, lyrics=the_lyrics,
+                       badges=badges, settings=st)
+            row.append(j)
+            jobs.append(j)
+        rows.append((s, row))
+
+    w = await _weights_for(spec)
+    run = await render_task_for(spec).override(short_name=f"takes {brief}")(
+        model_key, w, jobs)
+    cards = await _to_results(run, sublabel=f"{model_key} · {spec.family}", spec=spec,
+                              jobs=jobs, brief=brief if not prompt else "")
+
+    idx = {id(j): i for i, j in enumerate(jobs)}
+    note = ("Same words, same seed, different amounts of room. Length is not a crop: "
+            "it is fed to the model up front, so these are different arrangements of "
+            "the same song rather than longer and shorter cuts of one take. Pick the "
+            "one that breathes, then copy its reproduce command.")
+    blocks = [Block(heading=f"seed {s}", note=note, prompt=the_prompt,
+                    lyrics=the_lyrics,
+                    lyrics_label=(f"lyrics ({n_lines} sung lines)" if n_lines
+                                  else "lyrics"),
+                    results=[_at(cards, idx[id(j)], j.label) for j in row])
+              for s, row in rows]
+
+    what = "custom prompt" if prompt else brief
+    meta = (f"{model_key} · {len(jobs)} takes · {what} · lengths "
+            f"{', '.join(f'{d:g}s' for d in durs)}"
+            + (f" (derived from {n_lines} sung lines)" if not durations and n_lines
+               else ""))
+    await flyte.report.replace.aio(music_core.render_report(
+        blocks, title=f"Takes: '{brief}' at {len(durs)} lengths", meta=meta))
     await flyte.report.flush.aio()
     return run
 
@@ -561,6 +1132,7 @@ async def generate_one(
     shift: float = -1.0,
     bpm: int = 0,
     keyscale: str = "",
+    timesignature: str = "",
     language: str = "en",
 ) -> ModelRun:
     """Render a single track. The cheapest 'does this even load on the box' check.
@@ -576,6 +1148,7 @@ async def generate_one(
     st = GenSettings(seed=seed, steps=steps, guidance=guidance, shift=shift,
                      duration=duration, bpm=bpm or (0 if prompt else b.bpm),
                      keyscale=keyscale or ("" if prompt else b.keyscale),
+                     timesignature=timesignature,
                      language=language)
 
     jobs = [GenJob(label=model_key, prompt=the_prompt, lyrics=the_lyrics,
@@ -593,7 +1166,11 @@ async def generate_one(
                   prompt=the_prompt, lyrics=the_lyrics,
                   results=[_at(cards, 0, model_key)])
     await flyte.report.replace.aio(music_core.render_report(
-        [block], title=f"ACE-Step 1.5 · {model_key}",
+        # Named from the SPEC, not hardcoded. This demo started as an ACE-Step one and
+        # the registry now spans six families, so a MiniMax render titled "ACE-Step
+        # 1.5" is simply false. Any title that can outlive its subject should be
+        # derived from the thing it is describing.
+        [block], title=f"{model_key} · {spec.family}",
         meta=f"{spec.repo} · {spec.license}"))
     await flyte.report.flush.aio()
     return run

@@ -49,9 +49,9 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>Reinforcement Learning in NVIDIA Isaac Sim: Physical AI &amp; Sim-to-Real</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">TBD</div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-08-28</div>
         <div style="font-size: 13px; color: #666;">
-          <a href="topics/isaac-sim">code</a>
+          <a href="topics/isaac-sim">code</a> • <a href="https://luma.com/8nf6v63n">register</a>
         </div>
       </div>
     </td><td><div style="padding: 8px 0; line-height: 1.5;">Step up from MuJoCo to NVIDIA Isaac Sim: GPU-accelerated, photorealistic robot simulation for physical AI and sim-to-real transfer.
@@ -59,9 +59,9 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>World Models with DreamerV3</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">TBD</div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-09-04</div>
         <div style="font-size: 13px; color: #666;">
-          <a href="topics/dreamerv3">code</a>
+          <a href="topics/dreamerv3">code</a> • <a href="https://luma.com/dc8ln5hh">register</a>
         </div>
       </div>
     </td><td><div style="padding: 8px 0; line-height: 1.5;">An intro to world models: DreamerV3 learns a compact model of its environment and trains a policy inside imagined rollouts. Lightweight and RL-connected.
@@ -69,9 +69,9 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>World Models with NVIDIA Cosmos: Physical AI</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">TBD</div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-09-11</div>
         <div style="font-size: 13px; color: #666;">
-          <a href="topics/cosmos">code</a>
+          <a href="topics/cosmos">code</a> • <a href="https://luma.com/7es4ml9o">register</a>
         </div>
       </div>
     </td><td><div style="padding: 8px 0; line-height: 1.5;">NVIDIA Cosmos, an open world foundation model for physical AI: generative world simulation and action-conditioned rollouts, runnable locally on a DGX Spark.
@@ -79,9 +79,9 @@ Welcome to AI Build & Learn, a weekly AI engineering stream where we pick a new 
 <tr><td>
       <div style="padding: 8px 0;">
         <div style="font-size: 16px; line-height: 1.3; margin-bottom: 6px;"><strong>World Models with V-JEPA 2: Latent-Space Prediction &amp; Planning</strong></div>
-        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">TBD</div>
+        <div style="color: #666; font-size: 13px; margin-bottom: 4px;">2026-09-18</div>
         <div style="font-size: 13px; color: #666;">
-          <a href="topics/v-jepa">code</a>
+          <a href="topics/v-jepa">code</a> • <a href="https://luma.com/dzg57rrj">register</a>
         </div>
       </div>
     </td><td><div style="padding: 8px 0; line-height: 1.5;">A different take on world models: V-JEPA 2 predicts in representation space instead of pixels. Self-supervised video understanding and latent planning, runs on a DGX Spark.
