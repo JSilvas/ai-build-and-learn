@@ -106,6 +106,11 @@ ADAPTER_KNOBS: dict[str, set[str]] = {
     "audioldm2": {"steps", "guidance"},
     "stableaudio": {"steps", "guidance"},
     "diffrhythm": {"steps", "guidance", "lyrics"},
+    # Its documented call exposes prompt, lyrics, audio_duration and a generator, and
+    # nothing else. No steps, no guidance, no shift, and no metadata channel, so a card
+    # reads `seed 42 · 60s`. Claiming otherwise would be the same class of lie as
+    # printing turbo's requested-but-ignored CFG.
+    "minimax": {"lyrics"},
 }
 
 
@@ -438,9 +443,101 @@ def load_pipeline(spec, local_dir: str | None = None, tile: bool = False):
         return _load_audioldm2(spec, local_dir)
     if spec.adapter == "stableaudio":
         return _load_stableaudio(spec, local_dir)
+    if spec.adapter == "minimax":
+        return _load_minimax(spec, local_dir)
     if spec.adapter == "diffrhythm":
         return None      # a subprocess per render; nothing to hold resident
     return _load_acestep(spec, local_dir, tile)
+
+
+def _load_minimax(spec, local_dir: str | None = None):
+    """Load MiniMax-Music3 through diffusers' ModularPipeline.
+
+    Not `DiffusionPipeline.from_pretrained`: this repo announces itself with
+    `modular_model_index.json` rather than `model_index.json`, and the components are
+    assembled by a second call. `load_components` is where the weights actually arrive,
+    so a failure there is a weights problem and a failure in `from_pretrained` is a
+    layout problem; keeping them on separate lines keeps that distinction legible in a
+    traceback.
+    """
+    import torch
+    from diffusers import ModularPipeline
+
+    src = resolve_weights(local_dir, marker="modular_model_index.json") or spec.repo
+    log.info(f"[{spec.key}] ModularPipeline.from_pretrained({src})")
+    pipe = ModularPipeline.from_pretrained(src)
+    pipe.load_components(dtype=getattr(torch, spec.dtype))
+    pipe.to("cuda")
+    return pipe
+
+
+def _generate_minimax(pipe, spec, prompt: str, lyrics: str = "",
+                      settings: GenSettings | None = None):
+    """Render one track through MiniMax-Music3.
+
+    The documented call takes prompt, lyrics, audio_duration and a generator, and
+    nothing else: no steps, no guidance, no shift. `ADAPTER_KNOBS` says so, so the card
+    prints `seed 42 · 60s` rather than inventing dials this model does not expose. If
+    the pipeline turns out to accept more, that is a knob to ADD deliberately after
+    checking, not one to pass hopefully and let it be ignored.
+    """
+    import torch
+
+    st = (settings or GenSettings()).resolve(spec)
+    gen = torch.Generator("cuda").manual_seed(int(st.seed))
+
+    t0 = time.perf_counter()
+    audio = pipe(
+        prompt=prompt,
+        # Structure tags pass straight through: this model reads the same
+        # [verse]/[chorus] format ACE-Step does, so there is no conversion to declare.
+        lyrics=lyrics or "",
+        audio_duration=float(st.duration),
+        generator=gen,
+        output="audios",
+    )[0]
+    seconds = time.perf_counter() - t0
+
+    audio = np.asarray(getattr(audio, "cpu", lambda: audio)().float()
+                       if hasattr(audio, "cpu") else audio, dtype=np.float32)
+    if audio.ndim == 1:
+        audio = audio[None, :]
+    if audio.shape[0] > audio.shape[1]:      # (samples, channels) -> (channels, samples)
+        audio = audio.T
+
+    # Ask the VOCODER what rate it produced rather than trusting the spec, and shout if
+    # they disagree. A sample-rate mismatch is the nastiest kind of bug in this repo
+    # because nothing fails: the wav is written, the report renders, the track plays.
+    # It just plays at the wrong speed and pitch, and the only symptom is a listener
+    # saying "the voice sounds slowed down". This model shipped a card saying 32kHz and
+    # a vocoder config saying 44100, and the 27% error was audible but silent to every
+    # check we had.
+    sr = int(spec.sample_rate)
+    real = _minimax_sample_rate(pipe)
+    if real and real != sr:
+        log.warning(f"[{spec.key}] spec says {sr}Hz but the vocoder reports {real}Hz; "
+                    f"using {real}. Audio tagged at the wrong rate plays at "
+                    f"{sr / real:.2f}x speed and nothing else complains.")
+        sr = real
+    return audio, sr, seconds, st
+
+
+def _minimax_sample_rate(pipe) -> int | None:
+    """The vocoder's real output rate, or None if it cannot be determined."""
+    for path in (("vocoder", "config", "sampling_rate"),
+                 ("vocoder", "sampling_rate"),
+                 ("sample_rate",)):
+        obj = pipe
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        else:
+            try:
+                return int(obj)
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _load_stableaudio(spec, local_dir: str | None = None):
@@ -614,6 +711,8 @@ def generate(pipe, spec, prompt: str, lyrics: str = "",
         return _generate_audioldm2(pipe, spec, prompt, settings)
     if spec.adapter == "stableaudio":
         return _generate_stableaudio(pipe, spec, prompt, settings)
+    if spec.adapter == "minimax":
+        return _generate_minimax(pipe, spec, prompt, lyrics, settings)
     if spec.adapter == "diffrhythm":
         return _generate_diffrhythm(spec, prompt, lyrics, settings)
     return _generate_acestep(pipe, spec, prompt, lyrics, settings)

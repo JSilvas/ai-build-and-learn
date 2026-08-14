@@ -58,7 +58,7 @@ import soundfile as sf
 
 import music_core
 import prompts
-from config import cpu_env, diffrhythm_env, gpu_env, orch_env
+from config import cpu_env, diffrhythm_env, gpu_env, minimax_env, orch_env
 from models import DEFAULT_MODELS, Variant, get_sweep, get_spec, resolve_models
 from music_core import Block, GenSettings, TrackResult
 from prompts import Brief, DEFAULT_BRIEF, get_brief, get_suite
@@ -153,10 +153,15 @@ async def fetch_weights(model_key: str) -> flyte.io.Dir:
         # duplicate .bin shards would double the pull on any repo that ships both.
         ignore_patterns=["*.pt", "*.bin", "*.msgpack", "*.onnx"],
     )
+    # Check the right one, and fail here with a directory listing rather than letting
+    # from_pretrained fail in a GPU pod later, after the whole download.
     # A diffusers pipeline announces itself with model_index.json; a plain transformers
-    # checkpoint (MusicGen) with config.json. Check the right one, and fail here with a
-    # directory listing rather than letting from_pretrained fail in a GPU pod later.
-    marker = "config.json" if spec.adapter == "musicgen" else "model_index.json"
+    # checkpoint (MusicGen) with config.json; a diffusers MODULAR pipeline (MiniMax)
+    # with modular_model_index.json, which is a different file and not a variant
+    # spelling. Getting this wrong fails in the GPU pod after the whole download.
+    marker = {"musicgen": "config.json",
+              "minimax": "modular_model_index.json"}.get(spec.adapter,
+                                                         "model_index.json")
     if not (dest / marker).exists():
         raise RuntimeError(
             f"{spec.repo} downloaded without a {marker}; not a {spec.adapter}-layout "
@@ -275,8 +280,21 @@ async def render_diffrhythm(model_key: str, weights: flyte.io.Dir,
     return await _render_jobs(model_key, weights, jobs)
 
 
+@minimax_env.task
+async def render_minimax(model_key: str, weights: flyte.io.Dir,
+                         jobs: list[GenJob]) -> ModelRun:
+    """Identical body to `render`, different ENV, same reason as DiffRhythm.
+
+    MiniMax-Music3 needs `diffusers` from an unreleased PR commit for its
+    ModularPipeline support, which the other five diffusers-based models must not be
+    put on. Isolating it into its own image costs a build; putting an unreleased
+    dependency under a working registry costs everything else.
+    """
+    return await _render_jobs(model_key, weights, jobs)
+
+
 # adapter -> which task (hence which image) renders it.
-RENDER_TASKS = {"diffrhythm": render_diffrhythm}
+RENDER_TASKS = {"diffrhythm": render_diffrhythm, "minimax": render_minimax}
 
 
 def render_task_for(spec):
@@ -395,7 +413,7 @@ async def compare(
     the_briefs = [get_brief(k) for k in briefs] if briefs else get_suite(suite)
 
     await flyte.report.replace.aio(music_core.render_status(
-        "ACE-Step 1.5: checkpoints side by side",
+        "Same brief, every model",
         f"{len(specs)} checkpoints x {len(the_briefs)} briefs at {duration:g}s, seed "
         f"{seed}. Fetching weights (~{sum(s.download_gb for s in specs):.0f}GB total, "
         f"cached after the first run), then rendering. "
@@ -484,7 +502,7 @@ async def compare(
                 f"question is whether the melody and phrasing change with the genre or "
                 f"whether one tune is wearing {len(the_briefs)} costumes")
     else:
-        title = "ACE-Step 1.5: same brief, every checkpoint"
+        title = "Same brief, every model"
         meta = (f"{len(specs)} checkpoints · {len(the_briefs)} briefs · {duration:g}s "
                 f"each · seed {seed} · same prompt, each checkpoint's own sampling "
                 f"recipe · play a row left to right to compare")
@@ -553,7 +571,7 @@ async def sweep(
             if inert else "")
 
     await flyte.report.replace.aio(music_core.render_status(
-        f"ACE-Step sweep: {ax.label}",
+        f"{model_key} sweep: {ax.label}",
         f"{model_key} · brief '{brief}' · {len(vals)} values: "
         f"{', '.join(ax.fmt.format(v) for v in vals)}. Fetching weights, then rendering "
         f"all {len(vals)} against one loaded pipeline.{warn}"))
@@ -584,7 +602,7 @@ async def sweep(
     meta = (f"{model_key} · everything fixed except {ax.label} · seed "
             f"{seed if ax.field != 'seed' else 'varied'} · {duration:g}s each")
     await flyte.report.replace.aio(music_core.render_report(
-        [block], title=f"ACE-Step 1.5: what does {ax.label} do?", meta=meta))
+        [block], title=f"{model_key}: what does {ax.label} do?", meta=meta))
     await flyte.report.flush.aio()
     return run
 
@@ -652,7 +670,7 @@ async def density(
 
     cols = fixed if by_duration else dens
     await flyte.report.replace.aio(music_core.render_status(
-        "ACE-Step: how much room does a lyric line need?",
+        f"{model_key}: how much room does a lyric line need?",
         f"{model_key} · {len(lens)} lyric lengths x {len(cols)} "
         f"{'durations' if by_duration else 'densities'}"
         f"{' + an instrumental control row' if instrumental_control else ''} · seed "
@@ -852,7 +870,7 @@ async def variants(
 
     n_lines = prompts.sung_lines(lyrics)
     await flyte.report.replace.aio(music_core.render_status(
-        title or "ACE-Step studio",
+        title or "Studio",
         f"{len(vs)} take(s) · "
         + (f"{n_lines} sung lines, default length {default_len:g}s "
            f"({default_len / n_lines:.1f}s per line)" if n_lines else "instrumental")
@@ -914,7 +932,7 @@ async def variants(
         lyrics_label=(f"lyrics ({n_lines} sung lines)" if n_lines else "lyrics"),
         results=[cards[i] for i in sorted(cards)])
     await flyte.report.replace.aio(music_core.render_report(
-        [block], title=title or "ACE-Step studio",
+        [block], title=title or "Studio",
         meta=f"{len(vs)} takes · " + ", ".join(
             f"{_auto_label(v, base, i)}" for i, v in enumerate(vs))))
     await flyte.report.flush.aio()
@@ -956,7 +974,7 @@ async def grid(
             if inert else "")
 
     await flyte.report.replace.aio(music_core.render_status(
-        f"ACE-Step: {len(step_vals)}x{len(cfg_vals)} steps x guidance",
+        f"{model_key}: {len(step_vals)}x{len(cfg_vals)} steps x guidance",
         f"{model_key} · brief '{brief}' · steps {step_vals} x guidance {cfg_vals} · "
         f"{duration:g}s each · seed {seed}. Cost scales with steps, so the "
         f"bottom-right cell is the expensive one.{warn}"))
@@ -1048,7 +1066,7 @@ async def takes(
         if n_lines else " No lyric, so the ladder is the fixed instrumental one.")
 
     await flyte.report.replace.aio(music_core.render_status(
-        f"ACE-Step: {len(durs) * len(the_seeds)} takes of '{brief}'",
+        f"{model_key}: {len(durs) * len(the_seeds)} takes of '{brief}'",
         f"{model_key} · lengths {', '.join(f'{d:g}s' for d in durs)} · seeds "
         f"{', '.join(map(str, the_seeds))}.{suggested} Rendering all of them against "
         f"one loaded pipeline."))
@@ -1148,7 +1166,11 @@ async def generate_one(
                   prompt=the_prompt, lyrics=the_lyrics,
                   results=[_at(cards, 0, model_key)])
     await flyte.report.replace.aio(music_core.render_report(
-        [block], title=f"ACE-Step 1.5 · {model_key}",
+        # Named from the SPEC, not hardcoded. This demo started as an ACE-Step one and
+        # the registry now spans six families, so a MiniMax render titled "ACE-Step
+        # 1.5" is simply false. Any title that can outlive its subject should be
+        # derived from the thing it is describing.
+        [block], title=f"{model_key} · {spec.family}",
         meta=f"{spec.repo} · {spec.license}"))
     await flyte.report.flush.aio()
     return run

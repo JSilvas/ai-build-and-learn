@@ -284,6 +284,59 @@ MODELS: dict[str, MusicModelSpec] = {
               "reliable way to get short songs from it.",
     ),
 
+    # ── MiniMax-Music3 (MiniMaxAI) ───────────────────────────────────────────────
+    #
+    # The THIRD model here that sings, and the newest by a wide margin: released
+    # August 2026, wired the day it dropped. That makes it the most interesting
+    # comparison in the registry right now, because ACE-Step 1.5 XL (April 2026) and
+    # DiffRhythm 2 (November 2025) are the current open state of the art at this job
+    # and this arrived after both.
+    #
+    # It takes ACE-Step's lyric format almost exactly: `[verse]` / `[chorus]` structure
+    # tags on their own lines. That is worth more than it sounds. DiffRhythm needs
+    # TIMED `.lrc` lyrics, so `lyrics_to_lrc` throws away the structure and spreads
+    # lines evenly, which handicaps it on any shared brief and the card has to say so.
+    # MiniMax needs no conversion at all, so a head-to-head against ACE-Step is the
+    # first genuinely apples-to-apples vocal comparison in this demo.
+    #
+    # 32kHz stereo against ACE-Step's 48kHz, which the report's full-Nyquist
+    # spectrogram will show as a hard ceiling at 16kHz. Not a flaw, just a different
+    # choice, and exactly the kind of thing the plot exists to make visible.
+    #
+    # LICENSE IS THE CATCH and it is not open source despite living on the Hub. The
+    # MiniMax-Music3 Community License permits commercial use but attaches conditions
+    # the MIT/Apache models here do not: you must prominently display "MiniMax-Music3"
+    # in a commercial product, you need separate written authorization above $20M
+    # yearly revenue, and its acceptable-use policy REQUIRES disclosing that output is
+    # machine-generated when publishing anywhere public. It is also silent on who owns
+    # the generated audio, where ACE-Step (MIT) and DiffRhythm (Apache-2.0) are not.
+    #
+    # 57GB is by far the largest fetch in the registry, and most of it is language
+    # model: an 18.5GB `qwen_7B/` sits alongside a separate 17.2GB `language_model/`.
+    "minimax-music3": MusicModelSpec(
+        key="minimax-music3",
+        repo="MiniMaxAI/MiniMax-Music3",
+        family="MiniMax-Music3 · flow-matching over a Qwen3 LM",
+        license="MiniMax-Music3 Community License (NOT open source: attribution "
+                "required, AI disclosure required, $20M revenue gate, silent on "
+                "output ownership)",
+        params="2B DiT + Qwen3-8B",
+        download_gb=57.4,
+        # 44100, NOT the 32000 the model card blurb states. The vocoder config is the
+        # authority (`vocoder/config.json`: sampling_rate 44100) and the adapter
+        # re-checks it at run time. Tagged at 32000 the audio played 27% slow and
+        # nothing failed: the only symptom was a voice that sounded slowed down.
+        sample_rate=44100,
+        adapter="minimax",
+        intended_for="Full songs with SUNG VOCALS from structured lyrics, up to ~6 "
+                     "minutes, 44.1kHz stereo. The third model here that sings.",
+        max_duration=360.0,   # ~9000 frames at 25fps
+        notes="Released August 2026 and wired the same day. Uses ACE-Step's structure "
+              "tags verbatim, so unlike DiffRhythm it needs no lossy lyric conversion "
+              "and the head-to-head is genuinely fair. Its own image: it needs "
+              "diffusers from an unreleased PR commit for ModularPipeline support.",
+    ),
+
     "musicgen-melody": MusicModelSpec(
         key="musicgen-melody",
         repo="facebook/musicgen-melody",
@@ -312,7 +365,11 @@ DEFAULT_MODELS = ["xl-turbo", "xl-sft"]
 # reads better without three cards explaining why they came back instrumental:
 #   flyte run compare_pipeline.py compare --briefs '["indie-vocal"]' \
 #       --models '["xl-turbo","diffrhythm"]'
-VOCAL_MODELS = ["xl-turbo", "diffrhythm"]
+# Three FAMILIES now, not two, and `xl-sft` rather than `xl-turbo` because the turbo
+# checkpoint's 8-step distillation is audibly smeared on vocals and this list exists to
+# compare singing. MiniMax needs no lyric conversion (same structure tags), DiffRhythm
+# does, so the card says so for one of the three and not the others.
+VOCAL_MODELS = ["xl-sft", "diffrhythm", "minimax-music3"]
 
 
 @dataclass

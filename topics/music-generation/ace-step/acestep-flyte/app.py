@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -103,13 +104,24 @@ env = flyte.app.AppEnvironment(
 _ACESTEP_KNOBS = {"steps", "guidance", "shift", "bpm", "keyscale", "timesignature",
                   "language", "lyrics", "cfg_interval"}
 _DIFFRHYTHM_KNOBS = {"steps", "guidance", "lyrics"}
+_MINIMAX_KNOBS = {"lyrics"}          # its call takes prompt, lyrics, duration, seed
+
+_ADAPTER_KNOBS = {"diffrhythm": _DIFFRHYTHM_KNOBS, "minimax": _MINIMAX_KNOBS}
 
 
 def knobs_for(model_key: str) -> set[str]:
     """The knobs this checkpoint understands. Unknown keys degrade to 'shared only'."""
-    if model_key == "diffrhythm":
-        return _DIFFRHYTHM_KNOBS
-    return _ACESTEP_KNOBS if model_key in MODELS else set()
+    spec = MODELS.get(model_key)
+    if spec is None:
+        return set()
+    return _ADAPTER_KNOBS.get(spec.adapter, _ACESTEP_KNOBS)
+
+
+# Which models ignore most of the per-take knobs, phrased for the UI. Derived rather
+# than hand-listed so it cannot fall out of step with `knobs_for`: the moment a model
+# is added to the registry with a thin adapter, this sentence includes it.
+_THIN_MODELS = sorted(k for k in MODELS
+                      if len(knobs_for(k)) < len(_ACESTEP_KNOBS))
 
 
 # ── The knob reference ───────────────────────────────────────────────────────────
@@ -130,8 +142,15 @@ KNOB_DOCS = {
         "**What it does.** Which trained model renders. `xl-turbo` is *guidance "
         "distilled*: 8 denoising steps with CFG folded into the weights. `xl-sft` is "
         "instruction-tuned: 50 steps and a real guidance pass. `xl-base` is the "
-        "pretrained model underneath both. `diffrhythm` is a different model entirely "
-        "and the only other one here that sings.\n\n"
+        "pretrained model underneath both. `diffrhythm` and `minimax-music3` are "
+        "different models entirely, and the only other two here that **sing**.\n\n"
+        "**`minimax-music3`** (MiniMax, August 2026) is the newest and takes ACE-Step's "
+        "`[verse]`/`[chorus]` tags verbatim, so unlike DiffRhythm it needs no lyric "
+        "conversion and the head-to-head against ACE-Step is genuinely fair. 32kHz "
+        "against ACE-Step's 48kHz, ~0.3x realtime (roughly 275s for a minute of "
+        "audio), and it treats length as approximate: asked for 60s it returned 82.8s. "
+        "Note its licence is **not** open source, unlike ACE-Step (MIT) and DiffRhythm "
+        "(Apache-2.0): attribution and AI-disclosure are required.\n\n"
         "**Why tweak it.** This is the one change that clearly improved things, most "
         "audibly **on the voice**. Low-step flow matching does not sound broken, it "
         "sounds *smeared*, and smeared is most of what people mean by 'it sounds AI'.\n\n"
@@ -343,23 +362,67 @@ def _external_url(url: str) -> str:
         return str(url)
 
 
+# How long the page follows a run before letting go. Knative's queue-proxy enforces a
+# request timeout (300s by default) on the streaming response Gradio uses for generator
+# functions, so a blocking `run.wait()` outlives its own connection and the browser is
+# left with a click that appears to have done nothing.
+#
+# That is exactly what happened here, and it is a regression caused by success
+# elsewhere: this app was written when a render was "5 to 13 seconds" and waiting was
+# free. A 240s track on xl-sft now takes 3.5 to 11 minutes, which is past the timeout,
+# so runs completed perfectly while the UI showed nothing.
+_FOLLOW_BUDGET_S = 240
+_POLL_EVERY_S = 5
+
+
 def _submit(task_name: str, blurb: str, **kwargs):
-    """Submit a run and stream status. Yields (status, link) on submit and on finish."""
+    """Submit a run and follow it for a while. Yields (status, link) as it goes.
+
+    Polls rather than blocking on `run.wait()`, for two reasons. It emits something on
+    every tick, which keeps the streaming response alive instead of letting an idle
+    connection be reaped; and it GIVES UP on purpose before the request timeout, so a
+    long render ends with an honest "still going, here is the link" rather than a dead
+    page. The run is never affected by the page letting go of it.
+    """
     try:
         run = flyte.run(_task(task_name), **kwargs)
     except Exception as e:                      # a bad ref, a dead cluster, bad inputs
         yield f"❌ Could not submit: `{type(e).__name__}: {e}`", ""
         return
+
     link = (f'<a href="{_external_url(run.url)}" target="_blank">Open the report for '
             f'<code>{run.name}</code></a>')
     yield f"🎵 Submitted **{run.name}**. {blurb}", link
-    try:
-        run.wait()
-        yield f"✅ **{run.name}** finished. The tracks play in the report.", link
-    except Exception as e:
-        yield (f"⚠️ **{run.name}** submitted, but waiting on it failed "
-               f"(`{type(e).__name__}`). The run itself may still be fine; open the "
-               f"report.", link)
+
+    t0 = time.monotonic()
+    while True:
+        time.sleep(_POLL_EVERY_S)
+        elapsed = int(time.monotonic() - t0)
+        try:
+            run.sync()
+            if run.done():
+                phase = str(getattr(run, "phase", "") or "")
+                if "SUCCEEDED" in phase.upper():
+                    yield (f"✅ **{run.name}** finished in {elapsed}s. The tracks play "
+                           f"in the report.", link)
+                else:
+                    yield (f"⚠️ **{run.name}** ended as `{phase}` after {elapsed}s. "
+                           f"The report has whatever it managed to render.", link)
+                return
+        except Exception as e:
+            # A transient control-plane hiccup must not look like a failed run. Say so
+            # and keep polling; the run is not ours to lose.
+            yield (f"⏳ **{run.name}** running ({elapsed}s). Status check failed "
+                   f"(`{type(e).__name__}`), retrying.", link)
+        else:
+            yield f"⏳ **{run.name}** running… {elapsed}s elapsed.", link
+
+        if time.monotonic() - t0 > _FOLLOW_BUDGET_S:
+            yield (f"⏳ **{run.name}** is still going after {elapsed}s, which is normal "
+                   f"for `xl-sft` or a long track. This page stops following it here so "
+                   f"the connection is not cut mid-stream; **the run is unaffected**. "
+                   f"Open the link to watch it finish.", link)
+            return
 
 
 def _weights_note(keys) -> str:
@@ -550,7 +613,11 @@ def create_demo():
                     gr.Markdown(
                         "### Takes\nAlways at least two. The second defaults to a "
                         "different seed, because that is the cheapest question worth "
-                        "asking and it shows how much the caption leaves to chance.")
+                        "asking and it shows how much the caption leaves to chance.\n\n"
+                        f"⚠️ **{', '.join(_THIN_MODELS)}** ignore most of the knobs "
+                        f"below — they take the lyric, the length and the seed and "
+                        f"little else. Their report cards print only what they "
+                        f"actually used, so a knob set here simply will not appear.")
                     t_n = gr.State(DEFAULT_TAKES)
                     t_rows, t_models, t_knobs = [], [], []
                     for i in range(MAX_TAKES):
