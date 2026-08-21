@@ -16,7 +16,8 @@ The first half of this README is a tutorial: what MuJoCo is, how a physics step 
 4. [The learning half: PPO and Brax](#4-the-learning-half-ppo-and-brax)
 5. [Reading this repo](#5-reading-this-repo)
 6. [The demo](#6-the-demo) and how to run it
-7. [Things that cost real debugging time on this box](#things-that-cost-real-debugging-time-on-this-box)
+7. [Things that cost real debugging time on this box](#7-things-that-cost-real-debugging-time-on-this-box)
+8. [A guided tour of the code](#8-a-guided-tour-of-the-code), if you are presenting it
 
 ---
 
@@ -102,7 +103,7 @@ This is why Playground's env code says `joint_angles = data.qpos[7:]` and `joint
 4. **Constraint solve.** Contacts, joint limits, friction and equality constraints all become rows in one constraint problem, which MuJoCo solves as a convex optimization. This is the expensive step and the interesting one: MuJoCo's contacts are *soft*, so instead of instantaneous impulses you get a well-behaved, differentiable-ish system that a solver can chew through quickly. That is a large part of why this engine, rather than a game physics engine, is the one robotics RL standardized on.
 5. **Integrate.** Apply the resulting accelerations to advance `qvel` then `qpos` by `timestep`.
 
-Step 4 is where the `njmax` trap in this repo comes from. The solver's constraint buffer is a fixed size, `njmax` rows, chosen up front. A humanoid standing on two feet generates a lot of rows: Playground's default for this env is `njmax = 29*2 + 8*4 = 90`, and on this box we measured overflow at 93 within the first rollout. See [the gotchas](#things-that-cost-real-debugging-time-on-this-box); the short version is that overflow silently drops constraints instead of raising, so the feet start sinking through the floor and you are quietly training on different physics than you think.
+Step 4 is where the `njmax` trap in this repo comes from. The solver's constraint buffer is a fixed size, `njmax` rows, chosen up front. A humanoid standing on two feet generates a lot of rows: Playground's default for this env is `njmax = 29*2 + 8*4 = 90`, and on this box we measured overflow at 93 within the first rollout. See [the gotchas](#7-things-that-cost-real-debugging-time-on-this-box); the short version is that overflow silently drops constraints instead of raising, so the feet start sinking through the floor and you are quietly training on different physics than you think.
 
 ### Actuators: the policy does not output torque
 
@@ -465,7 +466,7 @@ Each preset is a small diff on top of DeepMind's scales, not a rewrite. Only the
 
 ---
 
-## Things that cost real debugging time on this box
+## 7. Things that cost real debugging time on this box
 
 **`njmax` overflows.** Playground ships `njmax=90` for this env (`29*2 + 8*4`). On the Spark the first rollout printed `nefc overflow - please increase njmax to 93` repeatedly. As Part 1 explained, `njmax` caps the constraint rows the solver can hold, and a humanoid in ground contact makes more than 90 of them. On overflow MJX **silently drops constraints** rather than erroring, so feet sink through the floor and you are no longer training on the physics you think you are. We set `njmax=128`. Fixing it also roughly doubled throughput.
 
@@ -524,6 +525,161 @@ Nothing in the install warns you; it fails after the env has already built and c
 That also inherits its pinned `MENAGERIE_COMMIT_SHA`, so the robot XMLs can't drift from the version the env code expects.
 
 **Rendering is CPU, and a different backend.** MJX's fast path needs the GPU and MJX has no renderer. The replay rebuilds the same env with `impl="jax"` (loads in 0.5s on CPU) and draws through headless EGL. So the policy is *trained* on Warp and *replayed* on JAX. Those are two implementations of one model and should agree closely, but they are not bit-identical: if a replay disagrees badly with the eval reward, suspect this first.
+
+---
+
+## 8. A guided tour of the code
+
+If you are reading this to present it, or just want the shortest path through the repo, this is the order that works. Four stops, arranged so each one answers the question the previous one raises.
+
+### Stop 0: the rod, live in a REPL
+
+Not a file in this repo. Paste the [20-line snippet from Part 1](#a-whole-simulation-in-20-lines) into a Python prompt and run it. `MjModel`, `MjData`, `mj_step`, a one-line controller, printed state. Everything that follows is that same loop with a neural network in the controller slot and several thousand copies of `MjData`. Starting anywhere else means starting with abstraction.
+
+### Stop 1: [`envs.py`](envs.py), the physics lesson and the RL lesson in one file
+
+266 lines, and the highest teaching value per line in the repo. Three places to stop.
+
+**The `njmax` fix** is the best "physics engines have sharp edges" story here, and it follows straight from the constraint solve in [Part 1](#what-actually-happens-inside-mj_step):
+
+```python
+# Playground ships `njmax=90` for this env. On this box that overflows almost
+# immediately: the very first rollout printed
+#
+#     nefc overflow - please increase njmax to 93
+#
+# repeatedly. njmax caps the constraint-Jacobian rows the solver can hold, and a
+# humanoid in contact with the ground generates more than 90 of them. On overflow MJX
+# silently DROPS constraints rather than erroring, which means feet sink through the
+# floor and the physics quietly stops being the physics you think you are training on.
+NJMAX = 128
+```
+
+The point to land: this is not a crash, it is a *log line*. Training runs to completion, the reward curve climbs, and the number it climbed to describes physics where the feet pass through the floor. Fixing it also roughly doubled throughput.
+
+**The presets** are the reward-shaping argument in a form you can read out loud. Each is a diff on DeepMind's tuned scales, never a rewrite:
+
+```python
+# The tutorial's diagnosis was "it shuffles instead of stepping". Playground
+# already has the two terms that fix that, and one of them is OFF by default:
+#   feet_air_time   2.0  (on)  rewards a foot spending time in the air
+#   feet_clearance  0.0  (OFF) rewards the swing foot actually lifting
+# Turning clearance on is the single most direct answer to shuffling.
+"high-step": RewardPreset(
+    key="high-step",
+    scales={"feet_clearance": 1.0, "feet_air_time": 3.0},
+    notes="Anti-shuffle: turn on foot clearance, push air time harder.",
+),
+```
+
+The previous attempt at this demo wrote all ten reward terms by hand, watched the robot shuffle, and could not say which term was wrong. Holding the baseline fixed and naming each change is what makes the comparison mean anything.
+
+**`build_env` asserts its own shapes** rather than trusting them:
+
+```python
+env = registry.load(name, config=cfg)
+
+if env.action_size != EXPECTED_ACTION_SIZE:            # 29
+    raise RuntimeError(...)
+obs = env.observation_size
+if not isinstance(obs, dict):                          # asymmetric actor-critic
+    raise RuntimeError(...)
+for key, want in EXPECTED_OBS_SIZES.items():           # state 103, privileged 216
+    ...
+```
+
+`EXPECTED_ACTION_SIZE = 29` and `{"state": 103, "privileged_state": 216}` were measured on this box, not guessed. A Playground release that changes the observation layout then fails loudly here, at env build, instead of quietly training a mis-shaped network for an hour.
+
+### Stop 2: [`train.py`](train.py), where the payoff is
+
+347 lines, and two windows are enough.
+
+**The learner is one call.** This is the moment to point out that everything in [Part 4](#4-the-learning-half-ppo-and-brax) collapses to this:
+
+```python
+make_inference_fn, trained_params, _ = ppo.train(
+    environment=env,
+    progress_fn=progress,               # (step, metrics) at each eval boundary
+    policy_params_fn=policy_params_fn,  # (step, make_policy, params), same boundaries
+    network_factory=network_factory,
+    randomization_fn=randomizer,
+    # Playground's wrapper adds the auto-reset and domain-randomization vmap that
+    # Brax's own wrapper does not know about. Using Brax's default here silently
+    # drops the randomization.
+    wrap_env_fn=wrapper.wrap_for_brax_training,
+    seed=seed,
+    **{k: v for k, v in params.items() if k != "network_factory"},
+)
+```
+
+Two things worth saying out loud. `wrap_env_fn` is a silent-failure trap: leave it off and you still get a trained policy, just one that has never seen a friction it did not expect. And the `**params` splat is deliberate, because those numbers come from Playground's tuned config rather than from us.
+
+**The two callbacks** are where the live report comes from, and the difference between them is a genuinely non-obvious API detail:
+
+```python
+def policy_params_fn(step, make_policy, params):
+    """Never let a rendering problem kill an hour of training."""
+    ...
+    try:
+        _render_snapshot(step, make_policy, params)   # film the CURRENT policy
+    except Exception as exc:
+        log.warning(f"  snapshot at step {step:,} failed ({exc}); training continues")
+
+def progress(step, metrics):
+    history.append({...})
+    flyte.report.replace(reports.progress_html(...))  # stream the reward curve
+    flyte.report.flush()
+```
+
+`progress_fn` gets only `(step, metrics)`, so it can chart but cannot render. `policy_params_fn` fires at the same eval boundaries and is the **only** hook that hands over the live weights, which is the entire reason mid-training video is possible at all. Note the `try/except` around the snapshot: rendering is a nice-to-have and training is an hour of GPU, so a broken frame must never take the run with it.
+
+**Optional, for a war-stories segment:** `_wait_for_gpu()` probes CUDA through `ctypes` and retries for 15 minutes rather than dying on a transient:
+
+```python
+_wait_for_gpu()      # must run BEFORE `import jax`
+
+import jax
+```
+
+The ordering is the whole trick. JAX caches a failed backend init for the life of the process, so a task that imports jax during a starved window stays broken even after the box recovers. See [the gotchas](#7-things-that-cost-real-debugging-time-on-this-box) for why the box gets starved in the first place.
+
+### Stop 3: [`pipeline.py`](pipeline.py), the shape of a run
+
+Read `walk` top to bottom; it is short. The two lines that matter:
+
+```python
+trained_f, random_f = await asyncio.gather(
+    render_replay(checkpoint=checkpoint, steps=replay_steps, policy="trained"),
+    render_replay(checkpoint=checkpoint, steps=replay_steps, policy="random"),
+)
+```
+
+That is the evaluation argument in two lines. A clip of the trained policy on its own is unevaluable, because "is that good walking?" has no answer without the before-picture on the same command and the same camera. The random policy costs one extra CPU task and makes the whole report honest.
+
+### Two one-liners, if the traps come up
+
+[`config.py`](config.py) bakes the robot XMLs into the image at build time, and it has to land in Playground's own package directory:
+
+```python
+.with_commands([
+    "python -c 'from mujoco_playground._src import mjx_env; "
+    "mjx_env.ensure_menagerie_exists()'",
+])
+```
+
+[`render.py`](render.py) rebuilds the same env on the CPU backend, which is the trained-on-Warp / replayed-on-JAX split from [Part 3](#what-mjx-gives-up):
+
+```python
+cfg = envs.build_env_config(preset, terrain=terrain)
+cfg.impl = "jax"        # MJX has no renderer; this one runs on CPU and draws
+env = registry.load(envs.env_name(terrain), config=cfg)
+```
+
+### What to skip
+
+[`reports.py`](reports.py) is HTML plumbing (matplotlib to base64, a table helper, a `<video>` block) and [`app.py`](app.py) is Gradio boilerplate around a launcher that holds no GPU. Both are worth having and neither teaches anything about MuJoCo.
+
+**If you only open one file: [`envs.py`](envs.py).** `njmax` plus the presets is the physics lesson and the RL lesson in about 90 lines.
 
 ---
 
