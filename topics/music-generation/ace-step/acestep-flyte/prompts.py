@@ -836,6 +836,85 @@ PRODUCTION: list[Brief] = [
 ]
 
 
+# ── A dreamy cinematic brief, for the three-way vocal comparison ─────────────────
+#
+# Written for the ACE-Step vs MiniMax head-to-head rather than to probe a failure
+# mode, so unlike the CORE briefs it is not trying to break anything. It is here
+# because both models read the SAME structure tags, which makes it the first brief in
+# this repo that can go to two different families with no conversion and no asterisk on
+# the card.
+#
+# The caption is deliberately production-heavy rather than adjective-heavy: "tape
+# delay", "sub bass swell", "filtered arpeggio" and a named tempo give the model
+# something to render, where "emotional" and "dreamy" on their own give it a mood and
+# no instructions. The emotional read is supposed to come from the WORDS.
+
+DREAMSCAPE_LYRIC = """[intro]
+[soft pads, distant piano]
+[verse]
+I woke up somewhere over the Atlantic
+Half a dream still holding to my eyes
+The window held a thin blue line of morning
+And everything below us was disguised
+[verse]
+You said that love is mostly just attention
+A held breath and a hand that doesn't move
+I have been learning how to give it slowly
+I have nothing left to prove
+[chorus]
+So let it fall, let it fall
+Like light across the water
+I will find you in the quiet
+When the noise has all gone under
+Let it fall, let it fall
+I am not afraid of falling
+If the dark is where you are
+Then the dark is where I'm going
+[verse]
+There's a satellite that's been up there for decades
+Still transmitting to a room that isn't there
+I think about it circling in silence
+Saying something beautiful to empty air
+[chorus]
+Let it fall, let it fall
+Like light across the water
+I will find you in the quiet
+When the noise has all gone under
+Let it fall, let it fall
+I am not afraid of falling
+If the dark is where you are
+Then the dark is where I'm going
+[outro]
+Then the dark is where I'm going
+"""
+
+DREAMSCAPE: list[Brief] = [
+    Brief(
+        key="dreamscape",
+        prompt="cinematic electronic ballad, breathy female lead vocal, wide analog "
+               "pads, deep sub bass swells, sparse felt piano, filtered arpeggio, tape "
+               "delay, slow build into a euphoric wash, spacious reverb, emotional and "
+               "dreamy, modern film-score production",
+        lyrics=DREAMSCAPE_LYRIC,
+        axis="the fair three-way vocal comparison",
+        bpm=90,
+        keyscale="A minor",
+        listen_for=(
+            "The first brief here that goes to two model FAMILIES with no conversion "
+            "and no asterisk: ACE-Step and MiniMax read the same [verse]/[chorus] tags, "
+            "where DiffRhythm would need the structure thrown away and the lines spread "
+            "evenly. So any difference you hear is the model, not the handicap.\n\n"
+            "Judge the voice first, since that is where sft beat turbo most clearly and "
+            "where these two differ most: breath, consonants, and whether it sounds "
+            "performed or read. Then judge the BUILD, because the caption asks for a "
+            "slow rise into a euphoric wash and that is a structural request a model "
+            "either executes over four minutes or ignores. Third: does the chorus "
+            "actually lift? 'Let it fall' is the emotional pivot and a flat delivery "
+            "there is the giveaway."),
+    ),
+]
+
+
 def _check_callouts() -> None:
     """The control has to be exact, and the tag placement has to keep line counts equal."""
     for annotated, plain in ((BALLAD_FLYTE, "ballad-flyte-plain"),
@@ -1003,7 +1082,8 @@ def _check_swaps() -> None:
 
 # Every brief in the repo, assembled here at the bottom because the blocks above are
 # independent experiments and each needs the ones before it only for its own checks.
-SUITE: list[Brief] = [*CORE, *GENRE_SWAP, *GENRE_SWAP_2, *CALLOUTS, *PRODUCTION]
+SUITE: list[Brief] = [*CORE, *GENRE_SWAP, *GENRE_SWAP_2, *CALLOUTS, *PRODUCTION,
+                      *DREAMSCAPE]
 
 BY_KEY = {b.key: b for b in SUITE}
 
@@ -1048,6 +1128,8 @@ SUITES: dict[str, list[str]] = {
     # Same words, same callouts, same everything: one caption asks for a SOUND and the
     # other for a RECORDING.
     "production-ab": ["ballad-flyte-callouts", "ballad-flyte-dry"],
+    # The two families that read the same lyric format, on one brief.
+    "dreamscape": ["dreamscape"],
 }
 
 # The default brief for single-track and sweep runs: dense enough to be immediately
