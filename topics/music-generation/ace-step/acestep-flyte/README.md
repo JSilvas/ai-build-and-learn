@@ -1,0 +1,1031 @@
+# ACE-Step 1.5 on Flyte: music you can compare in a report
+
+Render music with [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) on the DGX
+Spark and get **one Flyte report with tracks that play in the browser**, plus a
+waveform, a spectrogram, and a copy-paste command to make any track again.
+
+Two questions, two entry points:
+
+| | question | command |
+|---|---|---|
+| `compare` | which **checkpoint**? | `flyte run compare_pipeline.py compare --suite quick` |
+| `sweep` | what does this **knob** do? | `flyte run compare_pipeline.py sweep --axis seed` |
+| `takes` | which **length** is right for this song? | `flyte run compare_pipeline.py takes --brief indie-vocal` |
+| `density` | how much room does a lyric line need? | `flyte run compare_pipeline.py density` |
+
+`compare` puts turbo, sft and base side by side on the same brief. `sweep` holds
+everything fixed and moves exactly one parameter across a row you play left to right.
+The second one is the reason this demo exists: a hosted music API gives you a seed
+field and a vibe, not a controlled experiment.
+
+**Measured on the Spark** (GB10, xl-turbo, 8 steps, `duration` sweep in one load):
+
+| track length | render time | real-time factor |
+|---|---|---|
+| 20s | 3.9s | 5.2x |
+| 60s | 4.9s | 12.2x |
+| 120s | 7.7s | 15.7x |
+| 180s | **12.8s** | 14.1x |
+
+Three minutes of finished stereo music in under thirteen seconds, weights already
+warm. Cost is roughly linear in length plus a fixed overhead, so longer tracks are
+*more* efficient per second of audio. Peak GPU is 11.1GB regardless of length, which
+is essentially just the weights.
+
+### The number that makes the point
+
+| | track | render | real-time factor | peak | per second of audio |
+|---|---|---|---|---|---|
+| ACE-Step xl-turbo | 180s | 12.8s | **14.1x faster than real time** | 11.1GB | 0.07s |
+| MusicGen large | 30s | 56.6s | **0.5x** (slower than real time) | 6.9GB | 1.89s |
+
+**~27x cheaper per second of audio**, and ACE-Step is the bigger model doing the harder
+job, because it is also singing. That is guidance-distilled flow matching against
+autoregressive token generation, and it is a better argument for why the field moved to
+diffusion than any benchmark chart. MusicGen is from June 2023; ACE-Step 1.5 XL from
+April 2026. Under three years.
+
+---
+
+## What ACE-Step 1.5 is
+
+A text-to-music foundation model from the ACE Studio / StepFun team, released January
+2026, with the XL line following in April. It takes a **style caption** ("driving
+synthwave, analog bass, gated reverb drums") and **optional structured lyrics**, and
+returns 48kHz stereo audio from 10 seconds to 10 minutes.
+
+Three components, all loaded by one `from_pretrained`:
+
+```
+Qwen3-Embedding-0.6B  ->  encodes the caption + lyrics + metadata
+AceStepTransformer1D  ->  flow-matching DiT, denoises in latent space
+AutoencoderOobleck    ->  25Hz stereo latents  ->  48kHz stereo waveform
+```
+
+## The models
+
+Eight models, five architectures, and one image for seven of them. Every one is a text-conditioned
+generative audio model, and that is where the similarity ends: they disagree about what
+"generating music" means, and the report is built to keep those differences visible
+rather than flatten them into a ranking.
+
+### Four architectures, four ideas about how to make audio
+
+**Flow-matching DiT (ACE-Step 1.5).** A diffusion transformer that learns a
+straight-line *velocity field* from noise to data rather than a noise-prediction
+schedule. Straighter paths mean fewer steps, and distillation folds the guidance pass
+into the weights on top. Audio lives as 25Hz stereo latents from an Oobleck VAE, and a
+Qwen3 encoder conditions on caption, lyrics and structured metadata together. This is
+the only model here that **sings**.
+
+**Latent DiT (Stable Audio Open).** Also a transformer diffusion in latent space, but
+noise-prediction rather than flow-matching, and conditioned by T5 text embeddings only.
+No lyric path, no metadata channel. A stochastic (SDE) sampler draws its noise from a
+Brownian tree, which is the source of its one integration headache below.
+
+**Autoregressive over audio tokens (MusicGen).** Not diffusion at all. EnCodec
+compresses audio into discrete tokens at 50/sec and a transformer predicts them one
+frame at a time, like a language model over sound. That is why it has no "steps" knob:
+its cost is *tokens*, so a 30s clip is 1500 sequential forward passes and cannot be
+parallelised across time. It is also why it is by far the slowest thing here.
+
+**Latent diffusion with a UNet (AudioLDM 2).** The oldest design in the set. Diffusion
+over a mel-spectrogram latent, with a GPT-2 bridging CLAP audio-text embeddings and T5
+text embeddings, decoded by a HiFi-GAN vocoder. Mel plus vocoder is what caps it at
+16kHz mono.
+
+### The registry
+
+| key | family | adapter | output | fetched | licence |
+|---|---|---|---|---|---|
+| `xl-turbo` | ACE-Step 1.5 XL | `acestep` | 48kHz stereo, **sings**, to 10min | 11.1GB | MIT |
+| `xl-sft` | ACE-Step 1.5 XL | `acestep` | as above | 11.5GB | MIT |
+| `xl-base` | ACE-Step 1.5 XL | `acestep` | as above | 11.5GB | MIT |
+| `stable-audio` | Stable Audio Open | `stableaudio` | 44.1kHz stereo, to 47s | 15.7GB | Stability Community (**gated**) |
+| `musicgen-large` | MusicGen | `musicgen` | 32kHz stereo, to 30s | 6.9GB | CC-BY-NC |
+| `musicgen-melody` | MusicGen | `musicgen` | 32kHz stereo, melody-conditionable | 6.2GB | CC-BY-NC |
+| `audioldm2-music` | AudioLDM 2 | `audioldm2` | 16kHz **mono**, ~10s sweet spot | 4.5GB | CC-BY-NC-SA |
+| `diffrhythm` | DiffRhythm 2 | `diffrhythm` | 48kHz stereo, **sings**, to 210s | 5.1GB | Apache-2.0 |
+
+`adapter` selects the loader and generator in `music_core`. It does **not** select an
+image: diffusers and transformers coexist happily, so all seven share one. Compare that
+to the TTS demo next door, which needs seven images for seven models because every open
+TTS package ships mutually hostile pins.
+
+### Measured on the Spark
+
+| model | track | render | real-time factor | peak |
+|---|---|---|---|---|
+| ACE-Step xl-turbo | 180s | 12.8s | **14.1x** | 11.1GB |
+| ACE-Step xl-turbo | 30s | 1.5-4.2s | 7-20x | 11.1GB |
+| Stable Audio Open | 30s | 19.5s | 1.5x | 2.7GB |
+| AudioLDM 2 music | 10s | 6.4s | 1.6x | 2.2GB |
+| MusicGen large | 30s | 55.3s | **0.5x** | 6.9GB |
+| DiffRhythm 2 | 96s | 206.0s | **0.5x** | subprocess |
+
+ACE-Step is ~27x cheaper per second of audio than MusicGen while being the larger model
+doing the harder job. That is autoregressive token generation versus guidance-distilled
+flow matching, and it is a better argument for why the field moved than any chart.
+
+Read the table as a **timeline**, not a leaderboard: MusicGen and AudioLDM 2 are 2023,
+Stable Audio Open is mid-2024, ACE-Step 1.5 XL is April 2026. The older models are
+context for how fast this moved, and comparing them on a vocal brief is unfair by
+construction, which is what `intended_for` on every card is there to say.
+
+### Which knobs each model actually has
+
+`ADAPTER_KNOBS` in `music_core.py` is the single source of truth, used by the report
+card, the reproduce command, and the studio's Advanced panel. Printing a dial a model
+does not have is the same class of dishonesty as printing a value it silently ignored.
+
+| adapter | steps | guidance | shift | bpm / key / lyrics |
+|---|---|---|---|---|
+| `acestep` | yes | yes | yes | yes |
+| `stableaudio` | yes | yes | no | no |
+| `audioldm2` | yes | yes | no | no |
+| `musicgen` | no | yes | no | no |
+| `diffrhythm` | yes | yes | no | lyrics only |
+
+So a MusicGen card reads `seed 42 · cfg 3 · 30s` and its reproduce command omits
+`--steps` and `--shift`, because it is autoregressive and has neither. A binary
+"is it diffusion?" test was not enough to get this right: AudioLDM 2 and Stable Audio
+have steps but no flow-matching `shift`.
+
+`max_duration` works the same way. MusicGen was trained on 30s windows and Stable Audio
+tops out at 47s; neither refuses a longer request, they degrade. So the spec clamps and
+the card shows the **clamped** number, making the limit legible as a constraint instead
+of looking like a quality failure.
+
+### What each one cost to integrate
+
+Three of the four families needed a workaround. All are documented at their call sites
+with the evidence that motivated them.
+
+- **ACE-Step**: nothing. `diffusers>=0.39`, one `from_pretrained`, done.
+- **MusicGen**: nothing. transformers already ships it.
+- **AudioLDM 2**: a one-method shim. diffusers 0.39 drives its GPT-2 by hand and calls
+  `_update_model_kwargs_for_generation`, which transformers dropped from
+  `PreTrainedModel` in 4.53. Pinning the shared image back fifteen months to suit the
+  oldest model in the registry was the wrong trade, so `_shim_audioldm2_generation`
+  rebinds that one method onto that one instance.
+- **Stable Audio Open**: two. `torchsde` is a required backend for its scheduler and is
+  not mentioned on the model card; and its Brownian noise tree is built over
+  `[sigma_min, sigma_max]` = `[0.3, 500]` while the schedule it generates runs
+  `500.00006 … 0.3, 0.0`, so **both endpoints fall outside the tree's own domain** and
+  torchsde recurses forever looking for them. `_widen_brownian_interval` widens the
+  domain to `[0, sigma_max × 1.001]`. It does not touch the schedule, so sampling is
+  unchanged; a wider domain does change the Brownian path for a given seed, so seeds
+  will not match another implementation bit-for-bit.
+
+That last one took five failed hypotheses (torchsde version, recursion limit, bf16,
+fp16, fp32) before one instrumented run logging the sigma schedule against the interval
+bounds gave the answer immediately. The lesson is in the Gotchas section and it is the
+same one `faulthandler` taught: **instrument before theorising.**
+
+### Adding another
+
+Write a `_load_<adapter>` and `_generate_<adapter>` in `music_core`, add an
+`ADAPTER_KNOBS` entry, and add a `MusicModelSpec` with `adapter`, `intended_for` and
+`max_duration`. No image change if it loads through diffusers or transformers.
+
+### DiffRhythm 2: the only other model here that sings
+
+`ASLP-lab/DiffRhythm2`, Apache-2.0, 5.1GB, November 2025. Block flow matching over its
+own DiT with a BigVGAN vocoder, 48kHz stereo, full-length songs from timed lyrics. The
+only genuine ACE-Step **rival** in the registry rather than an era baseline, because
+everything else here is instrumental-only.
+
+**The one model with its own image**, and it earns it: no PyPI package and no packaging
+metadata at all, so it is a git clone on `PYTHONPATH`, and it needs `transformers`
+pinned where the rest of the registry does not.
+
+Measured: **96s of audio in 206s** (0.5x real time) against ACE-Step's 180s in 12.8s
+(14.1x). Roughly 28x more expensive per second of audio for the same job.
+
+Getting it running took seven distinct layers, each worth knowing:
+
+1. **`orch_env` must declare it.** An orchestrator can only dispatch to environments in
+   its `depends_on`, or the run dies at submit with `MissingEnvironment:
+   'acestep-diffrhythm' not found in image cache`.
+2. **Guard the empty-Dir download at EVERY call site.** It fetches its own checkpoints
+   (`self_downloads=True`), so `_weights_for` hands it an empty Dir, and
+   `Dir.download()` on an empty Dir raises `DownloadQueueEmpty`. This trap was already
+   documented in `_to_results` and still bit a second, newer call site.
+3. **A subprocess adapter must leave the parent CUDA-free**, including
+   `reset_peak_memory` / `peak_memory_gb`, which create a context via
+   `torch.cuda.is_available()`.
+4. **Do not leak your CUDA tuning into a child process.**
+   `subprocess.run(env={**os.environ})` hands them `PYTORCH_CUDA_ALLOC_CONF` and
+   `CUDA_MODULE_LOADING=EAGER`, which we chose for our in-process models and they never
+   asked for. `_generate_diffrhythm` strips all of it.
+5. **transformers pinned to 4.47.1** for this image only. It imports `StaticCache` from
+   `transformers.models.llama.modeling_llama`, which moved to `cache_utils` in 5.x.
+   Pinning is free because the image is isolated; the other seven stay on 5.14.1.
+6. **`pyopenjtalk` is not optional.** Their `CNENTokenizer` imports the whole g2p chain
+   eagerly, so `g2p/g2p/japanese.py` loads even for English-only lyrics. It compiles on
+   aarch64 in ~36s given `cmake` + `build-essential`, both already in the image.
+7. **Memory pressure was the real "OOM".** The failure everyone would read as a model
+   being too big was a leaky neighbour: with rustfs holding ~19GB, the child saw
+   `free_gb 24.9` of a 128.5GB pool and `cfm.to(device)` failed at the driver with no
+   allocation size. `kubectl rollout restart deploy/rustfs -n flyte` took it to 74.8GB
+   free and the OOM vanished. **Clear the leak before big runs.**
+
+That last one cost four wrong attempts (transformers pins, parent CUDA context, env
+stripping) because a driver-level OOM with no "Tried to allocate" size looks like a code
+problem. The escalating-allocation probe in `_generate_diffrhythm` is kept permanently
+for exactly this: it reports total, free, the cgroup ceiling and the child's real
+allocation ceiling before every render, so the next mystery starts with data.
+
+**Why v2 and not v1.** v1 (`ASLP-lab/DiffRhythm`, 2.3k stars) drives transformers'
+`LlamaDecoderLayer` directly and never sets `num_attention_heads`, so on any modern
+transformers its attention and rotary embedding disagree about `head_dim` and the first
+forward pass dies in `apply_rotary_pos_emb`. A `head_dim=dim // 32` source patch fixes
+that, and then a second, unrelated failure sits behind it. v2 generates through its own
+DiT and touches Llama only for a cache class.
+
+**Known unfairness:** DiffRhythm wants **timed** lyrics (`[mm:ss.xx]line`); ACE-Step
+wants **structural** ones (`[verse]`/`[chorus]`). `lyrics_to_lrc` drops the tags and
+spreads lines evenly, which is less information than ACE-Step gets from the same brief.
+A fair head-to-head would supply real timings.
+
+---
+
+## Making a song: render several lengths, then choose
+
+```bash
+flyte run compare_pipeline.py takes --brief indie-vocal
+flyte run compare_pipeline.py takes --brief indie-vocal --seeds '["42","7"]'
+flyte run compare_pipeline.py takes --brief ballad-flyte-callouts --durations '["120","144","180"]'
+```
+
+`sweep --axis duration` and this render similar things for different reasons. A sweep
+moves one knob to **explain** it. `takes` is the working surface for actually making a
+song, where length is not a parameter you reason about but a judgement you make by ear
+once the options are next to each other.
+
+That is why the lengths are **derived from the lyric** rather than fixed.
+`prompts.suggest_durations()` counts the sung lines and brackets the estimated
+seconds-per-line target by roughly 3x, so the ladder contains the right answer even
+while the target itself is provisional:
+
+| brief | sung lines | ladder |
+|---|---|---|
+| `bossa-pt` | 4 | 14s, 24s, 41s |
+| `indie-vocal` | 8 | 29s, 48s, 82s |
+| `ballad-flyte-callouts` | 21 | 76s, 126s, 214s |
+| `synthwave-vocal` | 22 | 79s, 132s, 224s |
+| instrumental (no lyric) | 0 | 30s, 60s, 120s |
+
+A fixed 20/40/80 gets this wrong at both ends: it crams a 22-line lyric and wastes a
+4-line hook. The instrumental ladder is fixed because density is undefined without
+words, and for an instrumental the length is a compositional choice rather than a
+constraint.
+
+**Length is not a crop.** It is fed to the model up front, so the rungs are different
+*arrangements* of the same song rather than longer and shorter cuts of one take. Every
+card carries its own reproduce command, so choosing is: listen, copy the handle off the
+winner, render that one again at a higher step count or another seed.
+
+`SECONDS_PER_LINE = 6.0` currently, and the comment on it says exactly what it is: one
+listening pass on the `density` grid, on a cell that is still confounded. Nothing
+depends on it being right, because it is the centre of a bracket rather than a setting.
+
+**It is probably too low, and the evidence keeps pointing the same way.** Three
+independent listening reactions so far: short tracks sound compressed; 144s was the
+best cell in the grid; and the 21-line ballad wanted 240s, which is **11.4s per line**.
+That is above the top rung of the current ladder (10.2s/line), meaning the bracket is
+mis-centred rather than merely uncertain. The clean test already exists as two runs of
+the identical ballad at 144s and 240s, same seed, nothing else changed. If the long one
+wins, `SECONDS_PER_LINE` roughly doubles and every ladder re-centres with it, which is
+a one-line change and the reason the constant is in one place.
+
+---
+
+## Does the model take direction?
+
+```bash
+flyte run compare_pipeline.py compare --suite callouts --models '["xl-turbo"]' --duration 144
+```
+
+ACE-Step documents five structure tags as real conditioning: `[intro]`, `[verse]`,
+`[chorus]`, `[bridge]`, `[outro]`. It documents **nothing** about performance
+directions, the things a producer scribbles in a margin: `[belted]`, `[whispered]`,
+`[breakdown]`, `[guitar solo]`, `[half-time]`. Three outcomes are plausible and only
+rendering both tells you which:
+
+1. **They condition.** The chorus is visibly bigger than the verse, the breakdown
+   actually drops the drums, and you have found an undocumented control surface.
+2. **They are ignored.** The pair differs about as much as two seeds would.
+3. **They get sung.** This README already warns that writing "instrumental" in the
+   lyrics field makes the model sing the word. A singer solemnly delivering the words
+   "guitar solo" is the funniest result and the most informative.
+
+**The plain lyric is derived, not written twice.** `strip_callouts()` removes the
+undocumented tags and keeps the structure tags, so the two takes are word-for-word
+identical by construction. Two hand-written versions would differ by a word somewhere
+and that word would be indistinguishable from the effect. Callouts sit on their own
+lines so `sung_lines` counts 21 in both variants; an inline `[belted] I am durable`
+would start with a bracket and silently drop out of the count.
+
+### The two ballads
+
+The same song in two registers, verse for verse, 21 sung lines each:
+
+| brief | what it is |
+|---|---|
+| `ballad-flyte-plain` / `-callouts` | A power ballad about durable execution, played completely straight. The comedy is in treating a retry policy as heartbreak, which only lands if the singer means it. |
+| `ballad-serious-plain` / `-callouts` | The same skeleton with every literal term turned back into the human thing it was borrowed from. |
+
+The joke version and the sincere version are structurally the same song, which is
+either a point about metaphor or a point about infrastructure. `--suite
+ballad-registers` plays them against each other with the callouts held constant.
+
+Suites: `callouts` (all four), `callouts-flyte`, `callouts-serious`,
+`ballad-registers`.
+
+---
+
+## How much room does a lyric line need?
+
+```bash
+flyte run compare_pipeline.py density
+```
+
+Short tracks sound more compressed and more obviously synthetic. This entry point is
+the experiment behind that observation, and it exists because the rule of thumb further
+down this README ("budget roughly 4 seconds of track per sung line") was folklore that
+nobody had measured.
+
+ACE-Step paces the **whole** lyric to fit `audio_duration` rather than truncating it,
+so a long lyric in a short render is not cut off, it is compressed: syllables shorten,
+breaths vanish, and the model spends its capacity fitting words in rather than singing
+them. That predicts the variable is neither duration nor line count but the **ratio**.
+
+So the grid is driven by density and **duration is derived** (`duration = lines x
+seconds-per-line`). Driving it by duration instead would sample every row at a
+different density and leave no column to compare down.
+
+|  sung lines | 1.5s/line | 2.5s/line | 4.0s/line | 6.0s/line |
+|---|---|---|---|---|
+| 4 | 10s (clamped) | 10s | 16s | 24s |
+| 8 | 12s | 20s | 32s | 48s |
+| 16 | 24s | 40s | 64s | 96s |
+| 24 | 36s | 60s | 96s | 144s |
+| instrumental | 12s | 20s | 32s | 48s |
+
+**Read it two ways.** Across a row is the same words with more and more room, which is
+the effect you noticed. Down a column is constant density at wildly different absolute
+durations, which tests the competing explanation: if short tracks sound worse *there*,
+where every line has identical room to breathe, then duration is doing something on its
+own. The instrumental row settles it, since a wordless 12s clip has nothing to cram.
+
+Two details that keep the experiment honest:
+
+- **The four lyrics are nested.** Each is the previous one plus another section of the
+  same song, in a real form (v c v c b c). Four different lyrics would confound length
+  with content, and `_check_density()` asserts the nesting at import.
+- **Cells that collide are rendered once.** 4 lines at 1.5s and at 2.5s both clamp to
+  the 10s floor, and printing that render twice would look like a bug rather than a
+  constraint. The card says it was clamped and what density it actually ran at.
+
+19 tracks, 844s of audio, **47s of GPU**. Override with `--lines` and `--per_line`, or
+drop the control with `--no-instrumental_control`.
+
+### Duration mode, because the first grid could not answer its own question
+
+First listening result: **24 lines at 144s (6.0s/line) sounded the most natural.** That
+is the corner cell, which makes it two findings tangled together. It is the roomiest
+cell *and* the longest track, and it sits at the edge of the grid, so nothing bounds
+the knee from above.
+
+Hence a second mode. `--durations` fixes the **track length** down each column and
+derives density instead, so the lyric gets longer while the track does not:
+
+```bash
+# same 144s track, a quarter to all of the words: roomy, or just long?
+flyte run compare_pipeline.py density --durations '["144"]' --no-instrumental_control
+
+# does it keep improving past 6s/line, or is that the knee?
+flyte run compare_pipeline.py density --lines '["24"]' --per_line '["6","8","10"]' \
+    --no-instrumental_control
+```
+
+| | 4 lines | 8 lines | 16 lines | 24 lines |
+|---|---|---|---|---|
+| all at 144s | 36.0s/line | 18.0s/line | 9.0s/line | **6.0s/line** |
+
+If all four sound equally natural, length was the variable and density barely matters
+above some floor. If the 24-line one still wins, density and duration interact and the
+rule of thumb needs both terms. The extension row (144s, 192s, 240s at a constant 24
+lines) answers the other half: whether 6.0 is a knee or just the end of the ruler.
+
+Kept as two runs rather than one grid on purpose. Both reports stay light, and each
+answers exactly one question.
+
+The verdict is by ear. What comes out of it is one number, the seconds-per-line knee,
+and that number is the whole point: it is what a studio UI would need to suggest a
+sensible length from a pasted lyric. `prompts.sung_lines()` is the helper that counts
+the denominator.
+
+---
+
+## The quality knobs, ranked
+
+Everything that moves output quality, ordered by measured or expected effect. This
+doubles as the **spec for the studio**: the ranking is the order the controls should
+appear in, and the status column says which ones are safe to expose as a default versus
+which are still a question.
+
+### 1. Checkpoint — CONFIRMED, the biggest lever by far
+
+| | 240s track | peak | steps | CFG |
+|---|---|---|---|---|
+| `xl-turbo` | **23.0s** (10.4x realtime) | 11.1GB | 8 | inert, distilled to 1.0 |
+| `xl-sft` | **211.5s** (1.1x realtime) | 11.5GB | 50 | live, 7.0 |
+
+`xl-sft` is a clear improvement, most audibly **on the voice**, for 9x the cost. Turbo
+is guidance-distilled: 8 denoising steps and CFG folded into the weights. Low-step flow
+matching does not sound broken, it sounds *smeared*, and smeared is most of what reads
+as "AI-ish".
+
+**The single most important consequence:** every knob below behaved differently, or not
+at all, on turbo. Guidance in particular was **completely inert** in every run before
+this point, because the pipeline coerces it to 1.0 and warns. Tune on the checkpoint
+you intend to ship.
+
+### 2. Guidance / CFG — sft only
+
+`7.0` is the checkpoint's recipe. Low drifts and sounds generic; high over-obeys and
+turns harsh, brittle and fatiguing, which is its own flavour of synthetic. This is the
+knob most directly aimed at the complaint, and it has only just become testable.
+
+### 3. Steps
+
+50 is the shipped sft recipe, not a ceiling anyone measured. Transients (kick attack,
+hi-hat, consonants) blur first as steps drop, and the stereo image narrows. Cost is
+close to linear, so this is the straightforward quality-for-time trade.
+
+### 4. Production language in the caption
+
+The caption is a knob, not a label. `BALLAD_PROMPT` is maximalist (huge, gated, wide,
+anthemic) and every term in it asks for more processing, which is what a generative
+model fakes least convincingly: reverb tails go metallic and brickwalled loudness
+leaves no dynamics for the ear to read as human. `BALLAD_PROMPT_DRY` describes a
+**recording** instead of a sound (the room, the mic placement, the tape, explicit quiet
+verses and loud choruses, "no compression on the vocal"). `--suite production-ab` runs
+both with the lyric, callouts and bpm held fixed.
+
+### 4b. Time signature — CONFIRMED audible
+
+The last of the three structured-metadata fields that nobody had tested, and it works:
+asking a 1980s arena power ballad for `3` audibly changes it. So `bpm`, `keyscale` and
+`timesignature` are all real control surfaces rather than decoration, and they reach
+the model through a `# Metas` block the text encoder was trained on rather than as
+words in your caption, which is why they behave like controls and not like prompt
+wording. Free, like guidance and shift: 212.3s / 209.2s / 209.4s for 4, 3 and 6.
+
+### 5. Shift
+
+Where the flow-matching schedule spends its budget: high front-loads the noisy end
+where form and groove are decided, low spends more on the clean end, which is detail
+and texture. If what is left to fix is textural rather than structural, this is the
+specific knob for it. 3.0 is the shipped recommendation.
+
+### 6. Length
+
+Covered above. Not a crop: it is fed to the model up front and changes the
+arrangement. Every listening reaction so far has wanted **more** room per line.
+
+### 7. Seed
+
+The cheap lottery, and free information: how much the arrangement moves between seeds
+tells you how underspecified the caption is. A tight caption should visibly shrink the
+spread.
+
+### Not yet wired, and the reason the next one matters
+
+`AceStepPipeline` supports **audio-to-audio** and this repo does not expose it:
+`task_type` (`repaint`, `cover`, `extract`, `lego`, `complete`), `src_audio`,
+`repainting_start`/`_end`, `reference_audio` for timbre, `audio_cover_strength`.
+
+That is the honest implementation of **draft cheap, finish expensive**. Rendering the
+same brief and seed on turbo and then on sft does *not* give you the same take at two
+qualities: different weights, different step count and a live CFG pass mean a different
+trajectory, so turbo previews the *brief*, not the *render*. To actually carry a take
+across you need `cover` with the turbo output as `src_audio`, and **`xl-sft` is
+specifically the checkpoint that can**: it ships the audio tokenizer pair that the
+turbo repo omits. Wiring `refine` therefore turns the reports from a leaderboard into a
+working surface, and lets you regenerate the one bad fifteen seconds instead of
+re-rolling a four-minute track.
+
+---
+
+## Parameters
+
+Everything below is a real knob on `AceStepPipeline`. The **CLI** column is the flag on
+`generate_one`; a dash means the pipeline supports it but this demo has not wired it to
+an entry point yet.
+
+### Content
+
+| parameter | CLI | default | what it does |
+|---|---|---|---|
+| `prompt` | `--prompt` | from brief | The **style caption**: genre, mood, instrumentation, production. Not a description of the song's story. Naming specific instruments and a production style ("tape-saturated", "close-mic'd") works far better than adjectives alone. |
+| `lyrics` | `--lyrics` | from brief | Sung text with structure tags. **Empty string means instrumental.** Do not write "instrumental" here; the model will sing the word. |
+| `vocal_language` | `--language` | `en` | Language code for the lyric header (`en`, `pt`, `zh`, `ja`, ...). 50+ supported. Set it to match your lyric or the phrasing drifts toward English. |
+
+**Lyric structure tags are conditioning, not decoration.** `[intro]`, `[verse]`,
+`[chorus]`, `[bridge]`, `[outro]`. Drop them and you tend to get one undifferentiated
+verse.
+
+**Budget roughly 4 seconds of track per sung line, plus intro and outro.** The model
+paces the whole lyric to fit `audio_duration` rather than truncating the end, so an
+over-long lyric in a short render gets compressed and dropped throughout. The 22-line
+`synthwave-vocal` brief needs ~120-180s; at 60s it audibly skips.
+
+### Sampling
+
+| parameter | CLI | default | what it does |
+|---|---|---|---|
+| `audio_duration` | `--duration` | 30.0 | Track length in seconds (10 to 600). **Not a crop**: it is fed to the model up front and changes the composition. A 20s render states the idea immediately; a 180s render has room for an intro, a build and a turnaround. |
+| `seed` | `--seed` | 42 | The sampler's starting noise. Everything else fixed, a new seed is a new take. How *much* the arrangement moves tells you how underspecified your prompt is. |
+| `num_inference_steps` | `--steps` | per checkpoint | Denoising steps. Quality vs latency. Flow matching degrades gracefully: low-step output sounds *smeared* rather than broken, with transients blurring first and the stereo image narrowing. |
+| `guidance_scale` | `--guidance` | per checkpoint | CFG. How hard the model is pushed toward the prompt. Low drifts and sounds generic; high over-obeys and gets harsh and brittle. **Inert on turbo** (coerced to 1.0). |
+| `shift` | `--shift` | 3.0 | Warps where the flow-matching schedule spends its steps. High front-loads the noisy end, where global structure (form, arrangement, groove) is decided; low spends more budget on the clean end, which is detail and texture. 3.0 is the shipped recommendation. |
+| `cfg_interval_start/end` | - | 0.0 / 1.0 | Restrict CFG to a slice of the schedule. Guidance early only, or late only. |
+| `timesteps` | - | none | A fully custom schedule, overriding steps and shift. |
+
+### Musical metadata
+
+These go into a `# Metas` block the text encoder was trained on, **not** into your
+caption. That makes them a real control surface rather than a prompt-wording trick.
+Leave any of them unset and the model estimates it.
+
+| parameter | CLI | what it does |
+|---|---|---|
+| `bpm` | `--bpm` | Target tempo. Tap along to check how obedient it actually is; a ballad caption at 160 is where it gets interesting. |
+| `keyscale` | `--keyscale` | `"C major"`, `"A minor"`, `"D dorian"`. Major/minor is unmissable; a modal scale is where a model that memorized "minor = sad" falls apart. |
+| `timesignature` | `sweep --axis timesignature` | `"4"` for 4/4, `"3"` for 3/4, `"6"` for compound. **Confirmed audible.** It was the last of the three metadata fields nobody had tested, and asking a 1980s arena power ballad for 3 changes it. So all three of `bpm` / `keyscale` / `timesignature` are real control surfaces, not decoration. |
+
+The assembled prompt looks like this:
+
+```
+# Instruction
+Fill the audio semantic mask based on the given conditions:
+
+# Caption
+driving synthwave instrumental, analog saturated bass, ...
+
+# Metas
+- bpm: 118
+- timesignature: N/A
+- keyscale: N/A
+- duration: 30 seconds
+```
+
+### Audio-to-audio (supported by the pipeline, not yet wired here)
+
+This is the "that take was almost right" surface, and it is the obvious next thing to
+build on top of the reports.
+
+| parameter | what it does |
+|---|---|
+| `task_type` | `text2music` (default), `repaint`, `cover`, `extract`, `lego`, `complete`. |
+| `src_audio` | Source audio as a `[channels, samples]` 48kHz tensor, for every task above except plain generation. |
+| `repainting_start` / `_end` | Regenerate only seconds X to Y and keep the rest. |
+| `reference_audio` | Timbre conditioning: keep your arrangement, borrow another track's voice or tone. |
+| `audio_cover_strength` | 0.0-1.0. How far to move from the source. Lower blends more of the original. |
+| `track_name` | For `extract` / `lego`: which stem (`vocals`, `drums`, ...). |
+| `audio_codes` | 5Hz semantic codes; switches to `cover` automatically. Needs the tokenizer pair, which the **sft** and **base** repos ship and turbo does not. |
+
+---
+
+## The sweep axes
+
+`flyte run compare_pipeline.py sweep --axis <name>`. All values run in a **single GPU
+task against one loaded pipeline**, so another column costs one render, not another
+11GB load.
+
+| axis | default values | what it moves |
+|---|---|---|
+| `seed` | 11, 42, 1234, 90210 | Nothing but the starting noise. |
+| `steps` | 4, 8, 16, 32 | Quality vs latency. Find the knee; on turbo it is usually at or below 8. |
+| `guidance` | 1, 3, 7, 12 | Prompt adherence. **Inert on `xl-turbo`** by design. |
+| `shift` | 1, 2, 3 | Where the schedule spends its budget: structure vs detail. |
+| `bpm` | 75, 100, 128, 160 | Tempo obedience. |
+| `keyscale` | C major, A minor, F# minor, D dorian | Harmony, including a modal curveball. |
+| `duration` | 20s, 40s, 80s | Composition, not crop. |
+
+Override the values for any axis:
+
+```bash
+flyte run compare_pipeline.py sweep --axis steps --values '["2","4","8","24","50"]'
+```
+
+Values arrive as strings because a CLI list cannot be heterogeneously typed, and are
+cast back to `int`/`float`/`str` from the matching `GenSettings` field. There is a test
+asserting every preset round-trips its own type.
+
+---
+
+## The briefs
+
+Seventeen, in `prompts.py`, in two blocks that ask opposite questions. `CORE` is seven
+capability briefs, each aimed at a different failure mode. `GENRE_SWAP` is ten briefs
+that share one lyric and change nothing but the world around it.
+
+Named suites: `full`, `quick`, `instrumental`, `vocal`, `vocal-ab`, `genre-swap`,
+`genre-swap-quick`.
+
+### CORE: seven failure modes
+
+| key | what it tests |
+|---|---|
+| `synthwave` | The control. Dense material is forgiving, so passing means little and failing means everything. |
+| `synthwave-vocal` | The same caption plus a female lead and an emotional robot lyric. Direct A/B for what adding a singer does to the arrangement. |
+| `acoustic-duo` | Exposure. Two instruments and silence between the notes: every artifact is naked. |
+| `indie-vocal` | Intelligibility and structure. Can you make out the words, and does `[chorus]` arrive as a chorus? |
+| `odd-instruments` | Prompt adherence. 7/8, three unusual acoustic instruments by name, one explicit exclusion. Pair with `--axis guidance`. |
+| `bossa-pt` | The 50+ languages claim, in Portuguese. |
+| `arc` | Structure over time. At 20s a loop; at 180s it has to make an argument. Pair with `--axis duration`. |
+
+### GENRE_SWAP: one lyric, twenty-four worlds
+
+```bash
+flyte run compare_pipeline.py compare --suite genre-swap-all --models '["xl-turbo"]' --duration 60
+```
+
+Twenty-four briefs sharing a single lyric (`GENRE_SWAP_LYRIC`), deliberately plain: no
+proper nouns, no decade, no place. Anything specific in it would do half the model's
+work and quietly rig the test. Only the style caption changes.
+
+The question is not "what does it sound like as metal". It is whether the model has
+learned genre as a set of **timbres** or a set of **conventions**. Timbres give you the
+same tune ten times in different clothes: same melody, same phrasing, same places to
+breathe, guitars swapped for a pedal steel. Conventions rewrite the melody, move the
+stresses onto different syllables, and change where the line ends. Play any two
+choruses back to back. If the tune survives the swap, you have your answer, and it is
+the less impressive one.
+
+| key | the world | the specific tell |
+|---|---|---|
+| `gs-outlaw` | 1970s outlaw country | Phrasing, not pedal steel. Does the voice sit behind the beat and turn at line ends? |
+| `gs-blackmetal` | Norwegian black metal | Gentle words, ugly delivery. Intelligibility should **collapse**; if you can still hear the words it declined the brief. |
+| `gs-chant` | sacred plainchant | Three exclusions and no metre. Unison or drifted into Western harmony? Any drum is a fail. |
+| `gs-funkbr` | baile funk | Tamborzão is a named rhythm, not a vibe. And is "blown out" real distortion? |
+| `gs-boyband` | late-90s boy band | Four parts that move independently, or one voice doubled and widened? |
+| `gs-delta` | 1930s delta blues | Asks for an **era**. The common failure is an excellent modern recording. |
+| `gs-bulgarian` | Bulgarian women's choir | Straight tone and grinding seconds. Models add vibrato and resolve to thirds. |
+| `gs-drill` | UK drill | Does the 808 actually glide? And does it stop singing, since drill is spoken-adjacent? |
+| `gs-shanty` | sea shanty | Several rough men, or one clean voice cloned and detuned? Stomp is the only percussion allowed. |
+| `gs-hyperpop` | hyperpop | Artifacts that sound **chosen**, not accidental. A tasteful hyperpop track is a failed one. |
+
+Four of the ten carry an explicit **exclusion** (`no instruments`, `no percussion`).
+Those are the interesting ones: a bare genre tag can be satisfied by vibes, but a
+negative constraint can only be satisfied by obeying it, and adding a drum kit to
+plainchant is the most common way a music model tells you it is pattern-matching
+rather than listening.
+
+### GENRE_SWAP_2: where the training data thins out
+
+Batch one is mostly Anglophone popular music plus two choral outliers, and a model
+trained on the internet is comfortable in nearly all of it. These fourteen are picked
+where it is not, and each is defined by something a timbre swap cannot fake.
+
+| key | the world | what cannot be faked |
+|---|---|---|
+| `gs-mariachi` | mariachi | Trumpets **answer** the singer in the gaps. Playing through means instruments without arrangement. |
+| `gs-qawwali` | qawwali | Melisma. Short English words have to be stretched over many notes, or it is a harmonium backing. |
+| `gs-afrobeats` | afrobeats | Percussion pulls **against** the pulse. Quantised, it is pop with a shaker. |
+| `gs-klezmer` | klezmer | The clarinet has to cry: bends, slides, a sob at the top of phrases. |
+| `gs-gospel` | southern gospel | Lead and choir must **answer** each other, not sing together. Best chance of real harmony in the grid. |
+| `gs-jungle` | 1990s jungle | Drums at double the bassline's tempo, so it feels fast and slow at once. |
+| `gs-flamenco` | flamenco | The voice must sound damaged. A pleasant Spanish-flavoured vocal is the failure. |
+| `gs-bollywood` | 1970s filmi | Rapid ornaments around each note, plus a genuinely 1970s recording. |
+| `gs-doowop` | 1950s doo-wop | A **bass singer**: a human voice on the bottom, a role nothing else here asks for. |
+| `gs-enka` | Japanese enka | Kobushi, not vibrato. Also the quiet language test: does the style survive English? |
+| `gs-polka` | Bavarian polka | Oompah is trivially simple, so a clean check on rendering vs approximating a named rhythm. |
+| `gs-throat` | Tuvan throat singing | Two pitches from one voice. Almost nothing in the training data does this. |
+| `gs-highlife` | Ghanaian highlife | Two guitars **interlocking** into a pattern neither plays alone. |
+| `gs-vaporwave` | vaporwave | Genuine pitch-down artifacts. A clean lo-fi beat is the near miss. |
+
+`gs-throat` is expected to fail and is kept for that reason: it marks the edge of what
+is in the weights, which is more useful than another row the model finds easy.
+
+**Suites**: `genre-swap` (batch one, unchanged so the first report stays reproducible),
+`genre-swap-more` (batch two), `genre-swap-all` (all 24), and `genre-swap-quick`, four
+with the widest distance between them for a warm-up.
+
+**`genre-swap-all` is slow to OPEN, not slow to run.** Rendering all 24 costs 72s, but
+the report then carries two dozen inline base64 tracks plus a waveform and a
+spectrogram each, and the browser has to pull all of it before anything appears. It
+gets there, it just takes a while. If you are showing this to someone live, run
+`genre-swap` and `genre-swap-more` as two runs: same 24 tracks, two reports that open
+promptly, and the batch split is a real distinction rather than an arbitrary halving.
+
+### Why the report says "identical in every row"
+
+The lyric fold under each row is the same 24 times, which is the experiment and reads
+exactly like a bug. `compare` now **detects** a shared lyric (every brief has one and
+they are all the same) and, when it finds one, retitles the report *One lyric, every
+genre*, states the hypothesis in the meta line, and renames the fold to
+`lyrics (the control: identical in every row below)`.
+
+It is detected rather than passed in, so it stays true of any brief set assembled ad
+hoc with `--briefs`. Row headings now also name the world (`gs-klezmer: genre swap ·
+klezmer`), taken from the caption's first clause. That is enforced by `_check_swaps()`
+at import, and it is good prompting anyway: these models weight the head of the prompt
+most heavily, so burying the genre behind three instruments is a bad caption as well as
+a bad heading.
+
+**Measured**: all **24** at 60s on `xl-turbo` in a 4 minute run, of which **72s was
+rendering**. Every track after the first took 2.9s (20.5x realtime) with a variance of
+0.2s across two dozen wildly different genres, so cost here is a function of duration
+and nothing else. The rest of the wall clock is pod spin, the 11GB load and report
+encoding, which means the twenty-fifth genre costs three seconds.
+
+Run through both models that sing, `genre-swap-quick` at 60s:
+
+| | per track | notes |
+|---|---|---|
+| `xl-turbo` | 6.5s then **2.9s** | The first render carries warm-up; the rest are ~20x realtime. |
+| `diffrhythm` | 184.5s then **~53s** | ~1.1x realtime once warm, so ~18x more expensive per track. |
+
+DiffRhythm's first track came back **43.8s of audio for a 60s ask**, which is the
+`--max-secs`-is-a-ceiling behaviour in the open: it lays the lyric out and stops. The
+other three filled the full 60s. That alone makes it the wrong model for a fixed-length
+slot and the right one for "however long this song wants to be".
+
+---
+
+## The report
+
+Every card is one rendered track: waveform envelope, spectrogram to the full 24kHz
+Nyquist, an inline player, the resolved settings, and a **reproduce** fold.
+
+**Audio plays with no JavaScript.** Flyte reports render under a CSP that drops
+external assets and `<script>` tags. HTML5 `<audio controls>` with a base64 data URI
+needs neither.
+
+**Vorbis, not PCM.** A 60s stereo 48kHz track is ~0.23MB as OGG and 11.5MB as PCM16
+wav, and base64 adds a third on top. Embedding a grid of full-length tracks is only
+possible because of that.
+
+**The spectrogram runs to the full 24kHz Nyquist**, not the 8kHz voice band the TTS
+demo used, because a hard horizontal edge at 16kHz is the tell that a model renders
+through a lossy bottleneck. Cropping would hide the most diagnostic thing on the plot.
+
+**Every card carries the command that made it:**
+
+```
+flyte run compare_pipeline.py \
+    generate_one \
+    --model_key xl-turbo \
+    --brief synthwave-vocal \
+    --duration 180 --seed 42 --steps 8 --guidance 1 --shift 3
+```
+
+The settings shown are the **resolved** ones, so the command reproduces what actually
+ran rather than what was requested. Ask turbo for `--guidance 7` and the handle says
+`--guidance 1`, because that is what the model did. A handle that echoed the request
+would quietly lie on exactly the checkpoint you most want to iterate on. Named briefs
+stay named rather than inlining a 22-line lyric; the full prompt and lyrics are in the
+JSON block underneath. There is no copy button because the CSP would kill it.
+
+---
+
+## How it is wired
+
+```
+compare ─┬─ fetch_weights(xl-turbo)  ·· CPU pod, cached forever
+         ├─ fetch_weights(xl-sft)    ·· CPU pod, cached forever
+         └─ render(model, weights, [job, job, job])  ·· GPU pod, one load, N renders
+```
+
+| file | what it holds |
+|---|---|
+| `config.py` | Images and `TaskEnvironment`s. Spark-pinned (arm64, cu130, local registry). |
+| `models.py` | The checkpoint registry and the sweep-axis registry. |
+| `prompts.py` | The seven briefs. |
+| `music_core.py` | The engine room: load, generate, embed, render. **Flyte-free on purpose**, so the same code runs in the GPU task and in `run_local.py`. |
+| `compare_pipeline.py` | The Flyte tasks and the three entry points. |
+| `run_local.py` | Host-GPU smoke test, no cluster. |
+
+**One image, unlike the TTS demo next door**, which needs seven because every open TTS
+package ships mutually hostile pins. ACE-Step 1.5 was merged into `diffusers`
+([PR #13095](https://github.com/huggingface/diffusers/pull/13095), shipped in 0.39.0),
+so every checkpoint loads through one `from_pretrained` on one stack. Adding the next
+checkpoint is a registry entry, not a Dockerfile.
+
+**Jobs are batched per checkpoint.** Loading 11GB off disk takes far longer than
+rendering a 30s track at 8 steps, so `render` takes a list of jobs and runs them all
+against one loaded pipeline. The report is replaced after every track so a long run is
+watchable.
+
+**The orchestrator is CPU-only on purpose.** It stays alive holding its resources while
+awaiting children, so if it held the box's one GPU its own GPU children would deadlock.
+
+**Multi-GPU needs no code change.** `compare` already fans out with `asyncio.gather`;
+on one GPU the scheduler serializes, on four it does not.
+
+---
+
+## Running it
+
+```bash
+cd topics/music-generation/ace-step/acestep-flyte
+
+flyte run compare_pipeline.py generate_one --model_key xl-turbo --duration 20
+flyte run compare_pipeline.py compare --suite quick
+flyte run compare_pipeline.py sweep --axis seed
+flyte run compare_pipeline.py compare --suite vocal-ab --models '["xl-turbo"]' --duration 120
+
+# one lyric, twenty-four genres
+flyte run compare_pipeline.py compare --suite genre-swap-all --models '["xl-turbo"]' --duration 60
+# the same swap through both models that sing
+flyte run compare_pipeline.py compare --suite genre-swap-quick \
+    --models '["xl-turbo","diffrhythm"]' --duration 60
+```
+
+Weights are cached by `fetch_weights` with `flyte.Cache`, so the 11GB pull happens once
+per checkpoint. Bump `_WEIGHTS_CACHE_VERSION` when you change *what* gets downloaded.
+
+`run_local.py` drives the host GPU directly and writes standalone HTML with the
+identical renderer:
+
+```bash
+python run_local.py --model xl-turbo --brief synthwave
+python run_local.py --sweep steps --values 4,8,16,32
+```
+
+If the Flyte report comes up **blank**, forward port 30002 (rustfs) so the presigned
+URLs resolve. That is not a code bug.
+
+---
+
+## Gotchas, all of them found the hard way on this box
+
+**`sf.write()` of long audio to OGG/Vorbis SEGFAULTS the process.** libsndfile 1.2.2:
+20s and 30s encode fine, 60s and 90s crash. Not an exception, a SIGSEGV with exit 139
+and no Python traceback. It is a function of the size of the single write, not the
+destination: it crashes to a `BytesIO` and to a real file alike, mono and stereo alike.
+Writing the same audio through `sf.SoundFile` in ~5 second slices produces the same
+file and never crashes, which is what `music_core.encode_audio` does.
+
+This one cost four cluster runs and two wrong theories, because the crash lands *after*
+a successful render while building the report, so the last log line is always
+`loaded; peak 11.1GB` and it looks like the model died. The failures tracked audio
+LENGTH, which sent us hunting length-dependent behaviour in the model. There is a
+length-dependent thing in there: `AutoencoderOobleck` switches to tiled decode above
+512 latent frames, which at 25 frames/sec is 20.5 seconds, almost exactly where our
+successes stopped. That coincidence was convincing and completely wrong.
+
+**Arm `faulthandler`.** `faulthandler.enable()` in `music_core` turns a silent exit 139
+into a Python traceback naming the exact frame. Two lines of stack ended the hunt above
+in minutes after three crashes had produced nothing at all. On a box where CUDA
+allocations are host pages, native crashes are not exotic.
+
+**`diffusers>=0.39.0` is a hard floor.** `AceStepPipeline` did not exist before it, and
+the failure is a bare `ImportError` deep in a GPU pod minutes into a run.
+
+**`transformers>=4.51` is a softer, nastier floor.** The text encoder is a `Qwen3Model`;
+older transformers gives a `KeyError` inside `from_pretrained`, so the image builds fine
+and the task dies in the pod. (5.14.1 works.)
+
+**`hf_transfer` is dead lore.** Current huggingface_hub routes through **Xet** and
+ignores it; setting `HF_HUB_ENABLE_HF_TRANSFER` only earns a FutureWarning, and
+`HF_HUB_DOWNLOAD_TIMEOUT` does not bound the Xet path either. The real failure is hard
+and retryable:
+`CAS Client Error: Request middleware error: error sending request for url (...)`,
+seen on this pipeline's very first run. Protection lives in `retries=3`, not env vars.
+
+**Fetch with `local_dir=`, not `cache_dir=`.** The first version produced an HF hub
+cache and pointed `HF_HUB_CACHE` at the downloaded Dir. Two things went wrong: the Dir
+upload dereferenced the cache's symlinks so every shard was stored **twice** (11GB
+became ~22GB in the blob store), and the GPU task re-downloaded all 11GB from
+HuggingFace anyway, costing 2.5 minutes on every run. A plain repo layout handed to
+`from_pretrained` as a path skips the cache machinery entirely.
+
+**`torch.cuda.mem_get_info()` is unusable on GB10, in two different ways.** It
+**raises** `AcceleratorError: CUDA error: out of memory` from `cudaMemGetInfo` on a
+healthy box with 100GB+ free; a bare `except: pass` around it then skips the memory cap
+entirely and logs a cheerful `pool 0/0GB, capped at 0GB` that reads like a formatting
+quirk rather than "this process is now uncapped". And when it *does* return, its `free`
+counts reclaimable page cache as used (3GB of 129GB, while MemAvailable said 108GB).
+Use `MemAvailable` for free and `get_device_properties(0).total_memory` as the fallback
+for total, and log loudly when the cap cannot be applied.
+
+**Cap GPU memory against the cgroup, not the host.** On GB10 the GPU pool *is* host
+memory, so CUDA allocations are charged to the pod's cgroup: the box can have 100GB
+free while the pod is capped at 48Gi. Also do **not** use `torch.cuda.mem_get_info()`
+for this. It reported "3GB free of 129GB" here because reclaimable page cache counts as
+used, which capped a process at 2.55GB and OOMed the model load instantly. Read
+`MemAvailable` from `/proc/meminfo` and floor the result.
+
+**Do not launch more than THREE runs at once: the orchestrators starve their own
+children.** Seven concurrent `flyte run`s deadlocked the box completely. Each `a0`
+orchestrator requests 8Gi and 2 CPU and holds them for its whole life while awaiting
+children; each GPU child wants **96Gi and 8 CPU**. Seven orchestrators is 56Gi and 14
+of the node's 20 CPU, so every child sat in `Pending` with `0/1 nodes are available:
+Insufficient cpu, Insufficient memory` while the pods waiting on them refused to exit.
+One had been queued 54 minutes. Nothing was broken and nothing would ever have
+progressed.
+
+The arithmetic is worth keeping: a 96Gi child needs the node's requests under ~27Gi
+before it fits, and each orchestrator is 8Gi, so **three concurrent runs is the hard
+ceiling and one is the safe number.** This is the same hazard the "orchestrator is
+CPU-only on purpose" note describes, generalised: it is not only the GPU an
+orchestrator must avoid holding, it is any resource its children need. Recovery is
+`flyte abort run <id>` on the surplus; the freed memory schedules a child within
+seconds. To queue a batch, drive them serially and wait for each to reach a terminal
+phase before submitting the next.
+
+**Reclaim leaked memory before a big run.** `kubectl rollout restart deploy/rustfs -n
+flyte` took this box from 90GB to 110GB available; rustfs had 19GB of leaked heap. On
+unified memory that is 19GB the renderer cannot have.
+
+**VAE tiling stays off**, matching the diffusers default. Forcing it on was our change
+and it bought nothing on a box with 90GB of headroom. Note the model card's
+`pipe.vae.enable_tiling()` does not exist on `AutoencoderOobleck` in 0.39; only the
+`use_tiling` attribute does.
+
+**Turbo silently ignores guidance.** Correct behaviour for a distilled checkpoint, but
+it means a naive report prints "cfg 7.0" under a track that ran at 1.0.
+`GenSettings.resolve` mirrors the coercion so cards and repro handles stay honest.
+
+---
+
+## Licensing
+
+The most practical difference between these models, and the one least visible from a
+listening test. Two of the eight let you ship what you generate; three do not.
+
+| model | weights licence | commercial output? | verified how |
+|---|---|---|---|
+| ACE-Step 1.5 XL (all 3) | **MIT** | **yes** | model card |
+| DiffRhythm 2 | **Apache-2.0** | **yes** | model card + GitHub |
+| Stable Audio Open | Stability AI Community License | **read the card** | could not verify (gated) |
+| MusicGen large / melody | **CC-BY-NC-4.0** | **no** | model card |
+| AudioLDM 2 music | **CC-BY-NC-SA-4.0** | **no** | model card |
+
+### What each actually means for you
+
+**ACE-Step (MIT)** and **DiffRhythm 2 (Apache-2.0)** are the two you can build a product
+on. Both permissive, both cover the weights, neither restricts the output. Apache-2.0
+additionally carries an express patent grant, which MIT does not; for most people that
+is the only practical difference between them. ACE-Step's bundled Qwen3-Embedding-0.6B
+text encoder is Apache-2.0, redistributed under Qwen's terms, so the whole pipeline is
+commercial-safe.
+
+**MusicGen (CC-BY-NC-4.0)** is the one people most often get wrong. The non-commercial
+term covers the **weights AND what you generate with them**. It is the best-known open
+music model and the default reference in a lot of writing, which makes it the most
+likely to end up in a product it cannot legally be in.
+
+**AudioLDM 2 (CC-BY-NC-SA-4.0)** is non-commercial *and* share-alike, so it is the most
+restrictive here.
+
+**Stable Audio Open** is the interesting case and the one I could not fully check: the
+model card is **gated**, so it is unreadable without accepting the terms, and I did not
+verify its licence text from here. What is publicly documented in the diffusers docs is
+its **training data**: ~48k recordings from Freesound and the Free Music Archive, all
+CC0, CC BY or CC Sampling+. It is the only model in this registry trained exclusively on
+licensed audio, which is a different and arguably more interesting claim than the output
+licence. **Read the card before shipping anything from it.**
+
+### The point worth making on stream
+
+Training-data provenance and output licensing are separate questions, and only one model
+here answers both cleanly in the affirmative. Stable Audio Open has the cleanest
+*inputs*; ACE-Step and DiffRhythm 2 have the cleanest *outputs*. Nothing in the audio
+tells you which is which, which is exactly why the licence is on every report card and
+in this table rather than left as folklore.
+
+---
+
+## Next
+
+**A `refine` entry point** wrapping `repaint` / `cover`. Since `ModelRun` already
+returns a `flyte.io.Dir` of wavs, a follow-up run can take a previous run's Dir as
+`src_audio` and Flyte records the lineage for free. That turns the report from a
+leaderboard into a working surface: pick the take that was almost right, regenerate
+seconds 40-55, keep the rest.
+
+**A Gradio studio.** `config.py` reserves the name, port 7865, and a GPU pod template.
+A thin CPU launcher that submits runs and links the report, holding no GPU and loading
+no model, plus a picker over past runs' tracks to use as reference audio.
+
+Its one genuinely useful feature, and the reason the `density` experiment exists:
+**suggest the length from the lyric**. Paste a lyric, and the duration field
+pre-fills with `sung_lines(lyrics) x KNEE`, rounded, with the seconds-per-line shown
+next to it so the number is explained rather than magic. Overrideable, always, because
+the suggestion is a default and not a rule; but a first-time user should not have to
+learn by ear that a 24-line lyric in a 30s render comes out crammed. `KNEE` is the one
+value `density` is measuring, so the studio waits on that result rather than shipping
+another guess.
+
+**Other models.** ACE-Step first because it is the best open option right now, but the
+topic is wider: YuE for long-form lyrics-to-song, MusicGen for melody conditioning,
+Stable Audio Open for SFX and texture, and Magenta RT2 for live steerable streaming,
+which already has [its own demo](../../magenta/magenta-rt-flyte/). Adding one is a
+`models.py` entry if it loads through diffusers, and a second image if it does not.

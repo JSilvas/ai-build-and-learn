@@ -1,0 +1,79 @@
+# Isaac Sim + Isaac Lab as a Flyte TRAINING image, arm64 / GB10.
+#
+# The plain `Dockerfile` next door is enough to boot Kit and step physics. It is NOT
+# enough to train: the NGC container ships Isaac Sim and nothing else. Verified by
+# looking rather than assuming:
+#
+#   /isaac-sim/python.sh -c 'import torch'     -> ModuleNotFoundError
+#   /isaac-sim/python.sh -c 'import isaaclab'  -> ModuleNotFoundError
+#   pip list | grep -i torch                   -> (nothing; numpy 2.3.1 is about it)
+#
+# So this adds torch and Isaac Lab on top. It is a big image (~25 GB) and a slow
+# build; that is the price of RL in a pod and there is no smaller route on aarch64.
+#
+# Everything in the ENV block below is identical to Dockerfile and identical for the
+# same reason (the container has no system python, python.sh is only a wrapper that
+# exports these). Kept duplicated rather than chained through the local registry so
+# that a registry wipe cannot leave this image unbuildable.
+
+FROM nvcr.io/nvidia/isaac-sim:6.0.0
+
+USER root
+
+ENV PYTHONPATH=/isaac-sim/kit/python/lib/python3.12:/isaac-sim/kit/python/lib/python3.12/site-packages:/isaac-sim/python_packages:/isaac-sim/exts/isaacsim.simulation_app:/isaac-sim/kit/kernel/py:/isaac-sim/kit/plugins/bindings-python:/isaac-sim/exts/isaacsim.replicator.episode_recorder/pip_prebundle:/isaac-sim/exts/isaacsim.replicator.teleop/pip_prebundle:/isaac-sim/extsDeprecated/isaacsim.robot_motion.lula/pip_prebundle:/isaac-sim/exts/isaacsim.robot_motion.cumotion/pip_prebundle:/isaac-sim/exts/isaacsim.robot_motion.pink/pip_prebundle:/isaac-sim/exts/isaacsim.asset.exporter.urdf/pip_prebundle:/isaac-sim/extscache/omni.kit.pip_archive-0.0.0+6312fa25.la64.cp312/pip_prebundle:/isaac-sim/exts/omni.isaac.core_archive/pip_prebundle:/isaac-sim/exts/omni.pip.compute/pip_prebundle:/isaac-sim/exts/omni.pip.cloud/pip_prebundle
+
+ENV LD_LIBRARY_PATH=/isaac-sim/.:/isaac-sim/exts/isaacsim.robot.schema/plugins/lib:/isaac-sim/extsDeprecated/isaacsim.robot_motion.lula/pip_prebundle:/isaac-sim/exts/isaacsim.robot_motion.cumotion/pip_prebundle:/isaac-sim/exts/isaacsim.robot_motion.pink/pip_prebundle:/isaac-sim/exts/isaacsim.asset.exporter.urdf/pip_prebundle:/isaac-sim/kit:/isaac-sim/kit/kernel/plugins:/isaac-sim/kit/libs/iray:/isaac-sim/kit/plugins:/isaac-sim/kit/plugins/bindings-python:/isaac-sim/kit/plugins/carb_gfx:/isaac-sim/kit/plugins/rtx:/isaac-sim/kit/plugins/gpu.foundation
+
+ENV LD_PRELOAD=/isaac-sim/kit/libcarb.so
+ENV CARB_APP_PATH=/isaac-sim/kit
+ENV EXP_PATH=/isaac-sim/apps
+ENV ISAAC_PATH=/isaac-sim
+ENV PATH=/isaac-sim/kit/python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV ACCEPT_EULA=Y
+ENV PRIVACY_CONSENT=Y
+ENV OMNI_KIT_ACCEPT_EULA=YES
+ENV HOME=/isaac-sim
+
+# The container has apt but no git, gcc or cmake, and Isaac Lab's install needs all
+# three (it clones nothing itself, but several of its deps build from sdist on arm64
+# where no wheel is published).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git build-essential cmake ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# torch from the cu130 index, matching the driver (CUDA 13.0). The default PyPI wheel
+# is CPU-only on aarch64, which would train, silently, at a useless speed.
+RUN python3 -m pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cu130 \
+      torch==2.10.0 torchvision==0.25.0
+
+# Isaac Lab. It finds its simulator through a symlink named _isaac_sim and ONLY
+# through that symlink, so the link has to exist before --install runs.
+# --install pulls in rsl_rl, rl_games, skrl and Stable-Baselines3.
+ARG ISAACLAB_REF=main
+RUN git clone --depth=1 --branch ${ISAACLAB_REF} https://github.com/isaac-sim/IsaacLab /isaac-lab \
+ && ln -sfn /isaac-sim /isaac-lab/_isaac_sim \
+ && cd /isaac-lab \
+ && ./isaaclab.sh --install \
+ && chmod -R a+rX /isaac-lab
+
+# Isaac Lab installs its own packages editable (pip install -e), so /isaac-lab must
+# stay readable by the runtime uid or every import fails at task start.
+ENV ISAACLAB_PATH=/isaac-lab
+
+# flyte last: it is the layer most likely to change, and rebuilding it must not
+# invalidate the 20 GB of torch and Isaac Lab above.
+# connectrpc pinned to 0.10.x: 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
+# av encodes/decodes the replay mp4 for the report; aarch64 wheels exist for it,
+# imageio-ffmpeg's do not reliably.
+RUN python3 -m pip install --no-cache-dir "flyte==2.2.1" "connectrpc==0.10.*" av \
+ && ln -sf /isaac-sim/kit/python/bin/python3 /isaac-sim/kit/python/bin/python \
+ && a0 --help > /dev/null
+
+# The base sets ENTRYPOINT=/isaac-sim/runheadless.sh. Flyte serialises tasks with
+# command=[] and args=["a0", ...], so k8s would feed those args to runheadless.sh.
+# Clearing it makes args the command, matching Flyte's own base image.
+ENTRYPOINT []
+CMD ["python3"]
+
+USER isaac-sim

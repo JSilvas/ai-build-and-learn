@@ -1,0 +1,10 @@
+# LOCAL LAUNCHER DEPS ONLY. There is no isaacsim here and there cannot be: no
+# aarch64 wheel exists. This venv exists to run `flyte run`, nothing more.
+#
+# The simulator lives in two other places, neither of them this venv:
+#   - bare metal, built by setup.sh into ~/isaac  (use $ISAACSIM_PYTHON_EXE)
+#   - the task image, from nvcr.io/nvidia/isaac-sim  (see config.py)
+flyte==2.2.1
+# 0.11 breaks flyte 2.2.1 runs ('Headers' not callable).
+connectrpc==0.10.*
+python-dotenv

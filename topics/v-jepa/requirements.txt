@@ -1,0 +1,12 @@
+# Mirrors config.VJEPA_SPEC. torch/torchvision come from the cu130 aarch64 index
+# (see setup.sh); the plain-PyPI aarch64 torch wheel is CPU-only.
+transformers>=5.11
+accelerate>=1.10
+safetensors
+numpy
+pillow
+huggingface_hub
+av
+matplotlib
+flyte==2.2.1
+connectrpc==0.10.*

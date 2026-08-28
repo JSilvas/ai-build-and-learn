@@ -288,6 +288,29 @@ CLONE_TASKS = {
 }
 
 
+# ── Transcribing a found reference, for the app's drag-in path ───────────────────
+
+@metrics_env.task(retries=1)
+async def transcribe_ref(ref_audio: flyte.io.File) -> str:
+    """Whisper-transcribe a reference clip and return the text.
+
+    Exists for the studio's drag-in cloning tab: a clip cut out of a recording has no
+    transcript, and Qwen, Dia and CSM all condition on one. It reuses the SAME Whisper
+    that scores WER (metrics.Scorer), so the reference transcript and the scoring
+    transcripts come from identical weights.
+
+    `refs/README.md` argues for a read-aloud fixed script precisely because an ASR error
+    here silently degrades three of the five cloners, and that argument still stands.
+    This task does not repeal it; it makes the ASR route explicit and reviewable, which
+    is why the app drops the text in an editable box rather than launching straight into
+    a clone run with it.
+    """
+    ref = await _load_ref(ref_audio, "")
+    text = metrics.Scorer().load().transcribe(ref.wav, ref.sample_rate)
+    log.info(f"[transcribe_ref] {ref.seconds:.1f}s -> {text!r}")
+    return text
+
+
 # ── Scoring: every clip from every model, through one scorer ─────────────────────
 
 @metrics_env.task(report=True, retries=1)
